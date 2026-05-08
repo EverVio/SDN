@@ -478,15 +478,23 @@ if __name__ == '__main__':
 
 #### 启动流程（需要两个终端）
 
-**终端 1 — 启动 Ryu 控制器（先用最简单的 l2_learning）：**
+> **⚠️ 关键警告：双路径拓扑存在物理环路，必须使用 STP 控制器！**
+>
+> 拓扑包含环路 `s1 → s2 → s4 → s3 → s1`。如果使用 `simple_switch_13`（无 STP），当控制器遇到未知目的 MAC 时会向所有端口泛洪（FLOOD），导致数据包在环路中无限复制，引发**广播风暴**。实测表现为 `pingall` 丢包率高达 83%，控制器在 108 秒内收到 166203 个 Packet-In，MAC 地址表出现震荡（MAC Flapping）。
+>
+> **必须使用支持 STP 的控制器 `ryu.app.simple_switch_stp_13`**，它会在逻辑上阻塞一条链路（如 s3-s4）来打破环路。
+
+**终端 1 — 启动 Ryu 控制器（使用 STP 版本）：**
 
 ```bash
 conda activate sdn_env
 cd /root/SDN
-ryu-manager ryu.app.simple_switch_13
+ryu-manager ryu.app.simple_switch_stp_13
 ```
 
-> `ryu.app.simple_switch_13` 是 Ryu 自带的二层学习交换机应用，支持 OpenFlow 1.3。先用它验证拓扑连通性，我们后面会替换为自己的控制器。
+> `ryu.app.simple_switch_stp_13` 是 Ryu 自带的支持生成树协议（STP）的二层学习交换机应用。STP 会自动检测环路并阻塞一条路径来消除广播风暴。**不要使用 `simple_switch_13`**，它无法处理环路拓扑。
+>
+> STP 选举需要大约 15-30 秒，启动拓扑后请等待再执行 `pingall`。
 
 **终端 2 — 启动 Mininet 拓扑：**
 
@@ -514,6 +522,8 @@ h3 -> h1 h2 h4
 h4 -> h1 h2 h3
 *** Results: 0% dropped (12/12 received)
 ```
+
+> **如果出现 83% 丢包：** 说明使用了 `simple_switch_13` 而非 `simple_switch_stp_13`，请退出 Mininet 后切换控制器重新启动。详见 `docs/遇到的问题.md` 中的广播风暴排查记录。
 
 **验证 2：查看拓扑结构**
 ```bash
@@ -566,7 +576,7 @@ capabilities: FLOW_STATS TABLE_STATS PORT_STATS GROUP_STATS
 mininet> sh ovs-ofctl dump-flows s1 -O OpenFlow13
 ```
 
-> 使用 `simple_switch_13` 控制器时，流表中应该有 table-miss 规则和一些 MAC 学习规则。
+> 使用 `simple_switch_stp_13` 控制器时，流表中应该有 STP 优先级规则（`dl_dst=01:80:c2:00:00:00`）、table-miss 规则和一些 MAC 学习规则。
 
 **验证 5：基本 iperf 测试**
 ```bash
@@ -639,6 +649,26 @@ def cleanup():
 > 在每次运行拓扑前调用 `cleanup()`，确保没有残留的网络命名空间或 OVS 实例。
 
 ### 2.6 常见问题排查
+
+#### Q: pingall 丢包率高达 83%，只有同交换机的主机能互通？
+
+**症状：** `h1 -> h2` 和 `h2 -> h1` 正常，但 h3、h4 与 h1、h2 之间全部不通。`dump-flows s1` 显示 `priority=0` 的 table-miss 规则 `n_packets` 在短时间内达到数万甚至数十万。
+
+**根本原因：广播风暴（Broadcast Storm）**
+
+双路径拓扑 `s1 → s2 → s4 → s3 → s1` 存在物理环路。使用无 STP 的 `simple_switch_13` 时：
+1. h1 ping h3 发出 ARP 广播包
+2. s1 不知道 h3 在哪，泛洪到 s2 和 s3
+3. s2 和 s3 分别泛洪给 s4
+4. s4 从 s2 和 s3 都收到同一份包，继续泛洪回 s2 和 s3
+5. 数据包在环路中指数级复制，耗尽带宽和控制器性能
+
+**实测证据：**
+- `dump-flows s1` 中 `priority=0` 的 table-miss 规则在 ~108 秒内累计 166203 个包
+- 流表中出现 MAC 震荡：`in_port="s1-eth4", dl_src=00:00:00:00:00:04 actions=output:"s1-eth4"`（从 eth4 进来又从 eth4 出去，说明 MAC 学习被环路包污染）
+- 只有 h1↔h2 成功，因为它们在同一交换机上，ARP 不经过核心链路
+
+**解决方案：** 使用支持 STP 的控制器 `ryu.app.simple_switch_stp_13`，STP 会阻塞环路中的一条链路来消除风暴。详见 `docs/遇到的问题.md`。
 
 #### Q: pingall 全部失败？
 
