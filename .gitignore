@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual Environment
+venv/
+.env/
+
+# Logs
+*.log
+
+# Mininet / Ryu 临时文件
+mnexec*
+*.swp
+
+# Experiment outputs
+data/raw/
+data/processed/
+data/logs/
+
+# Results
+results/
+
+# VSCode
+.vscode/
+
+# System files
+.DS_Store
