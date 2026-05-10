@@ -6,7 +6,20 @@
 
 **Architecture:** Mininet 构建双路径拓扑（4 交换机 + 4 主机），Ryu 控制器作为 SDN 控制平面，通过 OpenFlow 协议与交换机通信。控制器周期性查询端口统计信息计算链路利用率，当利用率超阈值时将部分流量从拥塞路径重路由至轻载路径。
 
-**Tech Stack:** Python 3.9 / Ryu SDN Framework 4.34 / Mininet / Open vSwitch (OVS) 3.3.4 / OpenFlow 1.3 / iperf / Conda (sdn_env)
+**Tech Stack:** Python 3.9 / Ryu SDN Framework 4.34 / Mininet / Open vSwitch (OVS) 3.3.4 / OpenFlow 1.3 / iperf / Conda (sdn)
+
+**项目定位：固定拓扑下的 SDN 动态流量工程原型**
+
+本项目只解决一个问题：**双路径拥塞时的动态 reroute**。方法是 telemetry → threshold → explicit flow install。不做通用 SDN controller，不做动态 shortest-path recompute，不做 ECMP/per-flow scheduling。
+
+**两个控制器的角色：**
+
+| 控制器 | 角色 | 架构 |
+|--------|------|------|
+| `base_controller.py` | 对照实验的基准（无负载均衡） | 最小化：table-miss + topology discovery + datapath registration |
+| `load_balancer.py` | 核心创新（动态流量工程） | 真正 SDN：拓扑感知 + 显式路径安装 + ARP 单播转发 + 拥塞感知 reroute |
+
+`base_controller.py` 的存在意义是提供对照数据，证明负载均衡有效。它不是项目的核心——`load_balancer.py` 才是。
 
 ---
 
@@ -67,7 +80,7 @@
 
 - Windows 11 + WSL2 (Ubuntu 24.04)
 - VS Code + Remote - WSL 扩展
-- Conda 虚拟环境 `sdn_env` (Python 3.9)
+- Conda 虚拟环境 `sdn` (Python 3.9)
 - 已安装：Mininet、Ryu 4.34、OVS 3.3.4、iperf、networkx、matplotlib、numpy
 
 ### 项目目录结构
@@ -128,13 +141,61 @@ LLDP（Link Layer Discovery Protocol）是链路层发现协议。在 SDN 中，
 
 **为什么需要它？** 你的双路径拓扑中，控制器需要知道 s1-s2-s4 和 s1-s3-s4 这两条路径的存在，才能做路径选择。LLDP 让控制器自动构建出整个网络拓扑图。
 
-### 1.2 环境验证步骤
+### 1.2 配置环境
+
+以下是经过验证的完整、正确的环境配置指令流程。
+
+**第一步：安装系统级依赖与工具**
+
+Mininet 和底层抓包工具需要直接操作 Linux 网络命名空间，必须通过系统的包管理器安装。
+
+```bash
+sudo apt update
+# 安装 Mininet、网络带宽测试工具 iperf 及抓包工具 wireshark
+sudo apt install -y mininet iperf wireshark-common
+```
+
+**第二步：配置 Conda 虚拟环境**
+
+Ryu 框架对高版本 Python 兼容性较差，使用 Python 3.9 作为稳定的隔离环境。
+
+```bash
+# 创建并激活隔离的 Python 3.9 虚拟环境
+conda create -n sdn python=3.9 -y
+conda activate sdn
+```
+
+**第三步：安装 Ryu 及其兼容性依赖**
+
+解决新版打包工具和运行库导致的构建及导入错误。
+
+```bash
+# 降级 setuptools 绕过新版对源码根目录 flat-layout 的严格检查，并安装构建所需的 pbr 包
+pip install "setuptools==59.5.0" pbr
+
+# 禁用 pip 的构建隔离机制，强制使用当前环境中降级后的 setuptools 编译安装 Ryu
+pip install ryu --no-build-isolation
+
+# 降级 eventlet 版本，修复 Ryu 源码中引用被移除变量 ALREADY_HANDLED 导致的 ImportError
+pip install eventlet==0.30.2
+```
+
+**第四步：安装开发辅助工具**
+
+安装用于处理数据及可视化拓扑的 Python 依赖库。
+
+```bash
+# 安装网络图生成、数据绘图及数值计算库
+pip install networkx matplotlib numpy
+```
+
+### 1.3 环境验证步骤
 
 环境已配置完毕，以下为验证命令：
 
 ```bash
 # 激活 conda 环境
-conda activate sdn_env
+conda activate sdn
 
 # 验证 Mininet
 sudo mn --test pingall
@@ -154,7 +215,7 @@ python3 -c "import ryu, networkx, matplotlib, numpy; print('All imports OK')"
 
 > **提醒：** 截图保存所有验证输出，作为环境搭建成功的证据。
 
-### 1.3 关键命令速查表
+### 1.4 关键命令速查表
 
 #### Mininet 命令
 
@@ -478,28 +539,26 @@ if __name__ == '__main__':
 
 #### 启动流程（需要两个终端）
 
-> **⚠️ 关键警告：双路径拓扑存在物理环路，必须使用 STP 控制器！**
+> **⚠️ 关键警告：双路径拓扑存在物理环路，必须使用支持环路抑制的控制器！**
 >
-> 拓扑包含环路 `s1 → s2 → s4 → s3 → s1`。如果使用 `simple_switch_13`（无 STP），当控制器遇到未知目的 MAC 时会向所有端口泛洪（FLOOD），导致数据包在环路中无限复制，引发**广播风暴**。实测表现为 `pingall` 丢包率高达 83%，控制器在 108 秒内收到 166203 个 Packet-In，MAC 地址表出现震荡（MAC Flapping）。
+> 拓扑包含环路 `s1 → s2 → s4 → s3 → s1`。如果使用 Ryu 自带的 `simple_switch_13`（无任何环路防护），当控制器遇到未知目的 MAC 时会向所有端口泛洪（FLOOD），导致数据包在环路中无限复制，引发**广播风暴**。实测表现为 `pingall` 丢包率高达 83%，控制器在 108 秒内收到 166203 个 Packet-In，MAC 地址表出现震荡（MAC Flapping）。
 >
-> **必须使用支持 STP 的控制器 `ryu.app.simple_switch_stp_13`**，它会在逻辑上阻塞一条链路（如 s3-s4）来打破环路。
+> **使用我们自己实现的 `base_controller.py`**，它内置了三重环路防护机制：LLDP/IPv6 过滤、MAC 地址锁定（只学一次）、广播风暴时间窗去重。详见 [环节 3：基础控制器实现](#33-基础控制器实现对照基准)。
 
-**终端 1 — 启动 Ryu 控制器（使用 STP 版本）：**
+**终端 1 — 启动 Ryu 控制器：**
 
 ```bash
-conda activate sdn_env
+conda activate sdn
 cd /root/SDN
-ryu-manager ryu.app.simple_switch_stp_13
+ryu-manager controller/base_controller.py --observe-links
 ```
 
-> `ryu.app.simple_switch_stp_13` 是 Ryu 自带的支持生成树协议（STP）的二层学习交换机应用。STP 会自动检测环路并阻塞一条路径来消除广播风暴。**不要使用 `simple_switch_13`**，它无法处理环路拓扑。
->
-> STP 选举需要大约 15-30 秒，启动拓扑后请等待再执行 `pingall`。
+> `base_controller.py` 是对照实验的基准控制器，内置广播风暴抑制机制，能够在环路拓扑中稳定运行。`--observe-links` 参数启用链路发现（后续 `load_balancer.py` 会用到）。详见 [环节 3](#33-基础控制器实现对照基准)。
 
 **终端 2 — 启动 Mininet 拓扑：**
 
 ```bash
-conda activate sdn_env
+conda activate sdn
 cd /root/SDN
 sudo python3 topo/dual_path_topo.py
 ```
@@ -523,7 +582,7 @@ h4 -> h1 h2 h3
 *** Results: 0% dropped (12/12 received)
 ```
 
-> **如果出现 83% 丢包：** 说明使用了 `simple_switch_13` 而非 `simple_switch_stp_13`，请退出 Mininet 后切换控制器重新启动。详见 `docs/遇到的问题.md` 中的广播风暴排查记录。
+> **如果出现 83% 丢包：** 说明使用了 Ryu 自带的 `simple_switch_13` 而非我们的 `base_controller.py`，请退出 Mininet 后切换控制器重新启动。`base_controller.py` 内置广播风暴抑制机制，能够在环路拓扑中稳定运行。详见 `docs/遇到的问题.md` 中的广播风暴排查记录。
 
 **验证 2：查看拓扑结构**
 ```bash
@@ -576,7 +635,7 @@ capabilities: FLOW_STATS TABLE_STATS PORT_STATS GROUP_STATS
 mininet> sh ovs-ofctl dump-flows s1 -O OpenFlow13
 ```
 
-> 使用 `simple_switch_stp_13` 控制器时，流表中应该有 STP 优先级规则（`dl_dst=01:80:c2:00:00:00`）、table-miss 规则和一些 MAC 学习规则。
+> 使用 `base_controller.py` 控制器时，流表中应该有 table-miss 规则（`priority=0`，动作 `CONTROLLER:65535`）和一些 MAC 学习规则（`priority=1`）。不会有 STP 相关规则，因为该控制器不依赖 STP，而是通过广播风暴抑制来应对环路。
 
 **验证 5：基本 iperf 测试**
 ```bash
@@ -642,7 +701,6 @@ def cleanup():
     """清理残留的 Mininet 网络"""
     import os
     os.system('sudo mn -c 2>/dev/null')
-    os.system('sudo killall -9 ryu-manager 2>/dev/null')
     os.system('sudo killall -9 ovs-vswitchd 2>/dev/null')
 ```
 
@@ -668,7 +726,7 @@ def cleanup():
 - 流表中出现 MAC 震荡：`in_port="s1-eth4", dl_src=00:00:00:00:00:04 actions=output:"s1-eth4"`（从 eth4 进来又从 eth4 出去，说明 MAC 学习被环路包污染）
 - 只有 h1↔h2 成功，因为它们在同一交换机上，ARP 不经过核心链路
 
-**解决方案：** 使用支持 STP 的控制器 `ryu.app.simple_switch_stp_13`，STP 会阻塞环路中的一条链路来消除风暴。详见 `docs/遇到的问题.md`。
+**解决方案：** 使用我们自己实现的 `base_controller.py`，它内置 IPv6/LLDP 过滤、MAC 地址锁定和广播风暴时间窗去重三重防护机制，能够在环路拓扑中稳定运行。详见 `docs/遇到的问题.md`。
 
 #### Q: pingall 全部失败？
 
@@ -923,15 +981,20 @@ Ryu 在交换机连接的不同阶段触发不同事件：
 | `MAIN_DISPATCHER` | 正常工作状态 | 处理 Packet-In 的时机 |
 | `DEAD_DISPATCHER` | 连接断开 | 清理资源 |
 
-### 3.3 基础控制器实现：L2 学习交换机
+### 3.3 基础控制器实现：对照基准
 
-我们将实现一个完整的 L2 学习交换机控制器。这是负载均衡器的基础版本，也是对照实验中的"无负载均衡"场景。
+`base_controller.py` 是对照实验中的"无负载均衡"基准控制器。它的存在意义是提供对比数据——证明 `load_balancer.py` 的动态 reroute 有效。
+
+**定位：** 这是一个最小化控制器，不是项目核心。它采用传统 L2 学习交换机架构（MAC 学习 + 泛洪转发），不做任何集中式路径规划。为了让它在环路拓扑中能正常运行（`pingall` 通过），加入了三重防护：IPv6/LLDP 过滤、MAC 锁定、广播时间窗去重。
+
+> **注意：** 这些防护机制是 learning-switch 架构在环路拓扑下的补丁，不是本项目的创新点。真正的 SDN 架构（`load_balancer.py`）通过显式路径安装从根源上消除泛洪，不需要这些补丁。
 
 **实现思路：**
 1. 交换机连接时，下发 table-miss 规则
-2. 收到 Packet-In 时，学习源 MAC 地址和入端口的对应关系
-3. 如果知道目的 MAC 的出端口，就下发流表规则并转发
-4. 如果不知道目的 MAC 的出端口，就泛洪（FLOOD）
+2. 收到 Packet-In 时，先过滤 LLDP 和 IPv6 包，再对广播包做时间窗去重
+3. MAC 地址锁定（只学一次），防止环路包导致端口映射漂移
+4. 如果知道目的 MAC 的出端口，就下发流表规则并转发
+5. 如果不知道目的 MAC 的出端口，就泛洪（FLOOD）
 
 #### Step 1：创建文件并导入模块
 
@@ -945,6 +1008,7 @@ Ryu 在交换机连接的不同阶段触发不同事件：
 用途：对照实验中的"无负载均衡"场景
 """
 
+import time
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -972,12 +1036,24 @@ class L2LearningSwitch(app_manager.RyuApp):
         # MAC 地址表: {dpid: {mac_addr: port_no}}
         # 例如: {1: {'00:00:00:00:00:01': 1, '00:00:00:00:00:03': 3}}
         self.mac_to_port = {}
+
+        # 广播风暴缓存：{(dpid, src_mac, eth_type): timestamp}
+        # 用于广播风暴抑制，防止环路拓扑中广播包（ARP 等）无限复制
+        self.broadcast_cache = {}
+        # 缓存最大容量，防止内存泄漏
+        self.cache_limit = 1000
 ```
 
 **`mac_to_port` 数据结构说明：**
 - 外层 dict 的 key 是 `dpid`（交换机编号）
 - 内层 dict 的 key 是 MAC 地址，value 是端口号
 - 这个表记录了"从哪个端口能到达哪个 MAC 地址"
+
+**`broadcast_cache` 数据结构说明：**
+- key 是 `(dpid, src_mac, eth_type)` 三元组，value 是上次见到该广播包的时间戳
+- 用于广播风暴抑制：0.5 秒内同一交换机收到相同源 MAC 和以太网类型的广播包，判定为环路包并丢弃
+- 拦截范围覆盖所有目标 MAC 为 `ff:ff:ff:ff:ff:ff` 的广播包（包括 ARP、RARP 等），而非仅限 ARP
+- `cache_limit` 机制：缓存超过 1000 条时自动清空，防止长期运行导致内存泄漏
 
 #### Step 3：处理交换机连接事件
 
@@ -1083,22 +1159,44 @@ class L2LearningSwitch(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # 忽略 LLDP 包（拓扑发现用的，不需要学习 MAC）
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+        # 过滤 LLDP（SDN 控制器用来拓扑发现的，不需要学习 MAC）
+        # 和 IPv6（消除 Mininet 主机初始化时的 IPv6 组播风暴）
+        if eth.ethertype in (ether_types.ETH_TYPE_LLDP, ether_types.ETH_TYPE_IPV6):
             return
 
         dst = eth.dst    # 目的 MAC 地址
         src = eth.src    # 源 MAC 地址
         dpid = datapath.id  # 交换机 ID
 
+        # ====== 广播风暴抑制 ======
+        # 拦截目标 MAC 为全 F 的广播包（包含 ARP 广播及其他广播协议）
+        # 利用时间窗机制打破双路径拓扑导致的广播环路
+        if dst == 'ff:ff:ff:ff:ff:ff':
+            cache_key = (dpid, src, eth.ethertype)
+            now = time.time()
+
+            # 定期清理缓存，防止内存泄漏
+            if len(self.broadcast_cache) > self.cache_limit:
+                self.broadcast_cache.clear()
+
+            if cache_key in self.broadcast_cache:
+                # 0.5 秒时间窗拦截重复广播包
+                if now - self.broadcast_cache[cache_key] < 0.5:
+                    return
+
+            self.broadcast_cache[cache_key] = now
+
         # 初始化该交换机的 MAC 表
         self.mac_to_port.setdefault(dpid, {})
 
-        # ====== MAC 地址学习 ======
-        # 记录：从 in_port 进来的包，源地址是 src
-        # 以后要发往 src 的包，从 in_port 出去就行了
-        self.mac_to_port[dpid][src] = in_port
-        self.logger.info("Switch %s: learn %s on port %d", dpid, src, in_port)
+        # MAC 锁定：一旦某个 MAC 地址学习到某个端口，就不再更新
+        # 防止环路传回的包导致端口映射漂移（MAC Flapping）
+        if src not in self.mac_to_port[dpid]:
+            # ====== MAC 地址学习 ======
+            # 记录：从 in_port 进来的包，源地址是 src
+            # 以后要发往 src 的包，从 in_port 出去就行了
+            self.mac_to_port[dpid][src] = in_port
+            self.logger.info("Switch %s: learn %s on port %d", dpid, src, in_port)
 
         # ====== 查找目的端口 ======
         if dst in self.mac_to_port[dpid]:
@@ -1125,7 +1223,9 @@ class L2LearningSwitch(app_manager.RyuApp):
 
         # ====== Packet-Out：发送当前数据包 ======
         # 如果是泛洪，或者没有 buffer_id，需要用 Packet-Out 手动发送
-        data = None if msg.buffer_id == ofproto.OFP_NO_BUFFER else msg.data
+        # 如果交换机没缓存包，我们必须把原包数据完整的通过 Packet-Out 发回去
+        # 如果交换机已缓存（buffer_id 有效），传 data=None 即可
+        data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=msg.buffer_id,
@@ -1143,20 +1243,28 @@ class L2LearningSwitch(app_manager.RyuApp):
    - `eth = pkt.get_protocol(ethernet.ethernet)` 提取以太网帧头
    - `eth.dst` = 目的 MAC，`eth.src` = 源 MAC，`eth.ethertype` = 上层协议类型
 
-2. **过滤 LLDP 包：**
-   - LLDP 包的 ethertype 是 `0x88CC`
-   - 如果不忽略，LLDP 包的源 MAC 会被错误地学习到 MAC 表中
-   - Ryu 的 `topology.py` 模块会处理 LLDP 包
+2. **过滤 LLDP 和 IPv6 包：**
+   - LLDP 包的 ethertype 是 `0x88CC`，Ryu 的 `topology.py` 模块会处理
+   - IPv6 包的 ethertype 是 `0x86DD`，Mininet 主机初始化时会发送大量 IPv6 组播包（如 ND、MLD），不过滤会导致 Packet-In 风暴，严重拖慢 `pingall` 测试
+   - 用 `in` 语法同时过滤两种类型，简洁高效
 
-3. **MAC 学习：**
-   - `self.mac_to_port[dpid][src] = in_port` 记录"源 MAC 从哪个端口来"
-   - 这是交换机的基本功能：看到源 MAC，就知道回包时该往哪个端口发
+3. **广播风暴抑制：**
+   - **为什么当前实现"看似"有效：** 代码将广播丢弃逻辑放在 MAC 地址学习之前。当环路传回重复的广播包时，控制器直接 return，使得交换机不会在不同端口上来回学习同一个源 MAC 地址（防止了 MAC 震荡）。同时 0.5 秒的时间窗能够阻断双路径拓扑中由环路引发的瞬时广播风暴。
+   - **为什么拦截所有广播包而非仅 ARP：** OpenFlow 的 `OFPP_FLOOD` 动作不仅应用于广播包，还会应用于未知单播（Unknown Unicast）。如果仅拦截 ARP，当网络中出现目的 MAC 未知的单播数据包时，该包会在 `s1 → s2 → s4 → s3 → s1` 的环路中无限循环。通过拦截 `dst == 'ff:ff:ff:ff:ff:ff'` 的所有广播包，覆盖了 ARP、RARP 等所有广播协议。
+   - **缓存 key 选择 `(dpid, src_mac, eth_type)`：** 比仅用 ARP 的 `(dpid, src_mac, dst_ip)` 更通用，适用于所有广播协议类型。
+   - **内存泄漏防护：** `broadcast_cache` 设置了 `cache_limit = 1000` 的上限，超过时自动清空。否则每一次新的广播请求都会在字典中永久驻留一个键值 pair，长期运行会导致 OOM。
+   - **已知局限：** 此机制只能抑制广播风暴。如果交换机尚未学习到目的 MAC，单播包仍会触发 `OFPP_FLOOD` 并在环路中循环。在 `base_controller.py`（learning-switch 架构）中，广播抑制是应对环路问题的核心防御机制，使 baseline 控制器能够在双路径拓扑中稳定运行。在后续的 `load_balancer.py` 中，进一步采用 topology-aware SDN routing，通过显式路径安装彻底消除 uncontrolled flooding，从根源上解决环路问题。
 
-4. **查找目的端口：**
+4. **MAC 锁定与学习：**
+   - `if src not in self.mac_to_port[dpid]`：只在首次见到某 MAC 时学习，之后不再更新
+   - 在存在环路的拓扑中，泛洪的包可能从非预期端口传回，导致 MAC 表被错误覆写（MAC Flapping）。锁定后，一旦 MAC 地址绑定到某个端口，就不会因环路包而漂移
+   - 这是双路径拓扑中 `pingall` 能否通过的关键条件之一
+
+5. **查找目的端口：**
    - 如果 MAC 表中有目的 MAC，直接查表得到出端口
    - 如果没有，泛洪到所有端口（除了入端口）
 
-5. **下发流表 vs Packet-Out：**
+6. **下发流表 vs Packet-Out：**
    - 如果知道出端口且不是泛洪，下发流表规则（优先级 1，高于 table-miss 的 0）
    - 如果交换机缓存了包（`buffer_id != OFP_NO_BUFFER`），直接 return，交换机会自动处理
    - 如果没有缓存，需要 Packet-Out 手动发送
@@ -1269,7 +1377,7 @@ def delete_flow(self, datapath, match, priority=1):
 **终端 1 — 启动 Ryu 控制器：**
 
 ```bash
-conda activate sdn_env
+conda activate sdn
 cd /root/SDN
 ryu-manager controller/base_controller.py --observe-links
 ```
@@ -1279,7 +1387,7 @@ ryu-manager controller/base_controller.py --observe-links
 **终端 2 — 启动 Mininet 拓扑：**
 
 ```bash
-conda activate sdn_env
+conda activate sdn
 cd /root/SDN
 sudo python3 topo/dual_path_topo.py
 ```
@@ -1584,7 +1692,7 @@ Ryu 每 3 秒                   交换机回复
 
 #### 为什么需要"两条路径"？
 
-在你的拓扑中，h1→h3 有两条等价路径。传统交换机用 STP（生成树协议）会**阻塞其中一条**避免环路，只用一条路径。SDN 控制器可以**同时使用两条路径**，这就是负载均衡的本质。
+在你的拓扑中，h1→h3 有两条等价路径：Path A（s1→s2→s4）和 Path B（s1→s3→s4）。传统交换机用 STP（生成树协议）会**阻塞其中一条**避免环路，只用一条路径。`base_controller.py` 采用的 learning-switch 架构同样只能依赖泛洪，无法主动选择路径。而真正的 SDN 控制器可以通过集中式的拓扑感知，在**所有交换机上显式安装路径流表**，同时使用两条路径——这就是负载均衡的本质。
 
 #### 流表下发 vs 流表修改
 
@@ -1607,18 +1715,37 @@ Ryu 每 3 秒                   交换机回复
 
 ### 5.2 完整负载均衡控制器架构
 
-将之前的 `base_controller.py` 和 `stats_collector.py` 合并，并添加负载均衡逻辑。创建 `/root/SDN/controller/load_balancer.py`。
+创建 `/root/SDN/controller/load_balancer.py`。这是本项目的**核心创新**——与 `base_controller.py` 的 learning-switch 架构有本质区别。
+
+**架构升级说明：** `load_balancer.py` 不再依赖 MAC 学习 + 泛洪转发，而是采用真正的 SDN 架构：
+- **拓扑感知**：通过 LLDP 获取网络全貌，构建 adjacency graph
+- **显式路径安装**：在路径上所有交换机预先安装流表，数据包沿预定路径逐跳转发，不依赖泛洪
+- **ARP 单播转发**：ARP 请求不泛洪，控制器查表后只转发到目标 host 所在端口
+- **拥塞感知 reroute**：telemetry → threshold → 路径切换
+
+**应保留的核心能力：**
+- Topology awareness（adjacency graph）
+- Port stats collection（telemetry 核心）
+- Explicit path installation（项目灵魂）
+- Threshold-triggered reroute（合理且简单）
+
+**应删除/弱化的逻辑：**
+- 复杂 MAC learning：load_balancer 不依赖 learning switch，通过显式路径安装替代
+- `OFPP_FLOOD`：正常数据流不应泛洪，仅在极端 fallback 时使用
+- 广播 cache patch：真正 SDN 化后广播应非常少，不需要时间窗去重
 
 **控制器模块划分：**
 ```
 load_balancer.py
-├── 交换机连接处理（table-miss 规则）
-├── MAC 学习与转发（Packet-In 处理）
-├── 端口统计采集（周期性查询）
-├── 链路利用率计算
-├── 负载均衡决策（阈值判断 + 路径选择）
-├── 流表安装/删除（路径切换）
-└── 辅助工具方法
+├── 拓扑发现（LLDP 邻居发现 + 交换机上线/下线事件）
+├── Host 位置学习（记录每个 host 连在哪个交换机的哪个端口）
+├── Packet-In 处理（ARP 单播转发 + 首包路径安装）
+├── 路径计算与选择（基于拓扑图的最短路径 + 负载均衡选择）
+├── 显式路径流表安装（在路径上所有交换机安装流表，非仅入口）
+├── 端口统计采集（周期性查询端口收发字节数）
+├── 链路利用率计算（Δbytes × 8 / (Δt × bandwidth)）
+├── 拥塞检测与 reroute（阈值判断 + 路径切换）
+└── 流表更新与清理（删除旧流表 + 安装新路径流表）
 ```
 
 ### 5.3 关键难点：端口映射与路径安装
@@ -1643,23 +1770,34 @@ mininet> sh ovs-ofctl show s1 -O OpenFlow13
 
 #### 路径安装策略
 
-在双路径拓扑中，你需要控制的关键流表在 **s1**（入口交换机）上：
+在双路径拓扑中，SDN 控制器的路径安装必须覆盖路径上的**所有交换机**，而不仅仅是入口交换机 s1。这是 `load_balancer.py` 与 `base_controller.py` 的核心区别之一。
 
-**默认状态（走路径 A）：**
+**为什么必须在所有交换机上安装流表？**
+
+`base_controller.py` 采用 learning-switch 架构：它只在 Packet-In 触发时被动学习 MAC，中间交换机靠泛洪 + MAC 学习自行建立转发表。这在环路拓扑中会导致广播风暴，且无法精确控制路径。
+
+`load_balancer.py` 采用显式路径安装：当 h1 要发包给 h3 时，控制器在路径上的每一跳都预先安装好精确的流表规则，数据包沿着预定路径逐跳转发，不会有任何泛洪。
+
+**默认状态（走路径 A）—— 在三台交换机上安装流表：**
 ```
-# s1 上的流表
-match: eth_dst=h3_mac  →  output: port_to_s2    # 去 h3 走路径 A
-match: eth_dst=h4_mac  →  output: port_to_s2    # 去 h4 走路径 A
+# 路径 A: h1 → s1 → s2 → s4 → h3
+s1: match: eth_dst=h3_mac  →  output: port3(→s2)
+s2: match: eth_dst=h3_mac  →  output: port2(→s4)
+s4: match: eth_dst=h3_mac  →  output: port1(→h3)
 ```
 
-**触发重路由后（走路径 B）：**
+**触发重路由后（走路径 B）—— 删除旧流表，在三台交换机上安装新流表：**
 ```
-# 删除旧规则，安装新规则
-match: eth_dst=h3_mac  →  output: port_to_s3    # 去 h3 走路径 B
-match: eth_dst=h4_mac  →  output: port_to_s3    # 去 h4 走路径 B
+# 路径 B: h1 → s1 → s3 → s4 → h3
+s1: match: eth_dst=h3_mac  →  output: port4(→s3)
+s3: match: eth_dst=h3_mac  →  output: port2(→s4)
+s4: match: eth_dst=h3_mac  →  output: port1(→h3)  # s4 的出端口不变
 ```
 
-**中间交换机（s2, s3）** 的流表保持不变——它们只负责从一端转发到另一端。
+**关键实现细节：**
+- `install_path(path_name)` 方法需要遍历路径上所有交换机，逐一下发 FlowMod
+- 切换路径时，必须先删除旧路径上所有交换机的流表，再安装新路径的流表
+- s4 的出端口（port1→h3）在两条路径中相同，无需修改；需要修改的是 s1 和中间交换机（s2 或 s3）
 
 ### 5.4 决策逻辑详解
 
@@ -1701,7 +1839,7 @@ def check_and_reroute(self):
 
 1. **删除流表后新规则未生效**：确保先 `delete_flow`，等一个 `hub.sleep(0.1)`，再 `add_flow`，否则可能冲突
 2. **已有连接不会自动重路由**：TCP 连接的后续包仍然匹配旧流表。你需要先删除旧流表，新包触发 Packet-In 后才会安装新路径的流表
-3. **ARP 广播**：ARP 包需要特殊处理（泛洪），不要把它也做路径选择
+3. **ARP 处理（单播转发，不做 proxy ARP）**：ARP 请求（广播）触发 Packet-In 后，控制器查找目标 host 的位置（记录在 host_location 表中），然后只将 ARP 转发到目标 host 所在的端口（单播），而非泛洪。这比完整 proxy ARP 简单得多，且足够解决问题。泛洪会在环路拓扑中引发广播风暴，必须避免
 4. **流表优先级**：你的负载均衡规则优先级要高于默认的 MAC 学习规则
 5. **流表切换瞬间丢包**：删除旧流表和安装新流表之间有时间差，这个窗口期的包会被丢弃。对于课程作业来说，少量丢包是可接受的
 
