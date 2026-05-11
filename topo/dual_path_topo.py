@@ -1,11 +1,7 @@
 import os
-import time
-import atexit
 from mininet.net import Mininet
 from mininet.node import RemoteController, OVSSwitch
-from mininet.cli import CLI
 from mininet.link import TCLink
-from mininet.log import setLogLevel
 
 
 def create_topology():
@@ -56,25 +52,7 @@ def create_topology():
     net.addLink(s1, s3, bw=10)  # 路径 B 第一段
     net.addLink(s3, s4, bw=10)  # 路径 B 第二段
 
-    # 构建网络、启动控制器和交换机
-    net.build()
-    c0.start()
-    net.start()
-
-    # 等待交换机连接控制器
-    time.sleep(2)
-
-    print("\n=== 拓扑已启动 ===")
-    print("路径 A: h1/h2 -> s1 -> s2 -> s4 -> h3/h4")
-    print("路径 B: h1/h2 -> s1 -> s3 -> s4 -> h3/h4")
-    print("链路带宽: 10 Mbps (核心链路)")
-    print("进入 Mininet CLI...\n")
-
-    # 进入交互式命令行
-    CLI(net)
-
-    # 退出时清理
-    net.stop()
+    return net, c0
 
 
 def cleanup():
@@ -83,11 +61,3 @@ def cleanup():
     for sw in switches:
         os.system(f"sudo ovs-vsctl --if-exists del-br {sw} 2>/dev/null")
     print("Cleanup OVS completed.")
-
-
-if __name__ == "__main__":
-    atexit.register(cleanup)
-    cleanup()
-
-    setLogLevel("info")
-    create_topology()
