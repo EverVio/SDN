@@ -1,18 +1,13 @@
-"""
-阈值响应式负载均衡控制器（Phase 5 对照组）
-- 拓扑发现（LLDP + networkx）
-- ARP 单播转发（避免双路径环路广播风暴）
-- 显式路径安装（路径 A: s1→s2→s4, 路径 B: s1→s3→s4）
-- 周期统计采集（StatsMixin）
-- 阈值决策：util > 70% → 切换到另一条路径
-"""
-
 import os
 import sys
 import time
+import csv
 import networkx as nx
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+import joblib
+import atexit
 
-# ryu-manager 以文件方式加载模块，需要手动将项目根目录加入 sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ryu.base import app_manager
@@ -38,23 +33,150 @@ PATH_PORTS_REV = {
     "B": {4: 4, 3: 1, 1: 1},  # s4:4←s3, s3:1←s1, s1:1→h1
 }
 
+PREDICTIVE_CSV_PATH = "./data/predictions.csv"
 
-class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
+
+class DecisionEngine:
+    COLD_START_PERIODS = 5  # 冷启动阶段持续的统计周期数
+    COOLDOWN_PERIODS = 3  # 路径切换后的冷却周期数（期间不再切换）
+    CONGESTION_THRESHOLD = 0.7
+    PREDICT_MAE = 0.06
+    EMA_ALPHA = 0.6  # 指数移动平均的平滑因子
+    WINDOW_SIZE = 3
+
+    def __init__(self, model_dir, pred_csv_path, poll_interval):
+        model_path_a = os.path.join(model_dir, "model_path_A.pkl")
+        model_path_b = os.path.join(model_dir, "model_path_B.pkl")
+
+        self.curr_path = "A"
+        self.smoothed_a = None
+        self.smoothed_b = None
+        self.stats_counts = 0
+        self.feature_queue = []  # 存储最近 N 次的特征值
+        self.cooldown_remaining = 0  # 路径切换冷却时间剩余秒数
+        self.model_a = joblib.load(model_path_a)
+        self.model_b = joblib.load(model_path_b)
+        self.poll_interval = poll_interval
+
+        self.pred_csv = open(pred_csv_path, "w", newline="")
+        self.pred_writer = csv.writer(self.pred_csv)
+        self.pred_writer.writerow(["timestamp", "link", "predicted", "smoothed"])
+
+    def on_stats_collected(self, util_a, util_b):
+        self.stats_counts += 1
+
+        # 阶段一：冷启动阶段——仅收集数据，不做决策
+        if self.stats_counts < self.COLD_START_PERIODS:
+            if len(self.feature_queue) < self.WINDOW_SIZE:
+                self.feature_queue.append((util_a, util_b))
+            return None
+
+        # 阶段二：特征积累阶段——继续收集数据，直到达到窗口大小
+        if len(self.feature_queue) < self.WINDOW_SIZE:
+            self.feature_queue.append((util_a, util_b))
+            return None
+
+        # 阶段三：冷却期——不做切换，但继续更新平滑值
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+            if self.cooldown_remaining == 0:
+                # 冷却期结束，重置统计计数以重新进入冷启动阶段
+                self.feature_queue.clear()
+                self.smoothed_a = None
+                self.smoothed_b = None
+            return None
+
+        # 阶段四：预测模式
+        self.feature_queue.pop(0)  # 移除最旧的特征
+        self.feature_queue.append((util_a, util_b))  # 添加最新的特征
+
+        # 构建六维特征向量
+        combined = []
+        for ua, ub in self.feature_queue:
+            combined.extend([ua, ub])
+
+        # 分别预测 path A 和 path B 的拥塞概率
+        pred_a = self._predict(combined, "A")
+        pred_b = self._predict(combined, "B")
+
+        # EMA 平滑
+        if self.smoothed_a is None:
+            self.smoothed_a = pred_a
+            self.smoothed_b = pred_b
+        else:
+            self.smoothed_a = (
+                self.EMA_ALPHA * pred_a + (1 - self.EMA_ALPHA) * self.smoothed_a
+            )
+            self.smoothed_b = (
+                self.EMA_ALPHA * pred_b + (1 - self.EMA_ALPHA) * self.smoothed_b
+            )
+
+        # 记录预测结果
+        timestamp = (int(time.time()) // self.poll_interval) * self.poll_interval
+        self.pred_writer.writerow([timestamp, "path_A", pred_a, self.smoothed_a])
+        self.pred_writer.writerow([timestamp, "path_B", pred_b, self.smoothed_b])
+        self.pred_csv.flush()
+
+        # 决策：MAE 感知切换
+        if self.curr_path == "A":
+            if (self.smoothed_a + self.PREDICT_MAE > self.CONGESTION_THRESHOLD) and (
+                self.smoothed_b + self.PREDICT_MAE < self.CONGESTION_THRESHOLD
+            ):
+                self.curr_path = "B"
+                self.cooldown_remaining = self.COOLDOWN_PERIODS
+                return "B"
+        else:
+            if (self.smoothed_b + self.PREDICT_MAE > self.CONGESTION_THRESHOLD) and (
+                self.smoothed_a + self.PREDICT_MAE < self.CONGESTION_THRESHOLD
+            ):
+                self.curr_path = "A"
+                self.cooldown_remaining = self.COOLDOWN_PERIODS
+                return "A"
+
+        return None
+
+    def _predict(self, features, target):
+        X = np.array(features).reshape(1, -1)
+        model = self.model_a if target == "A" else self.model_b
+        return float(model.predict(X)[0])
+
+    def get_state_name(self):
+        if self.stats_counts < self.COLD_START_PERIODS:
+            return f"ColdStart[{self.stats_counts}/{self.COLD_START_PERIODS}]"
+        if len(self.feature_queue) < self.WINDOW_SIZE:
+            return "Filling_Queue"
+        if self.cooldown_remaining > 0:
+            return f"Cooldown[{self.cooldown_remaining}/{self.COOLDOWN_PERIODS}]"
+        return "Model_Predict"
+
+    def close(self):
+        if self.pred_csv and not self.pred_csv.closed:
+            self.pred_csv.close()
+
+
+class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(ThresholdBalancer, self).__init__(*args, **kwargs)
+        super(PredictiveBalancer, self).__init__(*args, **kwargs)
         self.mac_to_port = {}  # {dpid: {mac: port}}
         self.host_location = {}  # {mac: (dpid, port)}
         self.ip_to_mac = {}  # {ip: mac}
         self.network = nx.Graph()
         self.datapaths = {}  # {dpid: datapath} (StatsMixin 需要)
-        self.current_path = "A"  # 默认路径 A
         self.topo_ready = False
         self.path_installed = False  # 路径流表是否已安装
 
         self.init_stats()
 
+        model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+        self.engine = DecisionEngine(
+            model_dir=model_dir,
+            pred_csv_path=PREDICTIVE_CSV_PATH,  # 使用顶部定义的路径
+            poll_interval=self.curr_poll_interval,  # StatsMixin 提供的轮询间隔
+        )
+
+        atexit.register(self._cleanup)
         self.decision_thread = hub.spawn(self._decision_loop)
 
     # ──────────────────────────────────────────────
@@ -154,7 +276,7 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
             and h1_mac in self.host_location
             and h3_mac in self.host_location
         ):
-            self._install_full_path(self.current_path)
+            self._install_full_path(self.engine.curr_path)
             self.path_installed = True
             # 处理当前数据包（沿已安装路径转发）
             out_port = self._get_path_out_port(dpid)
@@ -217,12 +339,12 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
 
     def _get_path_out_port(self, dpid):
         """获取当前路径下该交换机的出端口"""
-        path = PATH_PORTS.get(self.current_path, {})
+        path = PATH_PORTS.get(self.engine.curr_path, {})
         return path.get(dpid)
 
     def _get_out_port(self, from_dpid, to_dpid):
         """计算从 from_dpid 到 to_dpid 的出端口（基于当前路径拓扑）"""
-        path = self.current_path
+        path = self.engine.curr_path
         if path == "A":
             chain = [1, 2, 4]
         else:
@@ -281,11 +403,9 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
 
     def _switch_path(self, new_path):
         """切换路径：删除 s1 旧流表 + 在所有交换机安装新流表"""
-        self.logger.info(
-            ">>> Switching from path %s to path %s", self.current_path, new_path
-        )
+        old_path = "A" if new_path == "B" else "B"
+        self.logger.info(">>> Switching from path %s to path %s", old_path, new_path)
         self._clear_path_flows()
-        self.current_path = new_path
         if self.path_installed:
             self._install_full_path(new_path)
 
@@ -310,7 +430,7 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
     # 阈值决策循环
     # ──────────────────────────────────────────────
     def _decision_loop(self):
-        """每 POLL_INTERVAL 秒检查链路利用率，超阈值则切换路径"""
+        """每 POLL_INTERVAL 秒采集利用率，交给模型决策"""
         while True:
             hub.sleep(self.curr_poll_interval)
             if not self.datapaths:
@@ -319,23 +439,27 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
             util_a = self._get_path_util("A")
             util_b = self._get_path_util("B")
 
+            # 调用决策引擎
+            decision = self.engine.on_stats_collected(util_a, util_b)
+
+            # 打印状态
+            state = (
+                self.engine.get_state_name()
+                if hasattr(self.engine, "get_state_name")
+                else "?"
+            )
             self.logger.info(
-                "Path A: %.1f%%, Path B: %.1f%%, current: %s",
+                "Path A: %.1f%%, Path B: %.1f%%, Engine state: %s, Current path: %s, Decision: %s",
                 util_a * 100,
                 util_b * 100,
-                self.current_path,
+                state,
+                self.engine.curr_path,
+                decision if decision else "None",
             )
 
-            if self.current_path == "A" and util_a > 0.70 and util_b < 0.50:
-                self.logger.info(
-                    "Path A congested (%.1f%%), rerouting to B", util_a * 100
-                )
-                self._switch_path("B")
-            elif self.current_path == "B" and util_b > 0.70 and util_a < 0.50:
-                self.logger.info(
-                    "Path B congested (%.1f%%), rerouting to A", util_b * 100
-                )
-                self._switch_path("A")
+            # 如果引擎要求切换，则执行切换
+            if decision is not None:
+                self._switch_path(decision)
 
     def _get_path_util(self, path_name):
         """获取路径瓶颈利用率（所有核心链路的最大值）"""
@@ -345,6 +469,10 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
             keys = [(1, 4), (3, 2), (4, 4)]
         utils = [self.link_utilization.get(k, 0) for k in keys]
         return max(utils) if utils else 0
+
+    def _cleanup(self):
+        if hasattr(self, "engine"):
+            self.engine.close()
 
     # ──────────────────────────────────────────────
     # 统计回复

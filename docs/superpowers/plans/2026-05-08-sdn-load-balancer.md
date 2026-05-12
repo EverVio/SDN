@@ -18,7 +18,7 @@
 |--------|------|------|---------|
 | `base_controller.py` | 基准对照（无负载均衡） | L2 学习交换机：MAC 学习 + 泛洪 | 证明负载均衡的必要性 |
 | `threshold_balancer.py` | 对照组（阈值响应式） | 显式路径 + if util>70% 则切换 | 传统方法的延迟响应 |
-| `ai_balancer.py` | 实验组（AI 预测式） | 显式路径 + RF 预测 + EMA + 冷启动 + 冷却锁 | **核心创新** |
+| `predictive_balancer.py` | 实验组（AI 预测式） | 显式路径 + RF 预测 + EMA + 冷启动 + 冷却锁 | **核心创新** |
 
 实验对比维度：`无 LB` vs `阈值 LB` vs `AI LB`，突出 AI 预测的**提前切换能力**和**高负载下的吞吐量平稳度**。
 
@@ -90,7 +90,7 @@
 │   ├── base_controller.py       # Phase 2: L2 学习交换机（对照基准）✅
 │   ├── stats_mixin.py           # Phase 3: 端口统计采集 Mixin ✅
 │   ├── threshold_balancer.py    # Phase 3: 阈值响应式负载均衡（对照组）✅
-│   └── ai_balancer.py           # Phase 4: AI 预测式负载均衡（实验组）⬜
+│   └── predictive_balancer.py           # Phase 4: AI 预测式负载均衡（实验组）⬜
 ├── scripts/                     # 流量生成、数据处理、模型训练
 │   ├── traffic_gen.py           # Phase 3: 动态流量生成器（含高斯噪声）✅
 │   └── run_experiment.py        # Phase 3: 实验编排（拓扑 + 流量生成）✅
@@ -268,7 +268,7 @@ mininet> iperf h1 h3
 
 #### 你要做什么
 
-在 `threshold_balancer.py` 和 `ai_balancer.py` 中实现一个共享的统计采集模块（设计为 Mixin 类）。每 3 秒向所有已连接的交换机发送 OpenFlow 端口统计请求，收到回复后计算每条核心链路的瞬时利用率，写入 CSV 文件。
+在 `threshold_balancer.py` 和 `predictive_balancer.py` 中实现一个共享的统计采集模块（设计为 Mixin 类）。每 3 秒向所有已连接的交换机发送 OpenFlow 端口统计请求，收到回复后计算每条核心链路的瞬时利用率，写入 CSV 文件。
 
 #### 关键概念
 
@@ -893,25 +893,25 @@ cat data/model_evaluation_summary.csv
 
 **本节目标：** 在 Phase 3 的 `threshold_balancer.py` 基础上，将决策层从"当前超阈值才切换"替换为"ML 预测下一周期将拥塞，提前切换"。使用 Phase 3 训练好的 Random Forest 模型进行在线推理。这是本项目的核心创新——从被动响应变为主动预防。
 
-**本节产出：** `controller/ai_balancer.py`
+**本节产出：** `controller/predictive_balancer.py`
 
 ---
 
 ### 4.1 你需要做什么
 
-创建 `/root/SDN/controller/ai_balancer.py`，它与 `threshold_balancer.py` 的**唯一区别**在决策层。拓扑发现、Host 学习、ARP 单播转发、显式路径安装、StatsMixin 这些模块完全相同，直接复制即可。
+创建 `/root/SDN/controller/predictive_balancer.py`，它与 `threshold_balancer.py` 的**唯一区别**在决策层。拓扑发现、Host 学习、ARP 单播转发、显式路径安装、StatsMixin 这些模块完全相同，直接复制即可。
 
 你需要新增一个 `DecisionEngine` 类，实现：
 
 1. **状态机**：Cold Start → AI Prediction → Cooldown 三态循环
 2. **ML 推理**：加载 Phase 3 训练好的 Random Forest 模型，输入 6 维特征，输出下一周期利用率预测
 3. **EMA 平滑**：对预测值做指数移动平均，消除单次预测的抖动
-4. **MAE 感知阈值**：`predicted + model_error > 0.65` 才判定拥塞，而非简单的 `predicted > 0.65`
+4. **MAE 感知阈值**：`predicted + model_error > 0.7` 才判定拥塞，而非简单的 `predicted > 0.7`
 5. **预测日志**：每次预测写入 `data/predictions.csv`，用于后续可视化（预测 vs 实际）
 
 #### 与 threshold_balancer.py 的本质区别
 
-| | threshold_balancer.py | ai_balancer.py |
+| | threshold_balancer.py | predictive_balancer.py |
 |---|---|---|
 | 决策依据 | **当前**利用率 > 70% | **预测**下一周期利用率 + MAE > 65% |
 | 切换时机 | 拥塞**已经发生**后 | 拥塞**即将发生**前 |
@@ -982,7 +982,7 @@ smoothed = α × predicted + (1-α) × smoothed_prev
 
 #### MAE 感知阈值
 
-模型有误差（MAE ≈ 0.08）。如果阈值是 65%，模型预测 62% 就认为安全，但实际可能是 70%——已经拥塞了。
+模型有误差（MAE ≈ 0.6）。如果阈值是 65%，模型预测 62% 就认为安全，但实际可能是 70%——已经拥塞了。
 
 修正公式：`predicted + PREDICT_MAE > threshold`。这样当模型预测 57% + 8% = 65% 时就触发切换，留出误差缓冲。
 
@@ -998,16 +998,16 @@ smoothed = α × predicted + (1-α) × smoothed_prev
 |------|-----|------|
 | `COLD_START_PERIODS` | 5 | 冷启动阶段收集数据点（≥ WINDOW_SIZE） |
 | `COOLDOWN_PERIODS` | 3 | 重路由后锁定 9 秒 |
-| `CONGESTION_PREDICT_THRESHOLD` | 0.65 | 预测拥塞阈值（低于实际 70%，给 MAE 留空间） |
+| `CONGESTION_PREDICT_THRESHOLD` | 0.7 | 预测拥塞阈值（低于实际 70%，给 MAE 留空间） |
 | `EMA_ALPHA` | 0.3 | EMA 平滑系数 |
-| `PREDICT_MAE` | 0.08 | 模型 MAE，用于阈值修正 |
+| `PREDICT_MAE` | 0.6 | 模型 MAE，用于阈值修正 |
 | `WINDOW_SIZE` | 3 | 滑动窗口（3 时间步 × 2 链路 = 6 维特征） |
 
 ### 4.3 实现步骤
 
 #### Step 1：复制 threshold_balancer.py
 
-从 `threshold_balancer.py` 复制一份作为 `ai_balancer.py` 的起点。修改类名（如 `AIPredictiveBalancer`）。
+从 `threshold_balancer.py` 复制一份作为 `predictive_balancer.py` 的起点。修改类名（如 `AIPredictiveBalancer`）。
 
 #### Step 2：删除旧决策逻辑
 
@@ -1015,7 +1015,7 @@ smoothed = α × predicted + (1-α) × smoothed_prev
 
 #### Step 3：实现 DecisionEngine 类
 
-在 `ai_balancer.py` 中定义一个独立的 `DecisionEngine` 类（不继承 RyuApp）。核心方法：
+在 `predictive_balancer.py` 中定义一个独立的 `DecisionEngine` 类（不继承 RyuApp）。核心方法：
 
 - `__init__(self, model_dir, predict_mae)`：加载两个 pkl 模型，初始化状态变量
 - `on_stats_collected(self, util_a, util_b)`：决策主逻辑，返回 `None` 或 `'A'`/`'B'`
@@ -1091,11 +1091,11 @@ class DecisionEngine:
 
     COLD_START_PERIODS = 5
     COOLDOWN_PERIODS = 3
-    CONGESTION_PREDICT_THRESHOLD = 0.65
+    CONGESTION_PREDICT_THRESHOLD = 0.7
     EMA_ALPHA = 0.3
     WINDOW_SIZE = 3  # 3 个时间步 × 2 条链路 = 6 维
 
-    def __init__(self, model_dir='models/', predict_mae=0.08,
+    def __init__(self, model_dir='models/', predict_mae=0.6,
                  poll_interval=3, pred_csv_path='data/predictions.csv'):
         self.model_a = joblib.load(f'{model_dir}/model_path_A.pkl')
         self.model_b = joblib.load(f'{model_dir}/model_path_B.pkl')
@@ -1217,10 +1217,10 @@ class DecisionEngine:
 </details>
 
 <details>
-<summary>点击展开 ai_balancer.py 模块结构参考</summary>
+<summary>点击展开 predictive_balancer.py 模块结构参考</summary>
 
 ```
-ai_balancer.py
+predictive_balancer.py
 ├── __init__
 │   ├── load DecisionEngine (model_dir, predict_mae, poll_interval)
 │   ├── init mac_to_port, host_location
@@ -1254,7 +1254,7 @@ ai_balancer.py
 # 确保 models/model_path_A.pkl 和 model_path_B.pkl 存在（Phase 3 训练好的）
 
 # 终端 1
-ryu-manager controller/ai_balancer.py --observe-links 2>&1 | tee data/ai_ryu.log
+ryu-manager controller/predictive_balancer.py --observe-links 2>&1 | tee data/ai_ryu.log
 
 # 终端 2
 sudo python3 scripts/run_experiment.py
@@ -1316,7 +1316,7 @@ head data/predictions.csv
 |------|--------|---------|---------|
 | **Exp A: 无负载均衡** | `base_controller.py` | 流量全走单一路径，另一条空闲 | 证明 LB 的必要性 |
 | **Exp B: 阈值响应式** | `threshold_balancer.py` | 拥塞后才切换，有延迟 | 传统方法的瓶颈 |
-| **Exp C: AI 预测式** | `ai_balancer.py` | 拥塞前主动切换，无感知 | **AI 的核心优势** |
+| **Exp C: AI 预测式** | `predictive_balancer.py` | 拥塞前主动切换，无感知 | **AI 的核心优势** |
 
 ### 5.2 关键概念
 
@@ -1371,7 +1371,7 @@ sudo python3 scripts/run_experiment.py
 
 ```bash
 # 终端 1
-ryu-manager controller/ai_balancer.py --observe-links 2>&1 | tee data/expC_ryu.log
+ryu-manager controller/predictive_balancer.py --observe-links 2>&1 | tee data/expC_ryu.log
 
 # 终端 2
 sudo python3 scripts/run_experiment.py
@@ -1601,7 +1601,7 @@ mininet> h3 iperf -c 10.0.0.1 -u -b 5M -t 3 -i 1
 mininet> exit
 # Ctrl+C 停止 Ryu
 # 重新启动
-ryu-manager controller/ai_balancer.py --observe-links
+ryu-manager controller/predictive_balancer.py --observe-links
 sudo python3 scripts/run_experiment.py
 ```
 
@@ -1627,8 +1627,8 @@ sudo python3 scripts/run_experiment.py
 |------|------|
 | `ryu-manager controller/base_controller.py --observe-links` | 基础控制器 |
 | `ryu-manager controller/threshold_balancer.py --observe-links` | 阈值负载均衡 |
-| `ryu-manager controller/ai_balancer.py --observe-links` | AI 负载均衡 |
-| `ryu-manager --verbose controller/ai_balancer.py` | 详细日志模式 |
+| `ryu-manager controller/predictive_balancer.py --observe-links` | AI 负载均衡 |
+| `ryu-manager --verbose controller/predictive_balancer.py` | 详细日志模式 |
 
 ### Python 脚本
 
@@ -1648,7 +1648,7 @@ sudo python3 scripts/run_experiment.py
 - [x] **Phase 1：** Mininet 拓扑运行成功，双路径建立，pingall 0% dropped
 - [x] **Phase 2：** base_controller.py 验证通过
 - [x] **Phase 3：** StatsMixin + 流量生成器 + threshold_balancer.py 实现 ✅，双路径训练数据采集完成 ✅，特征组装 + RF 模型训练完成 ✅，R² > 0.94 ✅
-- [ ] **Phase 4：** ai_balancer.py 实现，冷启动→AI→冷却状态机验证通过
+- [ ] **Phase 4：** predictive_balancer.py 实现，冷启动→AI→冷却状态机验证通过
 - [ ] **Phase 5：** 三阶段对照实验完成，有完整数据和图表
 - [ ] **收尾：** 截图、录屏、数据文件整理完毕
 

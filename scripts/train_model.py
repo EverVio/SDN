@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-随机森林模型训练与可视化分析脚本（改进版）
+随机森林模型训练与可视化分析
 功能：
   1. 读取 training_features.csv，按链路（path_A / path_B）分别建模
   2. 使用 TimeSeriesSplit 交叉验证评估模型稳定性
