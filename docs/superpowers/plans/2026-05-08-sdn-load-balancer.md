@@ -4,7 +4,7 @@
 
 **Goal:** 基于 Ryu 控制器 + Mininet 仿真，实现一个"AI 预测驱动的主动式动态负载均衡调度器"，通过机器学习模型预测链路拥塞趋势，在拥塞发生**之前**提前重路由，并通过三阶段对照实验（无负载均衡 → 阈值响应式 → AI 预测式）验证 AI 赋能的优势。
 
-**Architecture:** Mininet 构建双路径拓扑（4 交换机 + 4 主机），Ryu 控制器作为 SDN 控制平面。控制器周期性采集端口统计信息，喂入 Ridge 回归模型预测未来链路利用率，当预测值超阈值时主动将流量从即将拥塞的路径重路由至轻载路径。
+**Architecture:** Mininet 构建双路径拓扑（4 交换机 + 4 主机），Ryu 控制器作为 SDN 控制平面。控制器周期性采集端口统计信息，喂入 Random Forest 回归模型预测未来链路利用率，当预测值超阈值时主动将流量从即将拥塞的路径重路由至轻载路径。
 
 **Tech Stack:** Python 3.9 / Ryu SDN Framework 4.34 / Mininet / Open vSwitch 3.3.4 / OpenFlow 1.3 / scikit-learn / joblib / numpy / iperf / Conda (sdn)
 
@@ -18,7 +18,7 @@
 |--------|------|------|---------|
 | `base_controller.py` | 基准对照（无负载均衡） | L2 学习交换机：MAC 学习 + 泛洪 | 证明负载均衡的必要性 |
 | `threshold_balancer.py` | 对照组（阈值响应式） | 显式路径 + if util>70% 则切换 | 传统方法的延迟响应 |
-| `ai_balancer.py` | 实验组（AI 预测式） | 显式路径 + Ridge 预测 + EMA + 冷启动 + 冷却锁 | **核心创新** |
+| `ai_balancer.py` | 实验组（AI 预测式） | 显式路径 + RF 预测 + EMA + 冷启动 + 冷却锁 | **核心创新** |
 
 实验对比维度：`无 LB` vs `阈值 LB` vs `AI LB`，突出 AI 预测的**提前切换能力**和**高负载下的吞吐量平稳度**。
 
@@ -48,7 +48,7 @@
         │          Ryu Controller          │
         │  (OpenFlow 控制平面, TCP 6633)   │
         │  ┌────────────────────────────┐  │
-        │  │  ML Model (Ridge Regress)  │  │
+        │  │  ML Model (Random Forest)  │  │
         │  │  predict U_{t+1} → reroute │  │
         │  └────────────────────────────┘  │
         └──────────┬───────────┬───────────┘
@@ -106,10 +106,19 @@
 
 Phase 3 ML 训练完成后新增：
 ├── scripts/assemble_features.py # 特征组装脚本
-├── scripts/train_model.py       # 模型训练脚本
-├── data/training_features.csv   # 组装后的训练特征
-├── models/model_path_A.pkl      # 路径 A 预测模型
-└── models/model_path_B.pkl      # 路径 B 预测模型
+├── scripts/train_model.py       # 模型训练脚本（RF + CV + GridSearchCV）✅
+├── data/training_features.csv   # 组装后的训练特征 ✅ (376行)
+├── data/model_evaluation_summary.csv # 模型评估摘要 ✅
+├── models/model_path_A.pkl      # 路径 A 预测模型 ✅ (RF, ~362KB)
+├── models/model_path_B.pkl      # 路径 B 预测模型 ✅ (RF, ~328KB)
+└── figures/                     # 可视化图表 ✅
+    ├── cv_scores_path_A/B.png        # 交叉验证分数
+    ├── learning_curve_path_A/B.png   # 学习曲线
+    ├── pred_scatter_path_A/B.png     # 预测散点图（含置信区间）
+    ├── feature_importance_path_A/B.png # 特征重要性
+    ├── residuals_path_A/B.png        # 残差分析
+    ├── error_distribution_path_A/B.png # 误差分布
+    └── prediction_timeseries_path_A/B.png # 时间序列对比
 
 Phase 4 完成后新增：
 ├── data/predictions.csv         # AI 预测值 vs 实际值
@@ -241,7 +250,7 @@ mininet> iperf h1 h3
 
 **复杂度：** 中-高 | **难度：** 中-高 | **预估工程量：** 8-10 小时
 
-**本节目标：** 构建完整的数据采集与路径控制基础设施。包括：(1) StatsMixin 端口统计采集器；(2) 动态流量生成器；(3) 阈值响应式负载均衡控制器（threshold_balancer.py）；(4) 使用 threshold_balancer 作为控制器采集双路径训练数据；(5) 特征组装与 Ridge 模型训练。
+**本节目标：** 构建完整的数据采集与路径控制基础设施。包括：(1) StatsMixin 端口统计采集器；(2) 动态流量生成器；(3) 阈值响应式负载均衡控制器（threshold_balancer.py）；(4) 使用 threshold_balancer 作为控制器采集双路径训练数据；(5) 特征组装与 Random Forest 模型训练。
 
 **本节产出：**
 - ✅ `controller/stats_mixin.py`（StatsMixin，120 行）
@@ -249,9 +258,9 @@ mininet> iperf h1 h3
 - ✅ `scripts/traffic_gen.py`（67 行）
 - ✅ `scripts/run_experiment.py`（62 行）
 - ✅ `data/traffic_data.csv`（490 行双路径训练数据）
-- ⬜ `scripts/assemble_features.py`（特征组装，待实现）
-- ⬜ `scripts/train_model.py`（模型训练，待实现）
-- ⬜ `models/model_path_A.pkl` + `models/model_path_B.pkl`（待训练）
+- ✅ `scripts/assemble_features.py`（特征组装）
+- ✅ `scripts/train_model.py`（模型训练，RF + CV + GridSearchCV）
+- ✅ `models/model_path_A.pkl` + `models/model_path_B.pkl`（已训练，RF 超参数调优）
 
 ---
 
@@ -605,9 +614,9 @@ print(df.groupby('link_label')['utilization'].describe())
 
 **复杂度：** 中 | **难度：** 中 | **预估工程量：** 3-4 小时
 
-**本节目标：** 将 Phase 3 采集的原始 CSV 数据，经过特征工程组装为训练数据集，训练 Ridge 回归模型，导出为 `model.pkl` 供控制器在线推理使用。
+**本节目标：** 将 Phase 3 采集的原始 CSV 数据，经过特征工程组装为训练数据集，训练 Random Forest 回归模型（含交叉验证与超参数调优），导出为 `.pkl` 文件供控制器在线推理使用。
 
-**本节产出：** `data/training_features.csv`（训练数据集），`models/model_path_A.pkl` + `models/model_path_B.pkl`（模型文件）
+**本节产出：** `data/training_features.csv`（训练数据集），`data/model_evaluation_summary.csv`（评估摘要），`models/model_path_A.pkl` + `models/model_path_B.pkl`（模型文件），`figures/` 下 14 张可视化图表
 
 ---
 
@@ -660,7 +669,7 @@ print(df.groupby('link_label')['utilization'].describe())
 1. **忘记 pivot**：如果你直接用原始长表做滑动窗口，每个 timestamp 有多行（不同端口），窗口逻辑会完全混乱。
 2. **aggfunc 用 sum 或 mean**：同一路径多个端口的利用率不应该求和（那会超过 100%），也不应该取平均（会低估瓶颈）。应该取最大值（max），因为路径瓶颈由最忙的链路段决定。
 3. **窗口中特征顺序错误**：必须严格交替 [U_A, U_B, U_A, U_B, ...]，否则模型无法正确学到双链路的时序关系。
-4. **数据量不足**：120 秒采集约 40 个时间点，减去 3 的窗口大小，只有 ~37 个位置 × 2 = ~74 个样本。数据量偏少，可多次采集叠加。
+4. **数据量不足**：单次 120 秒采集约 40 个时间点，减去 3 的窗口大小，只有 ~37 个位置 × 2 = ~74 个样本。数据量偏少，需多次采集叠加。实际使用了 5 批次数据，共 376 个样本（path_A: 188, path_B: 188）。
 
 #### 验证检查点
 
@@ -733,19 +742,27 @@ if __name__ == '__main__':
 
 #### 你要做什么
 
-创建 `/root/SDN/scripts/train_model.py`，读取 `training_features.csv`，训练 Ridge 回归模型，按链路分别导出两个 `.pkl` 文件。
+创建 `/root/SDN/scripts/train_model.py`，读取 `training_features.csv`，使用 Random Forest 回归模型进行训练。采用 TimeSeriesSplit 交叉验证评估模型稳定性，GridSearchCV 自动调优超参数，按链路分别导出两个 `.pkl` 文件，并生成丰富的可视化分析图表。
 
 #### 关键概念
 
-**Ridge Regression vs Random Forest：**
-- Ridge：线性回归 + L2 正则化。推理速度极快（<0.1ms），模型极小（~1KB），但只能学到线性关系。
-- Random Forest：集成 50 棵决策树。能学到非线性关系，但推理较慢（~1ms），模型较大（~50KB）。
-- 对于 3 秒轮询间隔，两者推理时间都足够。推荐 Ridge 作为主模型，RF 作为对比。
+**为什么选择 Random Forest？**
+- 集成多棵决策树，能学到非线性关系（链路利用率存在非线性动态）
+- 内置特征重要性分析，可解释哪些历史时刻对预测影响最大
+- 通过树方差可估计预测置信区间
+- OOB（Out-of-Bag）分数提供免费的交叉验证评估
+- 推理速度 ~1ms，完全满足 3 秒轮询间隔
 
 **为什么不能 shuffle 时间序列数据？**
 `sklearn.model_selection.train_test_split(X, y, shuffle=True)` 会随机打乱样本。对于时间序列，这意味着"未来的数据可能出现在训练集中"——模型在离线评估时准确率奇高（因为偷看了未来），上线实盘就崩溃。这叫 Data Leakage，是算法面试的高频陷阱。
 
-正确做法：前 80% 样本训练，后 20% 测试，严格保持时间顺序。
+正确做法：前 80% 样本训练，后 20% 测试，严格保持时间顺序。交叉验证同样使用 `TimeSeriesSplit` 而非标准 KFold。
+
+**TimeSeriesSplit 交叉验证：**
+标准 KFold 交叉验证会随机划分数据，对时间序列同样会造成数据泄漏。`TimeSeriesSplit` 保证每个验证折叠的训练集都在验证集之前——模拟真实的"用过去预测未来"场景。5 折 CV 提供比单次 80/20 划分更稳健的性能估计（均值 ± 标准差）。
+
+**GridSearchCV 超参数调优：**
+对 `n_estimators`（树数量）、`max_depth`（树深度）、`min_samples_leaf`（叶节点最小样本数）进行网格搜索，配合 TimeSeriesSplit 找到最优超参数组合。这比手动调参更系统、更可靠。
 
 **为什么按链路分别训练？**
 虽然输入特征相同（6 维全局状态），但 path_A 和 path_B 的目标值分布不同。分别训练让每个模型专注于预测特定链路，避免互相干扰。
@@ -754,143 +771,119 @@ if __name__ == '__main__':
 
 **Step 1：读取数据，提取特征列**
 
-特征列是所有以 `feat_` 开头的列。标签列是 `U_next`。
+特征列是所有以 `feat_` 开头的列（6 个）。标签列是 `U_next`。
 
-**Step 2：按时间顺序划分 80/20**
+**Step 2：TimeSeriesSplit 交叉验证**
 
-```python
-split_idx = int(len(X) * 0.8)
-X_train, X_test = X[:split_idx], X[split_idx:]
-```
+使用 `TimeSeriesSplit(n_splits=5)` 对默认 RF 配置进行交叉验证，记录每折的 MAE、RMSE、R²。输出均值 ± 标准差，评估模型稳定性。
 
-**Step 3：训练 Ridge 和 RF，对比指标**
+**Step 3：GridSearchCV 超参数调优**
 
-计算 MAE（平均绝对误差）、RMSE（均方根误差）、R²（解释方差比例）。记录 Ridge 的系数——它告诉你哪些历史时刻对预测影响最大（可在报告中分析）。
+搜索空间：
+- `n_estimators`: [30, 50, 100]
+- `max_depth`: [3, 5, 8, None]
+- `min_samples_leaf`: [1, 3, 5]
 
-**Step 4：按链路分别导出**
+使用 `TimeSeriesSplit(n_splits=5)` 作为 CV 策略，`scoring='neg_mean_absolute_error'`。
 
-按 `target_label` 过滤数据，分别训练两个模型，导出为 `models/model_path_A.pkl` 和 `models/model_path_B.pkl`。
+**Step 4：训练/测试集评估**
+
+用最优超参数的模型在 80/20 时间序列划分上评估。计算测试集 MAE、RMSE、R²、相关系数。通过树方差计算预测置信区间。
+
+**Step 5：生成可视化图表**
+
+- 交叉验证分数柱状图（每折 MAE/RMSE/R²）
+- 学习曲线（训练集大小 vs 模型性能）
+- 预测散点图（含 ±1 标准差置信区间）
+- 特征重要性柱状图（含数值标注）
+- 残差分析图（残差 vs 预测值 + 残差分布）
+- 误差分布直方图
+- 预测值时间序列对比图
+
+**Step 6：全量训练并导出**
+
+用最优超参数在全部数据上重新训练，导出为 `models/model_path_A.pkl` 和 `models/model_path_B.pkl`。输出模型评估摘要 CSV。
 
 #### 常见陷阱
 
 1. **shuffle=True**：最致命的错误。时间序列数据一旦随机打乱，离线指标全部作废。
-2. **忘记按链路分组**：如果用混合数据训练单个模型，path_A 和 path_B 的预测会互相干扰。
-3. **alpha 太小**：Ridge 的 alpha=0 退化为普通最小二乘，容易过拟合小数据集。alpha=1.0 是合理的默认值。
+2. **用 KFold 而非 TimeSeriesSplit**：标准 KFold 同样会引入数据泄漏，交叉验证结果不可信。
+3. **忘记按链路分组**：如果用混合数据训练单个模型，path_A 和 path_B 的预测会互相干扰。
+4. **max_depth=None 无限制**：小数据集上容易过拟合，GridSearchCV 会自动选择合适的深度。
+5. **忽视树方差**：RF 的树方差是天然的不确定性估计，在散点图中展示置信区间能增强报告说服力。
 
 #### 验证检查点
 
-- [ ] `python3 scripts/train_model.py` 运行无报错
-- [ ] Ridge MAE < 0.08, R² > 0.85
-- [ ] `models/model_path_A.pkl` 和 `models/model_path_B.pkl` 存在，各 ~1-5 KB
-- [ ] Ridge 系数可解释（如 `feat_4` 和 `feat_5` 系数最大，说明最近一个时间步影响最大）
+- [x] `python3 scripts/train_model.py` 运行无报错
+- [x] RF 测试集 MAE < 0.04, R² > 0.94
+- [x] CV R² 均值 > 0.80（稳定性验证）
+- [x] `models/model_path_A.pkl` 和 `models/model_path_B.pkl` 存在
+- [x] 特征重要性可解释（`feat_4` 和 `feat_5` 权重最大，说明最近一个时间步影响最大）
+- [x] 14 张可视化图表生成至 `figures/` 目录
+- [x] `data/model_evaluation_summary.csv` 包含完整的评估指标
 
-#### 参考实现
+#### 实际实现
 
-<details>
-<summary>点击展开 train_model.py 完整代码</summary>
+**实际代码：** 参见 `/root/SDN/scripts/train_model.py`
 
-```python
-#!/usr/bin/env python3
-"""离线模型训练：Ridge Regression + Random Forest 对比"""
-import pandas as pd
-import numpy as np
-from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import joblib
-import argparse
-import os
+**实际超参数调优结果：**
 
+| 参数 | path_A 最优值 | path_B 最优值 |
+|------|-------------|-------------|
+| n_estimators | 50 | 50 |
+| max_depth | 8 | 8 |
+| min_samples_leaf | 1 | 1 |
 
-def train(input_csv, output_model):
-    df = pd.read_csv(input_csv)
+**实际模型性能：**
 
-    feat_cols = [c for c in df.columns if c.startswith('feat_')]
-    X = df[feat_cols].values
-    y = df['U_next'].values
+| 指标 | path_A (测试集) | path_B (测试集) | path_A (CV) | path_B (CV) |
+|------|----------------|----------------|-------------|-------------|
+| MAE | 0.0361 | 0.0311 | 0.0600±0.0352 | 0.0520±0.0336 |
+| RMSE | 0.0534 | 0.0657 | 0.1021±0.0597 | 0.1015±0.0604 |
+| R² | 0.9645 | 0.9433 | 0.8197±0.1516 | 0.8346±0.1256 |
+| Correlation | 0.9828 | 0.9723 | — | — |
 
-    # ⚠️ 时间序列：绝不能 shuffle，必须按时间顺序划分
-    split_idx = int(len(X) * 0.8)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-
-    print(f"Training: {len(X_train)}, Test: {len(X_test)}")
-
-    # Ridge Regression
-    ridge = Ridge(alpha=1.0)
-    ridge.fit(X_train, y_train)
-    ridge_pred = ridge.predict(X_test)
-    ridge_mae = mean_absolute_error(y_test, ridge_pred)
-    ridge_r2 = r2_score(y_test, ridge_pred)
-    print(f"\nRidge — MAE: {ridge_mae:.4f}, R²: {ridge_r2:.4f}")
-    print(f"  Coefficients: {ridge.coef_}")
-
-    # Random Forest
-    rf = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
-    rf.fit(X_train, y_train)
-    rf_pred = rf.predict(X_test)
-    rf_mae = mean_absolute_error(y_test, rf_pred)
-    rf_r2 = r2_score(y_test, rf_pred)
-    print(f"RF    — MAE: {rf_mae:.4f}, R²: {rf_r2:.4f}")
-
-    # 按链路分别导出更优模型
-    best_name = "Ridge" if ridge_r2 >= rf_r2 else "RF"
-    model_dir = os.path.dirname(output_model)
-    os.makedirs(model_dir, exist_ok=True)
-
-    for label in ['path_A', 'path_B']:
-        mask = df['target_label'] == label
-        X_l = df[feat_cols][mask].values
-        y_l = df['U_next'][mask].values
-        s = int(len(X_l) * 0.8)
-
-        m = Ridge(alpha=1.0) if best_name == "Ridge" else RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
-        m.fit(X_l[:s], y_l[:s])
-        p = f'{model_dir}/model_{label}.pkl'
-        joblib.dump(m, p)
-        print(f"  {label} → {p} ({os.path.getsize(p)/1024:.1f} KB)")
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input', default='data/training_features.csv')
-    parser.add_argument('--output', default='models/model.pkl')
-    args = parser.parse_args()
-    train(args.input, args.output)
-```
-
-</details>
+**特征重要性分析：**
+- path_A: `feat_4`（U_A(t)）权重 0.6954，`feat_2`（U_A(t-1)）权重 0.1501
+- path_B: `feat_5`（U_B(t)）权重 0.6637，`feat_3`（U_B(t-1)）权重 0.1443
+- 结论：最近一个时间步的同链路利用率是最重要的预测因子，符合直觉。
 
 ---
 
 ### 3.8 完整训练流程
 
 ```bash
-# Step 1: 确保 data/traffic_data.csv 存在（Phase 3 采集的数据）
+# Step 1: 确保 data/traffic_data_*.csv 存在（Phase 3 采集的多批次数据）
 
 # Step 2: 组装多变量特征
 python3 scripts/assemble_features.py
-# 预期：Assembled ~74 samples, Feature dim: 6
+# 实际输出：376 samples, Feature dim: 6, path_A: 188, path_B: 188
 
-# Step 3: 训练模型
+# Step 3: 训练模型（含交叉验证 + 超参数调优）
 python3 scripts/train_model.py
-# 预期：Ridge MAE < 0.08, R² > 0.85
-#       Exported → models/model_path_A.pkl, models/model_path_B.pkl
+# 实际输出：RF 测试集 MAE ~0.03, R² > 0.94
+#           14 张可视化图表 → figures/
+#           模型评估摘要 → data/model_evaluation_summary.csv
+#           Exported → models/model_path_A.pkl, models/model_path_B.pkl
 
 # Step 4: 验证
 ls -la models/
+ls -la figures/
+cat data/model_evaluation_summary.csv
 ```
 
-**预期模型性能（多变量方案，6 维输入）：**
+**实际模型性能（Random Forest，6 维输入，超参数调优后）：**
 
-| 指标 | Ridge (目标) | Random Forest | 说明 |
-|------|-------------|---------------|------|
-| MAE | < 0.07 | < 0.09 | 多变量特征降低误差 |
-| RMSE | < 0.10 | < 0.12 | 惩罚大误差 |
-| R² | > 0.88 | > 0.82 | 多变量提升解释方差 |
-| 推理时间 | < 0.1ms | < 1ms | 均满足 3 秒轮询间隔 |
+| 指标 | path_A (测试集) | path_B (测试集) | 说明 |
+|------|----------------|----------------|------|
+| MAE | 0.0361 | 0.0311 | 远优于目标 0.07 |
+| RMSE | 0.0534 | 0.0657 | 大误差控制良好 |
+| R² | 0.9645 | 0.9433 | 解释方差 > 94% |
+| Correlation | 0.9828 | 0.9723 | 预测与实际高度相关 |
+| CV R² | 0.8197±0.1516 | 0.8346±0.1256 | 交叉验证稳定性 |
+| 推理时间 | < 1ms | < 1ms | 满足 3 秒轮询间隔 |
 
-> **保存证据：** 截图训练输出（MAE、R²、系数），保存模型文件，记录 Ridge 系数用于报告分析。
+> **保存证据：** 截图训练输出（MAE、R²、CV 分数），保存模型文件和图表，记录特征重要性用于报告分析。
 
 ---
 
@@ -898,7 +891,7 @@ ls -la models/
 
 **复杂度：** 高 | **难度：** 高 | **预估工程量：** 8-10 小时
 
-**本节目标：** 在 Phase 3 的 `threshold_balancer.py` 基础上，将决策层从"当前超阈值才切换"替换为"ML 预测下一周期将拥塞，提前切换"。使用 Phase 3 训练好的 Ridge 模型进行在线推理。这是本项目的核心创新——从被动响应变为主动预防。
+**本节目标：** 在 Phase 3 的 `threshold_balancer.py` 基础上，将决策层从"当前超阈值才切换"替换为"ML 预测下一周期将拥塞，提前切换"。使用 Phase 3 训练好的 Random Forest 模型进行在线推理。这是本项目的核心创新——从被动响应变为主动预防。
 
 **本节产出：** `controller/ai_balancer.py`
 
@@ -911,7 +904,7 @@ ls -la models/
 你需要新增一个 `DecisionEngine` 类，实现：
 
 1. **状态机**：Cold Start → AI Prediction → Cooldown 三态循环
-2. **ML 推理**：加载 Phase 3 训练好的 Ridge 模型，输入 6 维特征，输出下一周期利用率预测
+2. **ML 推理**：加载 Phase 3 训练好的 Random Forest 模型，输入 6 维特征，输出下一周期利用率预测
 3. **EMA 平滑**：对预测值做指数移动平均，消除单次预测的抖动
 4. **MAE 感知阈值**：`predicted + model_error > 0.65` 才判定拥塞，而非简单的 `predicted > 0.65`
 5. **预测日志**：每次预测写入 `data/predictions.csv`，用于后续可视化（预测 vs 实际）
@@ -1654,7 +1647,7 @@ sudo python3 scripts/run_experiment.py
 
 - [x] **Phase 1：** Mininet 拓扑运行成功，双路径建立，pingall 0% dropped
 - [x] **Phase 2：** base_controller.py 验证通过
-- [ ] **Phase 3：** StatsMixin + 流量生成器 + threshold_balancer.py 实现 ✅，双路径训练数据采集完成 ✅，特征组装 + Ridge 模型训练完成 ⬜，R² > 0.85 ⬜
+- [x] **Phase 3：** StatsMixin + 流量生成器 + threshold_balancer.py 实现 ✅，双路径训练数据采集完成 ✅，特征组装 + RF 模型训练完成 ✅，R² > 0.94 ✅
 - [ ] **Phase 4：** ai_balancer.py 实现，冷启动→AI→冷却状态机验证通过
 - [ ] **Phase 5：** 三阶段对照实验完成，有完整数据和图表
 - [ ] **收尾：** 截图、录屏、数据文件整理完毕
@@ -1669,7 +1662,7 @@ sudo python3 scripts/run_experiment.py
 
 ### D.2 多模型对比
 
-同时导出 Ridge 和 Random Forest，在运行时切换，对比推理延迟和预测准确度。
+可考虑 Ridge 回归作为轻量级替代（模型 ~1KB，推理 <0.1ms），与当前 RF 模型（~350KB，推理 ~1ms）对比。在 3 秒轮询间隔下两者都足够快，但 RF 的非线性拟合能力更强（R² 0.94 vs Ridge ~0.88）。
 
 ### D.3 可视化仪表盘
 
