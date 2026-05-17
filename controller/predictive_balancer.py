@@ -41,7 +41,7 @@ class DecisionEngine:
     COOLDOWN_PERIODS = 3  # 路径切换后的冷却周期数（期间不再切换）
     CONGESTION_THRESHOLD = 0.7
     PREDICT_MAE = 0.06
-    EMA_ALPHA = 0.6  # 指数移动平均的平滑因子
+    EMA_ALPHA = 0.6  # EMA 平滑系数
     WINDOW_SIZE = 3
 
     def __init__(self, model_dir, pred_csv_path, poll_interval):
@@ -56,13 +56,12 @@ class DecisionEngine:
         self.cooldown_remaining = 0  # 路径切换冷却时间剩余秒数
         self.model_a = joblib.load(model_path_a)
         self.model_b = joblib.load(model_path_b)
-        self.poll_interval = poll_interval
 
         self.pred_csv = open(pred_csv_path, "w", newline="")
         self.pred_writer = csv.writer(self.pred_csv)
         self.pred_writer.writerow(["timestamp", "link", "predicted", "smoothed"])
 
-    def on_stats_collected(self, util_a, util_b):
+    def on_stats_collected(self, util_a, util_b, current_poll_interval=3):
         self.stats_counts += 1
 
         # 阶段一：冷启动阶段——仅收集数据，不做决策
@@ -100,19 +99,16 @@ class DecisionEngine:
         pred_b = self._predict(combined, "B")
 
         # EMA 平滑
+        now = time.time()
         if self.smoothed_a is None:
             self.smoothed_a = pred_a
             self.smoothed_b = pred_b
         else:
-            self.smoothed_a = (
-                self.EMA_ALPHA * pred_a + (1 - self.EMA_ALPHA) * self.smoothed_a
-            )
-            self.smoothed_b = (
-                self.EMA_ALPHA * pred_b + (1 - self.EMA_ALPHA) * self.smoothed_b
-            )
+            self.smoothed_a = self.EMA_ALPHA * pred_a + (1 - self.EMA_ALPHA) * self.smoothed_a
+            self.smoothed_b = self.EMA_ALPHA * pred_b + (1 - self.EMA_ALPHA) * self.smoothed_b
 
-        # 记录预测结果
-        timestamp = (int(time.time()) // self.poll_interval) * self.poll_interval
+        # 记录预测结果（使用当前动态轮询间隔对齐时间桶）
+        timestamp = (int(now) // current_poll_interval) * current_poll_interval
         self.pred_writer.writerow([timestamp, "path_A", pred_a, self.smoothed_a])
         self.pred_writer.writerow([timestamp, "path_B", pred_b, self.smoothed_b])
         self.pred_csv.flush()
@@ -439,8 +435,8 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
             util_a = self._get_path_util("A")
             util_b = self._get_path_util("B")
 
-            # 调用决策引擎
-            decision = self.engine.on_stats_collected(util_a, util_b)
+            # 调用决策引擎（传入当前动态轮询间隔）
+            decision = self.engine.on_stats_collected(util_a, util_b, self.curr_poll_interval)
 
             # 打印状态
             state = (

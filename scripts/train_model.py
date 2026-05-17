@@ -1,14 +1,14 @@
 """
 随机森林模型训练与可视化分析
 功能：
-  1. 读取 training_features.csv，按链路（path_A / path_B）分别建模
-  2. 使用 TimeSeriesSplit 交叉验证评估模型稳定性
-  3. 使用 GridSearchCV 进行超参数调优
-  4. 按时间顺序划分训练/测试集（前80%训练，后20%测试）
-  5. 使用 Random Forest 进行回归，记录 MAE / RMSE / R² / 相关系数
-  6. 生成多种可视化图表：预测值散点图、特征重要性、残差分析、误差分布、CV分数、学习曲线
-  7. 全量数据训练并导出最终模型
-  8. 导出最终模型至 models/model_path_A.pkl 和 models/model_path_B.pkl
+  1. 使用自适应轮询策略仿真采集训练数据
+  2. 按链路（path_A / path_B）分别建模
+  3. 使用 TimeSeriesSplit 交叉验证评估模型稳定性
+  4. 使用 GridSearchCV 进行超参数调优
+  5. 按时间顺序划分训练/测试集（前80%训练，后20%测试）
+  6. 使用 Random Forest 进行回归，记录 MAE / RMSE / R² / 相关系数
+  7. 生成多种可视化图表：预测值散点图、特征重要性、残差分析、误差分布、CV分数、学习曲线
+  8. 全量数据训练并导出最终模型至 models/model_path_A.pkl 和 models/model_path_B.pkl
   9. 输出模型评估摘要 CSV
 """
 
@@ -28,10 +28,10 @@ import joblib
 warnings.filterwarnings("ignore")
 
 # ------------------------------ 配置参数 ------------------------------
-FEATURES_CSV = "../data/training_features.csv"
 OUTPUT_MODEL_DIR = "../models"
 FIGURES_DIR = "../figures"
 SUMMARY_CSV = "../data/model_evaluation_summary.csv"
+TRAINING_CSV = "../data/training_features.csv"
 TEST_SPLIT = 0.2
 CV_FOLDS = 5
 RANDOM_STATE = 42
@@ -43,8 +43,144 @@ PARAM_GRID = {
     "min_samples_leaf": [1, 3, 5],
 }
 
+# 轮询参数（与 controller/stats_mixin.py 一致）
+WINDOW_SIZE = 3
+POLL_IDLE = 5
+POLL_NORMAL = 3
+POLL_WARNING = 1
+IDLE_THRESHOLD = 0.30
+WARNING_THRESHOLD = 0.50
+
+# 训练数据生成参数
+N_BATCHES = 10
+BATCH_DURATION = 120  # 秒
+
 os.makedirs(OUTPUT_MODEL_DIR, exist_ok=True)
 os.makedirs(FIGURES_DIR, exist_ok=True)
+
+
+# ======================== 训练数据生成 ========================
+
+
+def generate_sawtooth(duration, period=30, base_min=0.05, base_max=0.80,
+                      noise_sigma=0.03, dt=1.0):
+    timestamps = np.arange(0, duration, dt)
+    utils = []
+    for t in timestamps:
+        phase = (t % period) / period
+        base = base_min + (base_max - base_min) * phase
+        noisy = base + np.random.normal(0, noise_sigma)
+        utils.append(np.clip(noisy, 0.0, 1.0))
+    return timestamps, np.array(utils)
+
+
+def generate_step(duration, low=0.10, high=0.75, period=40, dt=1.0):
+    timestamps = np.arange(0, duration, dt)
+    utils = []
+    for t in timestamps:
+        phase = (t % period) / period
+        utils.append(high if phase < 0.5 else low)
+    return timestamps, np.array(utils)
+
+
+def generate_bursty(duration, base=0.15, burst=0.85, burst_dur=5, gap=20, dt=1.0):
+    timestamps = np.arange(0, duration, dt)
+    utils = []
+    for t in timestamps:
+        in_burst = (t % (burst_dur + gap)) < burst_dur
+        utils.append(burst if in_burst else base)
+    return timestamps, np.array(utils)
+
+
+def generate_mixed(duration, dt=1.0):
+    """混合多种模式，随机拼接，增加数据多样性"""
+    timestamps = np.arange(0, duration, dt)
+    utils = np.zeros(len(timestamps))
+
+    patterns = [
+        ("sawtooth", lambda: generate_sawtooth(duration, dt=dt)[1]),
+        ("step", lambda: generate_step(duration, dt=dt)[1]),
+        ("bursty", lambda: generate_bursty(duration, dt=dt)[1]),
+    ]
+    np.random.shuffle(patterns)
+    n_seg = np.random.randint(2, 4)
+    seg_len = len(timestamps) // n_seg
+
+    for i in range(n_seg):
+        start = i * seg_len
+        end = start + seg_len if i < n_seg - 1 else len(timestamps)
+        seg_utils = patterns[i % len(patterns)][1]()
+        utils[start:end] = seg_utils[start:end]
+
+    return timestamps, utils
+
+
+def adaptive_sample(ts, utils_a, utils_b):
+    """自适应间隔采样，返回 (poll_times, polled_a, polled_b)"""
+    poll_times = []
+    polled_a = []
+    polled_b = []
+    dt = ts[1] - ts[0]
+    t = 0.0
+    interval = POLL_NORMAL
+
+    while t <= ts[-1]:
+        idx = min(int(t / dt), len(utils_a) - 1)
+        ua, ub = utils_a[idx], utils_b[idx]
+        poll_times.append(t)
+        polled_a.append(ua)
+        polled_b.append(ub)
+
+        u_max = max(ua, ub)
+        if u_max < IDLE_THRESHOLD:
+            interval = POLL_IDLE
+        elif u_max > WARNING_THRESHOLD:
+            interval = POLL_WARNING
+        else:
+            interval = POLL_NORMAL
+        t += interval
+
+    return np.array(poll_times), np.array(polled_a), np.array(polled_b)
+
+
+def generate_training_data():
+    """使用自适应轮询策略仿真采集训练数据，保存为 CSV"""
+    generators = [generate_sawtooth, generate_step, generate_bursty, generate_mixed]
+    all_samples = []
+
+    for batch in range(N_BATCHES):
+        gen_func = generators[batch % len(generators)]
+        np.random.seed(batch * 100 + 42)
+        ts_a, utils_a = gen_func(BATCH_DURATION)
+        np.random.seed(batch * 100 + 1234)
+        ts_b, utils_b = gen_func(BATCH_DURATION)
+
+        _, pa, pb = adaptive_sample(ts_a, utils_a, utils_b)
+
+        # 按 WINDOW_SIZE 滑动窗口组装特征
+        for i in range(WINDOW_SIZE, len(pa)):
+            features = []
+            for j in range(i - WINDOW_SIZE, i):
+                features.extend([pa[j], pb[j]])
+
+            all_samples.append({
+                **{f"feat_{k}": features[k] for k in range(6)},
+                "target_label": "path_A",
+                "U_next": pa[i],
+            })
+            all_samples.append({
+                **{f"feat_{k}": features[k] for k in range(6)},
+                "target_label": "path_B",
+                "U_next": pb[i],
+            })
+
+    df = pd.DataFrame(all_samples)
+    df.to_csv(TRAINING_CSV, index=False, float_format="%.6f")
+    print(f"  训练数据已生成: {TRAINING_CSV} (样本数: {len(df)})")
+    return df
+
+
+# ======================== 数据加载 ========================
 
 
 def load_data(csv_path):
@@ -233,7 +369,6 @@ def plot_feature_importance(rf_model, feat_cols, link_name):
         rotation=45,
         ha="right",
     )
-    # 在柱子上方标注数值
     for bar, val in zip(bars, importances[indices]):
         plt.text(
             bar.get_x() + bar.get_width() / 2,
@@ -409,13 +544,17 @@ def train_and_analyze(df, feat_cols, link_name):
 
 def main():
     print("===== SDN 负载均衡 — Random Forest 模型训练流水线 =====")
-    print(f"特征文件: {FEATURES_CSV}")
 
-    df, feat_cols = load_data(FEATURES_CSV)
+    # Step 1: 生成训练数据
+    print("\n--- 生成训练数据（自适应轮询仿真）---")
+    df = generate_training_data()
+
+    feat_cols = [c for c in df.columns if c.startswith("feat_")]
     print(f"特征列: {feat_cols}")
     print(f"总样本数: {len(df)}")
     print(f"链路分布:\n{df['target_label'].value_counts()}")
 
+    # Step 2: 训练与评估
     all_results = []
 
     for link in ["path_A", "path_B"]:

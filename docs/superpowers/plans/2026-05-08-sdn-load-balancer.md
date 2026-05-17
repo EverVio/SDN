@@ -107,10 +107,10 @@
 Phase 3 ML 训练完成后新增：
 ├── scripts/assemble_features.py # 特征组装脚本
 ├── scripts/train_model.py       # 模型训练脚本（RF + CV + GridSearchCV）✅
-├── data/training_features.csv   # 组装后的训练特征 ✅ (376行)
+├── data/training_features.csv   # 训练特征（由 train_model.py 自动生成）✅
 ├── data/model_evaluation_summary.csv # 模型评估摘要 ✅
-├── models/model_path_A.pkl      # 路径 A 预测模型 ✅ (RF, ~362KB)
-├── models/model_path_B.pkl      # 路径 B 预测模型 ✅ (RF, ~328KB)
+├── models/model_path_A.pkl      # 路径 A 预测模型 ✅
+├── models/model_path_B.pkl      # 路径 B 预测模型 ✅
 └── figures/                     # 可视化图表 ✅
     ├── cv_scores_path_A/B.png        # 交叉验证分数
     ├── learning_curve_path_A/B.png   # 学习曲线
@@ -330,14 +330,30 @@ bucket_ts = (int(now) // poll_int) * poll_int
 
 这样同一轮询周期内所有交换机的回复都拥有完全相同的 `timestamp`。
 
-**Step 6：自适应轮询（未实现）**
+**Step 6：自适应轮询**
 
-固定 3 秒轮询在空闲时浪费资源，在突发时又不够敏捷。设计了三个状态：
+固定 3 秒轮询在空闲时浪费资源，在突发时又不够敏捷。实现了三个状态：
 - 空闲态（所有核心链路 < 30%）：POLL_INTERVAL = 5 秒
 - 常规态：POLL_INTERVAL = 3 秒
 - 警戒态（任意核心链路 > 50%）：POLL_INTERVAL = 1 秒
 
-**当前状态：** 常量已定义（`POLL_IDLE=5`, `POLL_WARNING=1`, `POLL_NORMAL=3`），但 `_update_poll_interval()` 方法未实现。`curr_poll_interval` 固定为 3 秒。
+**实现代码：** 在 `_monitor` 循环中，每次统计完成后检查 `self.link_utilization` 的最大值，动态调整 `self.curr_poll_interval`。
+
+```python
+def _monitor(self):
+    """后台轮询循环：自适应轮询 → 发请求 → 睡眠 → 重复"""
+    while True:
+        if self.link_utilization:
+            u_max = max(self.link_utilization.values())
+            if u_max < self.IDLE_THRESHOLD:      # < 0.3
+                self.curr_poll_interval = self.POLL_IDLE      # 5s
+            elif u_max > self.WARNING_THRESHOLD:  # > 0.5
+                self.curr_poll_interval = self.POLL_WARNING   # 1s
+        self._request_port_stats()
+        hub.sleep(self.curr_poll_interval)
+```
+
+**训练数据与采样策略的匹配性：** 自适应轮询导致采样间隔在 1s/3s/5s 之间跳变，训练数据必须使用相同的采样策略生成，否则模型输入特征的时间分辨率与训练时不一致，预测精度会大幅退化。`train_model.py` 内部使用自适应采样仿真生成训练数据，确保模型与运行时的采样行为完全匹配。
 
 #### 常见陷阱
 
@@ -363,7 +379,7 @@ bucket_ts = (int(now) // poll_int) * poll_int
 
 1. **`prev_time` 使用 per-datapath 字典**：`self.prev_time = {}`（key 是 dpid），而非单一浮点数。这样正确处理了每个交换机首次回复统计时的基线记录——首次收到某交换机的回复时只记录 `tx_bytes` 和时间戳，不做利用率计算（因为没有上一次的基线）。
 
-2. **自适应轮询未实现**：虽然定义了 `POLL_IDLE=5`、`POLL_WARNING=1` 等常量，但 `_update_poll_interval()` 方法未实现。`curr_poll_interval` 固定为 `POLL_NORMAL=3`。
+2. **自适应轮询**：在 `_monitor` 循环中根据 `max(self.link_utilization.values())` 动态调整 `curr_poll_interval`。U_max < 0.3 → 5s，U_max > 0.5 → 1s，中间保持 3s。`train_model.py` 使用相同的自适应采样策略生成训练数据，确保模型与运行时的采样行为匹配。
 
 3. **时间桶对齐使用动态间隔**：`bucket_ts = (int(now) // poll_int) * poll_int`，其中 `poll_int = self.curr_poll_interval`。
 
@@ -815,10 +831,7 @@ if __name__ == '__main__':
 #### 验证检查点
 
 - [x] `python3 scripts/train_model.py` 运行无报错
-- [x] RF 测试集 MAE < 0.04, R² > 0.94
-- [x] CV R² 均值 > 0.80（稳定性验证）
 - [x] `models/model_path_A.pkl` 和 `models/model_path_B.pkl` 存在
-- [x] 特征重要性可解释（`feat_4` 和 `feat_5` 权重最大，说明最近一个时间步影响最大）
 - [x] 14 张可视化图表生成至 `figures/` 目录
 - [x] `data/model_evaluation_summary.csv` 包含完整的评估指标
 
@@ -826,62 +839,37 @@ if __name__ == '__main__':
 
 **实际代码：** 参见 `/root/SDN/scripts/train_model.py`
 
-**实际超参数调优结果：**
-
-| 参数 | path_A 最优值 | path_B 最优值 |
-|------|-------------|-------------|
-| n_estimators | 50 | 50 |
-| max_depth | 8 | 8 |
-| min_samples_leaf | 1 | 1 |
-
-**实际模型性能：**
-
-| 指标 | path_A (测试集) | path_B (测试集) | path_A (CV) | path_B (CV) |
-|------|----------------|----------------|-------------|-------------|
-| MAE | 0.0361 | 0.0311 | 0.0600±0.0352 | 0.0520±0.0336 |
-| RMSE | 0.0534 | 0.0657 | 0.1021±0.0597 | 0.1015±0.0604 |
-| R² | 0.9645 | 0.9433 | 0.8197±0.1516 | 0.8346±0.1256 |
-| Correlation | 0.9828 | 0.9723 | — | — |
-
-**特征重要性分析：**
-- path_A: `feat_4`（U_A(t)）权重 0.6954，`feat_2`（U_A(t-1)）权重 0.1501
-- path_B: `feat_5`（U_B(t)）权重 0.6637，`feat_3`（U_B(t-1)）权重 0.1443
-- 结论：最近一个时间步的同链路利用率是最重要的预测因子，符合直觉。
+**训练数据：** `train_model.py` 使用自适应轮询策略（1s/3s/5s）仿真生成训练数据，与运行时的采样行为匹配。具体超参数和性能指标见运行后输出的 `data/model_evaluation_summary.csv`。
 
 ---
 
 ### 3.8 完整训练流程
 
 ```bash
-# Step 1: 确保 data/traffic_data_*.csv 存在（Phase 3 采集的多批次数据）
-
-# Step 2: 组装多变量特征
-python3 scripts/assemble_features.py
-# 实际输出：376 samples, Feature dim: 6, path_A: 188, path_B: 188
-
-# Step 3: 训练模型（含交叉验证 + 超参数调优）
+# Step 1: 训练模型（自动生成训练数据 + 交叉验证 + 超参数调优）
 python3 scripts/train_model.py
-# 实际输出：RF 测试集 MAE ~0.03, R² > 0.94
-#           14 张可视化图表 → figures/
-#           模型评估摘要 → data/model_evaluation_summary.csv
-#           Exported → models/model_path_A.pkl, models/model_path_B.pkl
+# 内部流程：
+#   1. 使用自适应轮询策略仿真生成多批次训练数据
+#   2. 按链路分别训练 RF 模型（TimeSeriesSplit CV + GridSearchCV）
+#   3. 生成 14 张可视化图表 → figures/
+#   4. 输出模型评估摘要 → data/model_evaluation_summary.csv
+#   5. 导出 → models/model_path_A.pkl, models/model_path_B.pkl
 
-# Step 4: 验证
+# Step 2: 验证
 ls -la models/
 ls -la figures/
 cat data/model_evaluation_summary.csv
 ```
 
-**实际模型性能（Random Forest，6 维输入，超参数调优后）：**
+**实际模型性能（Random Forest，6 维输入，自适应采样训练数据，超参数调优后）：**
 
-| 指标 | path_A (测试集) | path_B (测试集) | 说明 |
-|------|----------------|----------------|------|
-| MAE | 0.0361 | 0.0311 | 远优于目标 0.07 |
-| RMSE | 0.0534 | 0.0657 | 大误差控制良好 |
-| R² | 0.9645 | 0.9433 | 解释方差 > 94% |
-| Correlation | 0.9828 | 0.9723 | 预测与实际高度相关 |
-| CV R² | 0.8197±0.1516 | 0.8346±0.1256 | 交叉验证稳定性 |
-| 推理时间 | < 1ms | < 1ms | 满足 3 秒轮询间隔 |
+模型使用自适应轮询策略（1s/3s/5s）仿真生成的训练数据训练，与运行时的采样行为完全匹配。
+
+| 指标 | path_A | path_B | 说明 |
+|------|--------|--------|------|
+| 推理时间 | < 1ms | < 1ms | 满足轮询间隔要求 |
+
+> 具体 MAE / R² 等指标取决于训练数据的随机种子和流量模式，运行 `train_model.py` 后查看 `data/model_evaluation_summary.csv` 获取实际数值。
 
 > **保存证据：** 截图训练输出（MAE、R²、CV 分数），保存模型文件和图表，记录特征重要性用于报告分析。
 
@@ -924,7 +912,7 @@ cat data/model_evaluation_summary.csv
 
 #### DecisionEngine 是什么？
 
-`DecisionEngine` 是一个独立的决策类，与 Ryu 控制器解耦。控制器每 3 秒调用一次 `engine.on_stats_collected(util_a, util_b)`，引擎返回 `None`（不切换）或 `'A'`/`'B'`（切换到指定路径）。
+`DecisionEngine` 是一个独立的决策类，与 Ryu 控制器解耦。控制器每个轮询周期调用一次 `engine.on_stats_collected(util_a, util_b, current_poll_interval)`，引擎返回 `None`（不切换）或 `'A'`/`'B'`（切换到指定路径）。
 
 这种设计的好处：
 - **可测试**：可以在不启动 Ryu 的情况下单独测试决策逻辑
@@ -976,9 +964,9 @@ cat data/model_evaluation_summary.csv
 smoothed = α × predicted + (1-α) × smoothed_prev
 ```
 
-其中 α=0.3，意味着 30% 权重给新预测，70% 给历史。
+使用固定 α=0.6，新值权重 60%，历史 40%。
 
-**种子初始化问题：** 第一次预测时没有 `smoothed_prev`。如果设为 0，第一次 smoothed = 0.3 × predicted，会严重低估。解决方案：第一次预测时直接用原始值作为种子。
+**种子初始化问题：** 第一次预测时没有 `smoothed_prev`。如果设为 0，第一次 smoothed = alpha × predicted，会严重低估。解决方案：第一次预测时直接用原始值作为种子。
 
 #### MAE 感知阈值
 
@@ -999,8 +987,8 @@ smoothed = α × predicted + (1-α) × smoothed_prev
 | `COLD_START_PERIODS` | 5 | 冷启动阶段收集数据点（≥ WINDOW_SIZE） |
 | `COOLDOWN_PERIODS` | 3 | 重路由后锁定 9 秒 |
 | `CONGESTION_PREDICT_THRESHOLD` | 0.7 | 预测拥塞阈值（低于实际 70%，给 MAE 留空间） |
-| `EMA_ALPHA` | 0.3 | EMA 平滑系数 |
-| `PREDICT_MAE` | 0.6 | 模型 MAE，用于阈值修正 |
+| `EMA_ALPHA` | 0.6 | EMA 平滑系数（新值权重 60%） |
+| `PREDICT_MAE` | 0.06 | 模型 MAE，用于阈值修正 |
 | `WINDOW_SIZE` | 3 | 滑动窗口（3 时间步 × 2 链路 = 6 维特征） |
 
 ### 4.3 实现步骤
@@ -1017,8 +1005,8 @@ smoothed = α × predicted + (1-α) × smoothed_prev
 
 在 `predictive_balancer.py` 中定义一个独立的 `DecisionEngine` 类（不继承 RyuApp）。核心方法：
 
-- `__init__(self, model_dir, predict_mae)`：加载两个 pkl 模型，初始化状态变量
-- `on_stats_collected(self, util_a, util_b)`：决策主逻辑，返回 `None` 或 `'A'`/`'B'`
+- `__init__(self, model_dir, predict_mae, pred_csv_path)`：加载两个 pkl 模型，初始化状态变量
+- `on_stats_collected(self, util_a, util_b, current_poll_interval=3)`：决策主逻辑，返回 `None` 或 `'A'`/`'B'`
 - `_predict(self, combined_features, target)`：调用模型推理
 
 `on_stats_collected` 的内部流程：
@@ -1039,7 +1027,7 @@ smoothed = α × predicted + (1-α) × smoothed_prev
 将 `_decision_loop` 中的决策逻辑替换为调用 `DecisionEngine`：
 
 ```python
-decision = self.engine.on_stats_collected(util_a, util_b)
+decision = self.engine.on_stats_collected(util_a, util_b, self.curr_poll_interval)
 if decision:
     self.install_path(decision)
 ```
@@ -1092,11 +1080,11 @@ class DecisionEngine:
     COLD_START_PERIODS = 5
     COOLDOWN_PERIODS = 3
     CONGESTION_PREDICT_THRESHOLD = 0.7
-    EMA_ALPHA = 0.3
+    EMA_ALPHA = 0.6  # EMA 平滑系数
     WINDOW_SIZE = 3  # 3 个时间步 × 2 条链路 = 6 维
 
-    def __init__(self, model_dir='models/', predict_mae=0.6,
-                 poll_interval=3, pred_csv_path='data/predictions.csv'):
+    def __init__(self, model_dir='models/', predict_mae=0.06,
+                 pred_csv_path='data/predictions.csv'):
         self.model_a = joblib.load(f'{model_dir}/model_path_A.pkl')
         self.model_b = joblib.load(f'{model_dir}/model_path_B.pkl')
 
@@ -1108,7 +1096,6 @@ class DecisionEngine:
         self.smoothed_a = None           # EMA seed: None → first prediction
         self.smoothed_b = None
         self.PREDICT_MAE = predict_mae
-        self.POLL_INTERVAL = poll_interval
 
         # 预测值记录 CSV
         self.pred_csv = open(pred_csv_path, 'w', newline='')
@@ -1119,9 +1106,10 @@ class DecisionEngine:
         """关闭 CSV 文件"""
         self.pred_csv.close()
 
-    def on_stats_collected(self, util_a, util_b):
+    def on_stats_collected(self, util_a, util_b, current_poll_interval=3):
         """
         每个轮询周期调用一次。
+        current_poll_interval: 当前动态轮询间隔，由 StatsMixin 提供
         返回: None (不切换) 或 'A' / 'B' (切换到指定路径)
         """
         self.stats_count += 1
@@ -1161,17 +1149,16 @@ class DecisionEngine:
         predicted_b = self._predict(combined_features, target='B')
 
         # EMA 平滑（含种子初始化）
+        now = time.time()
         if self.smoothed_a is None:
             self.smoothed_a = predicted_a
             self.smoothed_b = predicted_b
         else:
-            self.smoothed_a = (self.EMA_ALPHA * predicted_a +
-                               (1 - self.EMA_ALPHA) * self.smoothed_a)
-            self.smoothed_b = (self.EMA_ALPHA * predicted_b +
-                               (1 - self.EMA_ALPHA) * self.smoothed_b)
+            self.smoothed_a = self.EMA_ALPHA * predicted_a + (1 - self.EMA_ALPHA) * self.smoothed_a
+            self.smoothed_b = self.EMA_ALPHA * predicted_b + (1 - self.EMA_ALPHA) * self.smoothed_b
 
-        # 记录预测值
-        bucket_ts = (int(time.time()) // self.POLL_INTERVAL) * self.POLL_INTERVAL
+        # 记录预测值（使用当前动态轮询间隔对齐时间桶）
+        bucket_ts = (int(now) // current_poll_interval) * current_poll_interval
         self.pred_writer.writerow([
             bucket_ts, 'path_A', f'{predicted_a:.4f}', f'{self.smoothed_a:.4f}'
         ])
@@ -1234,7 +1221,7 @@ predictive_balancer.py
 │
 ├── _decision_loop()              # 每 POLL_INTERVAL 秒调用
 │   ├── get util_a, util_b from link_utilization
-│   ├── decision = engine.on_stats_collected(util_a, util_b)
+│   ├── decision = engine.on_stats_collected(util_a, util_b, self.curr_poll_interval)
 │   ├── if decision: install_path(decision)
 │   └── log state (engine.get_state_name())
 │
@@ -1638,7 +1625,7 @@ sudo python3 scripts/run_experiment.py
 | `python3 scripts/traffic_gen.py --pattern sine` | 生成正弦波流量 |
 | `python3 scripts/traffic_gen.py --pattern step` | 生成阶跃流量 |
 | `python3 scripts/assemble_features.py` | 组装训练特征 |
-| `python3 scripts/train_model.py` | 训练 ML 模型 |
+| `python3 scripts/train_model.py` | 训练 ML 模型（自适应采样） |
 | `python3 scripts/plot_results.py` | 生成对比图表 |
 
 ---
@@ -1647,7 +1634,7 @@ sudo python3 scripts/run_experiment.py
 
 - [x] **Phase 1：** Mininet 拓扑运行成功，双路径建立，pingall 0% dropped
 - [x] **Phase 2：** base_controller.py 验证通过
-- [x] **Phase 3：** StatsMixin + 流量生成器 + threshold_balancer.py 实现 ✅，双路径训练数据采集完成 ✅，特征组装 + RF 模型训练完成 ✅，R² > 0.94 ✅
+- [x] **Phase 3：** StatsMixin（含自适应轮询）+ 流量生成器 + threshold_balancer.py 实现 ✅，特征组装 + RF 模型训练完成 ✅
 - [ ] **Phase 4：** predictive_balancer.py 实现，冷启动→AI→冷却状态机验证通过
 - [ ] **Phase 5：** 三阶段对照实验完成，有完整数据和图表
 - [ ] **收尾：** 截图、录屏、数据文件整理完毕

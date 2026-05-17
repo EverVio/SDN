@@ -36,8 +36,15 @@ class StatsMixin:
         self.monitor_thread = hub.spawn(self._monitor)
 
     def _monitor(self):
-        """后台轮询循环：发请求 → 睡眠 → 重复"""
+        """后台轮询循环：自适应轮询 → 发请求 → 睡眠 → 重复"""
         while True:
+            # 自适应轮询：根据当前最大链路利用率调整轮询间隔
+            if self.link_utilization:
+                u_max = max(self.link_utilization.values())
+                if u_max < self.IDLE_THRESHOLD:
+                    self.curr_poll_interval = self.POLL_IDLE
+                elif u_max > self.WARNING_THRESHOLD:
+                    self.curr_poll_interval = self.POLL_WARNING
             self._request_port_stats()
             hub.sleep(self.curr_poll_interval)
 
