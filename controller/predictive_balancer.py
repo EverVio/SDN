@@ -2,9 +2,7 @@ import os
 import sys
 import time
 import csv
-import networkx as nx
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
 import joblib
 import atexit
 
@@ -32,6 +30,10 @@ PATH_PORTS_REV = {
     "A": {4: 3, 2: 1, 1: 1},  # s4:3←s2, s2:1←s1, s1:1→h1
     "B": {4: 4, 3: 1, 1: 1},  # s4:4←s3, s3:1←s1, s1:1→h1
 }
+
+# 流表优先级
+PRIORITY_ACTIVE_PATH = 20  # 新路径
+PRIORITY_STANDBY_PATH = 10  # 旧路径
 
 PREDICTIVE_CSV_PATH = "./data/predictions.csv"
 
@@ -104,8 +106,12 @@ class DecisionEngine:
             self.smoothed_a = pred_a
             self.smoothed_b = pred_b
         else:
-            self.smoothed_a = self.EMA_ALPHA * pred_a + (1 - self.EMA_ALPHA) * self.smoothed_a
-            self.smoothed_b = self.EMA_ALPHA * pred_b + (1 - self.EMA_ALPHA) * self.smoothed_b
+            self.smoothed_a = (
+                self.EMA_ALPHA * pred_a + (1 - self.EMA_ALPHA) * self.smoothed_a
+            )
+            self.smoothed_b = (
+                self.EMA_ALPHA * pred_b + (1 - self.EMA_ALPHA) * self.smoothed_b
+            )
 
         # 记录预测结果（使用当前动态轮询间隔对齐时间桶）
         timestamp = (int(now) // current_poll_interval) * current_poll_interval
@@ -158,9 +164,7 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
         self.mac_to_port = {}  # {dpid: {mac: port}}
         self.host_location = {}  # {mac: (dpid, port)}
         self.ip_to_mac = {}  # {ip: mac}
-        self.network = nx.Graph()
         self.datapaths = {}  # {dpid: datapath} (StatsMixin 需要)
-        self.topo_ready = False
         self.path_installed = False  # 路径流表是否已安装
 
         self.init_stats()
@@ -272,7 +276,7 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
             and h1_mac in self.host_location
             and h3_mac in self.host_location
         ):
-            self._install_full_path(self.engine.curr_path)
+            self._install_full_path(self.engine.curr_path, PRIORITY_STANDBY_PATH)
             self.path_installed = True
             # 处理当前数据包（沿已安装路径转发）
             out_port = self._get_path_out_port(dpid)
@@ -371,7 +375,7 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
     # ──────────────────────────────────────────────
     # 路径安装与切换
     # ──────────────────────────────────────────────
-    def _install_full_path(self, path_name):
+    def _install_full_path(self, path_name, priority):
         """在路径上所有交换机安装显式流表（正向 h1→h3 + 反向 h3→h1）"""
         h3_mac = "00:00:00:00:00:03"
         h1_mac = "00:00:00:00:00:01"
@@ -384,11 +388,11 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
                 # 正向：eth_dst=h3 → 路径出端口
                 match = parser.OFPMatch(eth_dst=h3_mac)
                 actions = [parser.OFPActionOutput(ports[dpid])]
-                self.add_flow(dp, 10, match, actions)
+                self.add_flow(dp, priority, match, actions)
                 # 反向：eth_dst=h1 → 反向路径出端口
                 match_rev = parser.OFPMatch(eth_dst=h1_mac)
                 actions_rev = [parser.OFPActionOutput(ports_rev[dpid])]
-                self.add_flow(dp, 10, match_rev, actions_rev)
+                self.add_flow(dp, priority, match_rev, actions_rev)
                 self.logger.info(
                     "  Install: s%d fwd=p%d rev=p%d (path %s)",
                     dpid,
@@ -398,29 +402,64 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
                 )
 
     def _switch_path(self, new_path):
-        """切换路径：删除 s1 旧流表 + 在所有交换机安装新流表"""
-        old_path = "A" if new_path == "B" else "B"
-        self.logger.info(">>> Switching from path %s to path %s", old_path, new_path)
-        self._clear_path_flows()
-        if self.path_installed:
-            self._install_full_path(new_path)
+        """切换路径：利用 OpenFlow 原子覆盖特性实现先建后拆"""
+        old_path = self.current_path
+        self.logger.info(
+            ">>> Make-Before-Break: switching from %s to %s", old_path, new_path
+        )
 
-    def _clear_path_flows(self):
-        """删除所有交换机上优先级=10 的流表"""
-        for dpid, dp in self.datapaths.items():
+        # 1. 统一使用相同的优先级 (例如 10) 安装新路径
+        # 在公共节点 (s1, s4) 上，相同 match 和 priority 的 ADD 会原子性覆盖旧 Action，瞬间完成切换
+        if self.path_installed:
+            self._install_full_path(new_path, priority=PRIORITY_STANDBY_PATH)
+            self.logger.info(
+                "  Installed new path %s (Atomic Overwrite on shared nodes)", new_path
+            )
+
+        # 2. 更新当前路径记录
+        self.current_path = new_path
+
+        # 3. 异步清理非公共节点上的废弃流表
+        hub.spawn(self._async_cleanup_old_path, old_path)
+
+    def _async_cleanup_old_path(self, old_path):
+        """精准删除旧路径的残留流表"""
+        hub.sleep(0.2)
+
+        # 获取旧路径涉及的 dpid 和端口映射
+        ports = PATH_PORTS[old_path]
+        ports_rev = PATH_PORTS_REV[old_path]
+
+        for dpid in ports:
+            if dpid not in self.datapaths:
+                continue
+            dp = self.datapaths[dpid]
             parser = dp.ofproto_parser
             ofproto = dp.ofproto
-            match = parser.OFPMatch()
+
+            # 删除正向流表：精准匹配 eth_dst 且 out_port 必须是旧端口
+            match = parser.OFPMatch(eth_dst="00:00:00:00:00:03")
             mod = parser.OFPFlowMod(
                 datapath=dp,
                 command=ofproto.OFPFC_DELETE,
-                priority=10,
-                out_port=ofproto.OFPP_ANY,
+                out_port=ports[dpid],  # <--- 核心修复：只删除指向“旧出端口”的流表
                 out_group=ofproto.OFPG_ANY,
                 match=match,
             )
             dp.send_msg(mod)
-        self.logger.info("  Cleared all priority=10 flows")
+
+            # 删除反向流表：精准匹配 eth_dst 且 out_port 必须是反向旧端口
+            match_rev = parser.OFPMatch(eth_dst="00:00:00:00:00:01")
+            mod_rev = parser.OFPFlowMod(
+                datapath=dp,
+                command=ofproto.OFPFC_DELETE,
+                out_port=ports_rev[dpid],  # <--- 核心修复
+                out_group=ofproto.OFPG_ANY,
+                match=match_rev,
+            )
+            dp.send_msg(mod_rev)
+
+        self.logger.info("  Cleaned up orphaned flows for old path %s", old_path)
 
     # ──────────────────────────────────────────────
     # 阈值决策循环
@@ -436,7 +475,9 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
             util_b = self._get_path_util("B")
 
             # 调用决策引擎（传入当前动态轮询间隔）
-            decision = self.engine.on_stats_collected(util_a, util_b, self.curr_poll_interval)
+            decision = self.engine.on_stats_collected(
+                util_a, util_b, self.curr_poll_interval
+            )
 
             # 打印状态
             state = (
@@ -484,22 +525,18 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
     def _switch_add_handler(self, ev):
         dpid = ev.switch.dp.id
         self.datapaths[dpid] = ev.switch.dp
-        self.network.add_node(dpid)
         self.logger.info("Topology: switch s%d added", dpid)
 
     @set_ev_cls(topo_event.EventSwitchLeave)
     def _switch_del_handler(self, ev):
         dpid = ev.switch.dp.id
         self.datapaths.pop(dpid, None)
-        if self.network.has_node(dpid):
-            self.network.remove_node(dpid)
         self.logger.info("Topology: switch s%d removed", dpid)
 
     @set_ev_cls(topo_event.EventLinkAdd)
     def _link_add_handler(self, ev):
         src = ev.link.src
         dst = ev.link.dst
-        self.network.add_edge(src.dpid, dst.dpid, port_no=src.port_no)
         self.logger.info(
             "Topology: link s%d:p%d → s%d:p%d",
             src.dpid,
@@ -507,18 +544,9 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
             dst.dpid,
             dst.port_no,
         )
-        if not self.topo_ready and self.network.number_of_edges() >= 4:
-            self.topo_ready = True
-            self.logger.info(
-                "Topology ready: %d switches, %d links",
-                self.network.number_of_nodes(),
-                self.network.number_of_edges(),
-            )
 
     @set_ev_cls(topo_event.EventLinkDelete)
     def _link_del_handler(self, ev):
         src = ev.link.src
         dst = ev.link.dst
-        if self.network.has_edge(src.dpid, dst.dpid):
-            self.network.remove_edge(src.dpid, dst.dpid)
         self.logger.info("Topology: link s%d → s%d removed", src.dpid, dst.dpid)
