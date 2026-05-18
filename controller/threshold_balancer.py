@@ -2,7 +2,7 @@
 阈值响应式负载均衡控制器（Phase 5 对照组）
 - 拓扑发现（LLDP）
 - ARP 单播转发（避免双路径环路广播风暴）
-- 显式路径安装（路径 A: s1→s2→s4, 路径 B: s1→s3→s4）
+- 显式路径安装（动态计算，基于 TopologyManager）
 - 周期统计采集（StatsMixin）
 - 阈值决策：util > 70% → 切换到另一条路径
 """
@@ -23,18 +23,7 @@ from ryu.lib.packet import packet, ethernet, ether_types, arp
 from ryu.topology import event as topo_event
 
 from controller.stats_mixin import StatsMixin
-
-# 路径端口映射：{路径名: {dpid: output_port}}
-PATH_PORTS = {
-    "A": {1: 3, 2: 2, 4: 1},  # s1:3→s2, s2:2→s4, s4:1→h3
-    "B": {1: 4, 3: 2, 4: 1},  # s1:4→s3, s3:2→s4, s4:1→h3
-}
-
-# 反向路径端口映射：{路径名: {dpid: output_port}}（h3→h1 方向）
-PATH_PORTS_REV = {
-    "A": {4: 3, 2: 1, 1: 1},  # s4:3←s2, s2:1←s1, s1:1→h1
-    "B": {4: 4, 3: 1, 1: 1},  # s4:4←s3, s3:1←s1, s1:1→h1
-}
+from controller.topology_manager import TopologyManager
 
 # 流表优先级
 PRIORITY_ACTIVE_PATH = 20  # 新路径
@@ -46,15 +35,21 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
 
     def __init__(self, *args, **kwargs):
         super(ThresholdBalancer, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}  # {dpid: {mac: port}}
-        self.host_location = {}  # {mac: (dpid, port)}
-        self.ip_to_mac = {}  # {ip: mac}
-        self.datapaths = {}  # {dpid: datapath} (StatsMixin 需要)
-        self.current_path = "A"  # 默认路径 A
-        self.path_installed = False  # 路径流表是否已安装
+        self.mac_to_port = {}
+        self.host_location = {}
+        self.ip_to_mac = {}
+        self.datapaths = {}
+        self.current_path = "A"
+        self.path_installed = False
 
-        self.init_stats()
+        self.topo = TopologyManager()
 
+        # Dual-path cache (computed dynamically)
+        self.path_fwd = {"A": None, "B": None}
+        self.path_rev = {"A": None, "B": None}
+        self.path_util_keys = {"A": set(), "B": set()}
+
+        self.init_stats(topo_manager=self.topo)
         self.decision_thread = hub.spawn(self._decision_loop)
 
     # ──────────────────────────────────────────────
@@ -78,6 +73,46 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
         self.logger.info("Switch %s connected, table-miss installed", datapath.id)
 
     # ──────────────────────────────────────────────
+    # 拓扑发现事件处理
+    # ──────────────────────────────────────────────
+    @set_ev_cls(topo_event.EventSwitchEnter)
+    def _switch_add_handler(self, ev):
+        dpid = ev.switch.dp.id
+        self.datapaths[dpid] = ev.switch.dp
+        self.topo.add_switch(dpid)
+        self.logger.info("Topology: switch s%d added", dpid)
+
+    @set_ev_cls(topo_event.EventSwitchLeave)
+    def _switch_del_handler(self, ev):
+        dpid = ev.switch.dp.id
+        self.datapaths.pop(dpid, None)
+        self.topo.remove_switch(dpid)
+        self.logger.info("Topology: switch s%d removed", dpid)
+
+    @set_ev_cls(topo_event.EventLinkAdd)
+    def _link_add_handler(self, ev):
+        src = ev.link.src
+        dst = ev.link.dst
+        self.topo.add_link(src.dpid, src.port_no, dst.dpid, dst.port_no)
+        self.logger.info("Topology: link s%d:p%d -> s%d:p%d",
+                         src.dpid, src.port_no, dst.dpid, dst.port_no)
+        self._invalidate_paths()
+
+    @set_ev_cls(topo_event.EventLinkDelete)
+    def _link_del_handler(self, ev):
+        src = ev.link.src
+        dst = ev.link.dst
+        self.topo.remove_link(src.dpid, dst.dpid)
+        self.logger.info("Topology: link s%d -> s%d removed", src.dpid, dst.dpid)
+        self._invalidate_paths()
+
+    def _invalidate_paths(self):
+        self.path_fwd = {"A": None, "B": None}
+        self.path_rev = {"A": None, "B": None}
+        self.path_util_keys = {"A": set(), "B": set()}
+        self.path_installed = False
+
+    # ──────────────────────────────────────────────
     # Packet-In 处理
     # ──────────────────────────────────────────────
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -98,6 +133,7 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
         dst = eth.dst
 
         # 学习源 MAC 位置（仅首次）
+        self.topo.learn_host(src, dpid, in_port)
         if src not in self.host_location:
             self.host_location[src] = (dpid, in_port)
             self.logger.info("Learn host: %s at s%d port %d", src, dpid, in_port)
@@ -147,20 +183,14 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
         self._install_reverse_rule(datapath, src, in_port)
 
         # 当两端 host 都已知时，首次在路径所有交换机上安装显式流表
-        h1_mac = "00:00:00:00:00:01"
-        h3_mac = "00:00:00:00:00:03"
-        if (
-            not self.path_installed
-            and h1_mac in self.host_location
-            and h3_mac in self.host_location
-        ):
-            self._install_full_path(self.current_path, PRIORITY_STANDBY_PATH)
-            self.path_installed = True
-            # 处理当前数据包（沿已安装路径转发）
-            out_port = self._get_path_out_port(dpid)
-            if out_port is not None:
-                self._send_packet(datapath, in_port, out_port, msg)
-                return
+        all_hosts = list(self.topo.host_table.keys())
+        if not self.path_installed and len(all_hosts) >= 2:
+            self._compute_paths()
+            if self.path_installed:
+                out_port = self._get_path_out_port(dpid)
+                if out_port is not None:
+                    self._send_packet(datapath, in_port, out_port, msg)
+                    return
 
         if dst in self.host_location:
             out_port = self._get_path_out_port(dpid)
@@ -215,28 +245,6 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
         actions = [parser.OFPActionOutput(in_port)]
         self.add_flow(datapath, 10, match, actions)
 
-    def _get_path_out_port(self, dpid):
-        """获取当前路径下该交换机的出端口"""
-        path = PATH_PORTS.get(self.current_path, {})
-        return path.get(dpid)
-
-    def _get_out_port(self, from_dpid, to_dpid):
-        """计算从 from_dpid 到 to_dpid 的出端口（基于当前路径拓扑）"""
-        path = self.current_path
-        if path == "A":
-            chain = [1, 2, 4]
-        else:
-            chain = [1, 3, 4]
-        try:
-            idx = chain.index(from_dpid)
-            if idx + 1 < len(chain) and chain[idx + 1] == to_dpid:
-                return PATH_PORTS[path][from_dpid]
-            if idx - 1 >= 0 and chain[idx - 1] == to_dpid:
-                return PATH_PORTS_REV[path][from_dpid]
-        except ValueError:
-            pass
-        return None
-
     def _arp_lookup(self, ip):
         """通过 IP 查找 MAC（直接查询 ARP 学到的绑定表）"""
         return self.ip_to_mac.get(ip)
@@ -251,39 +259,117 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
                 self.ip_to_mac[arp_pkt.dst_ip] = arp_pkt.dst_mac
 
     # ──────────────────────────────────────────────
-    # 路径安装与切换
+    # 路径计算与安装
     # ──────────────────────────────────────────────
+    def _compute_paths(self):
+        """Compute two edge-disjoint paths via TopologyManager."""
+        hosts = list(self.topo.host_table.keys())
+        if len(hosts) < 2:
+            return
+
+        mac_a, mac_b = hosts[0], hosts[1]
+        loc_a = self.topo.get_host_location(mac_a)
+        loc_b = self.topo.get_host_location(mac_b)
+        if not loc_a or not loc_b:
+            return
+
+        src_dpid = loc_a[0]
+        dst_dpid = loc_b[0]
+
+        paths = self.topo.compute_k_shortest_paths(src_dpid, dst_dpid, k=2, weight=None)
+
+        if not paths:
+            return
+
+        fwd1, rev1 = self.topo.path_to_ports(paths[0][0])
+        self.path_fwd["A"] = fwd1
+        self.path_rev["A"] = rev1
+        self.path_util_keys["A"] = self.topo.get_path_util_keys(fwd1, rev1)
+
+        if len(paths) >= 2:
+            fwd2, rev2 = self.topo.path_to_ports(paths[1][0])
+            self.path_fwd["B"] = fwd2
+            self.path_rev["B"] = rev2
+            self.path_util_keys["B"] = self.topo.get_path_util_keys(fwd2, rev2)
+        else:
+            self.path_fwd["B"] = fwd1
+            self.path_rev["B"] = rev1
+            self.path_util_keys["B"] = self.path_util_keys["A"]
+
+        self.set_path_util_keys(self.path_util_keys)
+        self._install_full_path("A", PRIORITY_STANDBY_PATH)
+        if len(paths) >= 2:
+            self._install_full_path("B", PRIORITY_STANDBY_PATH)
+
+        self.path_installed = True
+        self.logger.info("Paths computed: fwd_A=%s, fwd_B=%s", fwd1, self.path_fwd["B"])
+
     def _install_full_path(self, path_name, priority):
-        """
-        在路径上所有交换机安装显式流表（正向 h1→h3 + 反向 h3→h1）
-        :param path_name: "A" 或 "B"
-        :param priority: 流表优先级，默认 PRIORITY_STANDBY_PATH=10
-        """
-        h3_mac = "00:00:00:00:00:03"
-        h1_mac = "00:00:00:00:00:01"
-        ports = PATH_PORTS[path_name]
-        ports_rev = PATH_PORTS_REV[path_name]
-        for dpid in ports:
+        """Install flow rules for the named path."""
+        fwd = self.path_fwd.get(path_name)
+        rev = self.path_rev.get(path_name)
+        if not fwd or not rev:
+            return
+
+        hosts = list(self.host_location.keys())
+        if len(hosts) < 2:
+            return
+
+        mac_dst = hosts[1]
+        mac_src = hosts[0]
+
+        for dpid, out_port in fwd.items():
             if dpid in self.datapaths:
                 dp = self.datapaths[dpid]
                 parser = dp.ofproto_parser
-                # 正向：eth_dst=h3 → 路径出端口
-                match = parser.OFPMatch(eth_dst=h3_mac)
-                actions = [parser.OFPActionOutput(ports[dpid])]
+                match = parser.OFPMatch(eth_dst=mac_dst)
+                actions = [parser.OFPActionOutput(out_port)]
                 self.add_flow(dp, priority, match, actions)
-                # 反向：eth_dst=h1 → 反向路径出端口
-                match_rev = parser.OFPMatch(eth_dst=h1_mac)
-                actions_rev = [parser.OFPActionOutput(ports_rev[dpid])]
-                self.add_flow(dp, priority, match_rev, actions_rev)
-                self.logger.info(
-                    "  Install: s%d fwd=p%d rev=p%d (path %s, prio=%d)",
-                    dpid,
-                    ports[dpid],
-                    ports_rev[dpid],
-                    path_name,
-                    priority,
-                )
 
+        for dpid, out_port in rev.items():
+            if dpid in self.datapaths:
+                dp = self.datapaths[dpid]
+                parser = dp.ofproto_parser
+                match = parser.OFPMatch(eth_dst=mac_src)
+                actions = [parser.OFPActionOutput(out_port)]
+                self.add_flow(dp, priority, match, actions)
+
+    def _get_path_out_port(self, dpid):
+        """获取当前路径下该交换机的出端口"""
+        fwd = self.path_fwd.get(self.current_path)
+        if fwd and dpid in fwd:
+            return fwd[dpid]
+        return None
+
+    def _get_out_port(self, from_dpid, to_dpid):
+        """计算从 from_dpid 到 to_dpid 的出端口（基于当前路径拓扑）"""
+        curr = self.current_path
+        fwd = self.path_fwd.get(curr)
+        rev = self.path_rev.get(curr)
+
+        if fwd and from_dpid in fwd:
+            fwd_chain = list(fwd.keys())
+            try:
+                idx = fwd_chain.index(from_dpid)
+                if idx + 1 < len(fwd_chain) and fwd_chain[idx + 1] == to_dpid:
+                    return fwd[from_dpid]
+            except ValueError:
+                pass
+
+        if rev and from_dpid in rev:
+            rev_chain = list(rev.keys())
+            try:
+                idx = rev_chain.index(from_dpid)
+                if idx + 1 < len(rev_chain) and rev_chain[idx + 1] == to_dpid:
+                    return rev[from_dpid]
+            except ValueError:
+                pass
+
+        return None
+
+    # ──────────────────────────────────────────────
+    # 路径切换
+    # ──────────────────────────────────────────────
     def _switch_path(self, new_path):
         """切换路径：利用 OpenFlow 原子覆盖特性实现先建后拆"""
         old_path = self.current_path
@@ -310,8 +396,8 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
         hub.sleep(0.2)
 
         # 获取旧路径涉及的 dpid 和端口映射
-        ports = PATH_PORTS[old_path]
-        ports_rev = PATH_PORTS_REV[old_path]
+        ports = self.path_fwd.get(old_path, {})
+        ports_rev = self.path_rev.get(old_path, {})
 
         for dpid in ports:
             if dpid not in self.datapaths:
@@ -325,7 +411,7 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
             mod = parser.OFPFlowMod(
                 datapath=dp,
                 command=ofproto.OFPFC_DELETE,
-                out_port=ports[dpid],  # <--- 核心修复：只删除指向“旧出端口”的流表
+                out_port=ports[dpid],  # <--- 核心修复：只删除指向"旧出端口"的流表
                 out_group=ofproto.OFPG_ANY,
                 match=match,
             )
@@ -377,10 +463,9 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
 
     def _get_path_util(self, path_name):
         """获取路径瓶颈利用率（所有核心链路的最大值）"""
-        if path_name == "A":
-            keys = [(1, 3), (2, 2), (4, 3)]
-        else:
-            keys = [(1, 4), (3, 2), (4, 4)]
+        keys = self.path_util_keys.get(path_name, set())
+        if not keys:
+            return 0
         utils = [self.link_utilization.get(k, 0) for k in keys]
         return max(utils) if utils else 0
 
@@ -390,36 +475,3 @@ class ThresholdBalancer(app_manager.RyuApp, StatsMixin):
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
         self.handle_port_stats_reply(ev)
-
-    # ──────────────────────────────────────────────
-    # 拓扑发现（LLDP）
-    # ──────────────────────────────────────────────
-    @set_ev_cls(topo_event.EventSwitchEnter)
-    def _switch_add_handler(self, ev):
-        dpid = ev.switch.dp.id
-        self.datapaths[dpid] = ev.switch.dp
-        self.logger.info("Topology: switch s%d added", dpid)
-
-    @set_ev_cls(topo_event.EventSwitchLeave)
-    def _switch_del_handler(self, ev):
-        dpid = ev.switch.dp.id
-        self.datapaths.pop(dpid, None)
-        self.logger.info("Topology: switch s%d removed", dpid)
-
-    @set_ev_cls(topo_event.EventLinkAdd)
-    def _link_add_handler(self, ev):
-        src = ev.link.src
-        dst = ev.link.dst
-        self.logger.info(
-            "Topology: link s%d:p%d → s%d:p%d",
-            src.dpid,
-            src.port_no,
-            dst.dpid,
-            dst.port_no,
-        )
-
-    @set_ev_cls(topo_event.EventLinkDelete)
-    def _link_del_handler(self, ev):
-        src = ev.link.src
-        dst = ev.link.dst
-        self.logger.info("Topology: link s%d → s%d removed", src.dpid, dst.dpid)
