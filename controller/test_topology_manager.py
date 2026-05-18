@@ -277,6 +277,71 @@ def _build_dual_path_topo(topo):
     topo.add_link(3, 2, 4, 2)  # s3:2 <-> s4:2
 
 
+def _build_fat_tree_topo(topo):
+    """Build a minimal Fat-Tree k=4 test topology (pods 0-1 + core)."""
+    for dpid in range(1, 21):
+        topo.add_switch(dpid)
+
+    # Pod 0 edge <-> agg
+    topo.add_link(1, 3, 9, 1)   # e1 <-> a1
+    topo.add_link(1, 4, 10, 1)  # e1 <-> a2
+    topo.add_link(2, 3, 9, 2)   # e2 <-> a1
+    topo.add_link(2, 4, 10, 2)  # e2 <-> a2
+
+    # Pod 0 agg <-> core
+    topo.add_link(9, 3, 17, 1)  # a1 <-> c1
+    topo.add_link(10, 3, 17, 2) # a2 <-> c1
+
+    # Pod 1 edge <-> agg
+    topo.add_link(3, 3, 11, 1)
+    topo.add_link(3, 4, 12, 1)
+    topo.add_link(4, 3, 11, 2)
+    topo.add_link(4, 4, 12, 2)
+
+    # Pod 1 agg <-> core
+    topo.add_link(11, 3, 17, 3)
+    topo.add_link(12, 3, 17, 4)
+
+    # Learn hosts
+    topo.learn_host("00:00:00:00:00:01", 1, 1)
+    topo.learn_host("00:00:00:00:00:03", 3, 1)
+
+
+def test_k_shortest_paths():
+    """Test Yen's K-shortest paths on Fat-Tree topology."""
+    topo = TopologyManager()
+    _build_fat_tree_topo(topo)
+
+    paths = topo.compute_k_shortest_paths(1, 3, k=3, weight=None)
+
+    assert len(paths) >= 1, "Should find at least one path"
+    for path, cost in paths:
+        assert path[0] == 1
+        assert path[-1] == 3
+
+    print(f"  PASS: test_k_shortest_paths")
+    print(f"    Found {len(paths)} paths: {[(p, f'{c:.1f}') for p, c in paths]}")
+
+
+def test_weighted_k_paths():
+    """Test that weights affect path ordering."""
+    topo = TopologyManager()
+    _build_fat_tree_topo(topo)
+
+    # Set high weight on one link to make it less preferred
+    topo.set_edge_weight(9, 17, 100.0)  # make a1->c1 expensive
+
+    paths = topo.compute_k_shortest_paths(1, 3, k=3, weight='weight')
+
+    assert len(paths) >= 1
+    # The expensive link should not be in the first path
+    first_path = paths[0][0]
+    assert 9 not in first_path or len(paths) == 1, \
+        "High-weight link should be avoided"
+
+    print(f"  PASS: test_weighted_k_paths")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("TopologyManager Unit Tests")
@@ -293,6 +358,8 @@ if __name__ == "__main__":
         test_path_util_keys,
         test_topology_change_invalidation,
         test_dual_path_consistency,
+        test_k_shortest_paths,
+        test_weighted_k_paths,
     ]
 
     passed = 0
