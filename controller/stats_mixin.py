@@ -108,21 +108,27 @@ class StatsMixin:
         self.prev_time[dpid] = now
 
     def _get_link_label(self, dpid, port_no):
-        """动态获取链路标签（基于拓扑管理器）"""
+        """Dynamic link labeling for Fat-Tree topology."""
         if self.topo_manager is None:
             return f"s{dpid}_p{port_no}"
 
-        # 检查是否为边缘端口
+        # Edge port (host access)
         if self.topo_manager.is_edge_port(dpid, port_no):
             return f"s{dpid}_p{port_no}_edge"
 
-        # 检查属于哪条已计算的路径
+        # Check active path util keys (K paths)
         if hasattr(self, '_path_util_keys'):
             for path_name, keys in self._path_util_keys.items():
                 if (dpid, port_no) in keys:
                     return f"path_{path_name}"
 
-        return f"s{dpid}_p{port_no}"
+        # Classify by switch tier in Fat-Tree
+        if dpid <= 8:
+            return f"edge_s{dpid}_p{port_no}"
+        elif dpid <= 16:
+            return f"agg_s{dpid}_p{port_no}"
+        else:
+            return f"core_s{dpid}_p{port_no}"
 
     def set_path_util_keys(self, path_util_keys):
         """设置路径利用率键集合，用于动态标签。
