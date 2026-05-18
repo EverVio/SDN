@@ -16,13 +16,14 @@ class StatsMixin:
     IDLE_THRESHOLD = 0.30
     WARNING_THRESHOLD = 0.50
 
-    def init_stats(self):
+    def init_stats(self, topo_manager=None):
         """初始化统计相关数据结构，并由子类在 __init__ 中调用"""
         self.datapaths = {}  # dpid → datapath 对象
         self.prev_port_stats = {}  # (dpid, port_no) → 上次tx_bytes
         self.prev_time = {}  # dpid → 上次收到该交换机统计回复的时间戳（per-datapath）
         self.link_utilization = {}  # (dpid, port_no) → 当前利用率
         self.curr_poll_interval = self.POLL_NORMAL
+        self.topo_manager = topo_manager  # TopologyManager 实例
 
         os.makedirs("data", exist_ok=True)
 
@@ -107,20 +108,25 @@ class StatsMixin:
         self.prev_time[dpid] = now
 
     def _get_link_label(self, dpid, port_no):
-        """根据交换机号和端口号返回链路标签（需与实际拓扑端口一致）"""
-        # 路径 A：s1 port3 → s2 port2 → s4 port3
-        # 路径 B：s1 port4 → s3 port2 → s4 port4
-        if dpid == 1 and port_no == 3:
-            return "path_A"
-        if dpid == 2 and port_no == 2:
-            return "path_A"
-        if dpid == 4 and port_no == 3:
-            return "path_A"
-        if dpid == 1 and port_no == 4:
-            return "path_B"
-        if dpid == 3 and port_no == 2:
-            return "path_B"
-        if dpid == 4 and port_no == 4:
-            return "path_B"
-        # 其他端口（接入端口等）用通用标签
+        """动态获取链路标签（基于拓扑管理器）"""
+        if self.topo_manager is None:
+            return f"s{dpid}_p{port_no}"
+
+        # 检查是否为边缘端口
+        if self.topo_manager.is_edge_port(dpid, port_no):
+            return f"s{dpid}_p{port_no}_edge"
+
+        # 检查属于哪条已计算的路径
+        if hasattr(self, '_path_util_keys'):
+            for path_name, keys in self._path_util_keys.items():
+                if (dpid, port_no) in keys:
+                    return f"path_{path_name}"
+
         return f"s{dpid}_p{port_no}"
+
+    def set_path_util_keys(self, path_util_keys):
+        """设置路径利用率键集合，用于动态标签。
+
+        参数: path_util_keys = {"A": {(dpid, port_no), ...}, "B": {...}}
+        """
+        self._path_util_keys = path_util_keys
