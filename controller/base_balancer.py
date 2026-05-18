@@ -63,12 +63,13 @@ class BaseBalancer(app_manager.RyuApp, StatsMixin):
     # ──────────────────────────────────────────────
     # 流表安装 / 数据包发送辅助
     # ──────────────────────────────────────────────
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         kwargs = dict(
-            datapath=datapath, priority=priority, match=match, instructions=inst
+            datapath=datapath, priority=priority, match=match, instructions=inst,
+            idle_timeout=idle_timeout,
         )
         if buffer_id is not None:
             kwargs["buffer_id"] = buffer_id

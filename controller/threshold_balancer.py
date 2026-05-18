@@ -155,7 +155,7 @@ class ThresholdBalancer(BaseBalancer):
     # 路径计算与安装
     # ──────────────────────────────────────────────
     def _compute_paths(self):
-        """Compute two edge-disjoint paths via TopologyManager."""
+        """Compute two paths: shortest (A) and edge-disjoint alternative (B)."""
         hosts = list(self.topo.host_table.keys())
         if len(hosts) < 2:
             return
@@ -169,18 +169,21 @@ class ThresholdBalancer(BaseBalancer):
         src_dpid = loc_a[0]
         dst_dpid = loc_b[0]
 
-        paths = self.topo.compute_k_shortest_paths(src_dpid, dst_dpid, k=2, weight=None)
+        result_a = self.topo.compute_optimal_path(src_dpid, dst_dpid)
 
-        if not paths:
+        if not result_a:
             return
 
-        fwd1, rev1 = self.topo.path_to_ports(paths[0][0])
+        path_a, _ = result_a
+        fwd1, rev1 = self.topo.path_to_ports(path_a)
         self.path_fwd["A"] = fwd1
         self.path_rev["A"] = rev1
         self.path_util_keys["A"] = self.topo.get_path_util_keys(fwd1, rev1)
 
-        if len(paths) >= 2:
-            fwd2, rev2 = self.topo.path_to_ports(paths[1][0])
+        result_b = self.topo.compute_alternative_path(src_dpid, dst_dpid, path_a)
+        if result_b:
+            path_b, _ = result_b
+            fwd2, rev2 = self.topo.path_to_ports(path_b)
             self.path_fwd["B"] = fwd2
             self.path_rev["B"] = rev2
             self.path_util_keys["B"] = self.topo.get_path_util_keys(fwd2, rev2)
@@ -191,8 +194,7 @@ class ThresholdBalancer(BaseBalancer):
 
         self.set_path_util_keys(self.path_util_keys)
         self._install_full_path("A", PRIORITY_STANDBY_PATH)
-        if len(paths) >= 2:
-            self._install_full_path("B", PRIORITY_STANDBY_PATH)
+        self._install_full_path("B", PRIORITY_STANDBY_PATH)
 
         self.path_installed = True
         self.logger.info("Paths computed: fwd_A=%s, fwd_B=%s", fwd1, self.path_fwd["B"])
@@ -238,7 +240,7 @@ class ThresholdBalancer(BaseBalancer):
     # 路径切换
     # ──────────────────────────────────────────────
     def _switch_path(self, new_path):
-        """切换路径：利用 OpenFlow 原子覆盖特性实现先建后拆"""
+        """切换路径：Make-Before-Break，先安装新路径再清理旧路径"""
         old_path = self.current_path
         self.logger.info(
             ">>> Make-Before-Break: switching from %s to %s", old_path, new_path
@@ -246,9 +248,6 @@ class ThresholdBalancer(BaseBalancer):
 
         if self.path_installed:
             self._install_full_path(new_path, priority=PRIORITY_STANDBY_PATH)
-            self.logger.info(
-                "  Installed new path %s (Atomic Overwrite on shared nodes)", new_path
-            )
 
         self.current_path = new_path
         hub.spawn(self._async_cleanup_old_path, old_path)

@@ -12,7 +12,7 @@ class StatsMixin:
     LINK_BW = 10_000_000  # 10 Mbps
     POLL_NORMAL = 3  # 正常轮询间隔（秒）
     POLL_IDLE = 5  # 空闲时轮询间隔
-    POLL_WARNING = 1  # 高负载时轮询间隔
+    POLL_WARNING = 3  # 高负载时轮询间隔
     IDLE_THRESHOLD = 0.30
     WARNING_THRESHOLD = 0.50
 

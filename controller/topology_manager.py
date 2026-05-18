@@ -9,7 +9,7 @@ class TopologyManager:
     1. 维护有向图 G=(V, E)，节点=交换机 DPID，边=物理链路
     2. 管理主机位置表 Host_Table: MAC -> (dpid, port)
     3. 识别边缘接入端口（排除骨干端口）
-    4. 计算 K 最短路径（Yen 算法）
+    4. 计算加权最短路径（Dijkstra）
     5. 计算生成树（用于无环洪泛）
     """
 
@@ -26,7 +26,7 @@ class TopologyManager:
     def add_switch(self, dpid):
         if not self.G.has_node(dpid):
             self.G.add_node(dpid)
-            self._invalidate_cache()
+            self._recompute_spanning_tree()
 
     def remove_switch(self, dpid):
         if self.G.has_node(dpid):
@@ -39,14 +39,14 @@ class TopologyManager:
                 mac: loc for mac, loc in self.host_table.items()
                 if loc[0] != dpid
             }
-            self._invalidate_cache()
+            self._recompute_spanning_tree()
 
     def add_link(self, src_dpid, src_port, dst_dpid, dst_port):
         self.G.add_edge(src_dpid, dst_dpid)
         self.G.add_edge(dst_dpid, src_dpid)
         self.link_ports[(src_dpid, dst_dpid)] = src_port
         self.link_ports[(dst_dpid, src_dpid)] = dst_port
-        self._invalidate_cache()
+        self._recompute_spanning_tree()
 
     def remove_link(self, src_dpid, dst_dpid):
         if self.G.has_edge(src_dpid, dst_dpid):
@@ -55,7 +55,7 @@ class TopologyManager:
             self.G.remove_edge(dst_dpid, src_dpid)
         self.link_ports.pop((src_dpid, dst_dpid), None)
         self.link_ports.pop((dst_dpid, src_dpid), None)
-        self._invalidate_cache()
+        self._recompute_spanning_tree()
 
     def learn_host(self, mac, dpid, port):
         if mac not in self.host_table:
@@ -91,7 +91,7 @@ class TopologyManager:
         return port_no not in backbone
 
     # ──────────────────────────────────────────────
-    # 路径计算
+    # 最短路径计算
     # ──────────────────────────────────────────────
 
     def set_edge_weight(self, src_dpid, dst_dpid, weight):
@@ -115,115 +115,91 @@ class TopologyManager:
             cost += edge_data.get(weight, 1.0)
         return cost
 
-    def compute_k_shortest_paths(self, src_dpid, dst_dpid, k=3, weight='weight'):
-        """Compute up to K shortest paths using Yen's algorithm.
-
-        Returns: List of (path, cost) tuples sorted by cost ascending.
-        """
-        import heapq
-
-        if not (self.G.has_node(src_dpid) and self.G.has_node(dst_dpid)):
-            return []
-
-        if not nx.has_path(self.G, src_dpid, dst_dpid):
-            return []
-        first_path = nx.shortest_path(self.G, src_dpid, dst_dpid, weight=weight)
-        first_cost = self._path_cost(first_path, weight)
-
-        A = [(first_path, first_cost)]
-        B = []  # min-heap of (cost, tiebreaker, path)
-        seen = {tuple(first_path)}
-
-        for i in range(1, k):
-            prev_path = A[-1][0]
-
-            for j in range(len(prev_path) - 1):
-                spur_node = prev_path[j]
-                root_path = prev_path[:j + 1]
-                root_cost = self._path_cost(root_path, weight)
-
-                # Remove edges used by confirmed paths with same root
-                removed_edges = []
-                for path, _ in A:
-                    if len(path) > j and path[:j + 1] == root_path:
-                        u, v = path[j], path[j + 1]
-                        if self.G.has_edge(u, v):
-                            w = self.G[u][v].get('weight', 1.0)
-                            self.G.remove_edge(u, v)
-                            removed_edges.append((u, v, w))
-
-                # Remove root path internal nodes to prevent revisiting
-                for node in root_path[:-1]:
-                    for neighbor in list(self.G.neighbors(node)):
-                        w = self.G[node][neighbor].get('weight', 1.0)
-                        removed_edges.append((node, neighbor, w))
-                        self.G.remove_edge(node, neighbor)
-
-                if nx.has_path(self.G, spur_node, dst_dpid):
-                    spur_path = nx.shortest_path(
-                        self.G, spur_node, dst_dpid, weight=weight
-                    )
-                    total_path = root_path[:-1] + spur_path
-                    total_cost = root_cost + self._path_cost(spur_path, weight)
-
-                    key = tuple(total_path)
-                    if key not in seen:
-                        seen.add(key)
-                        heapq.heappush(B, (total_cost, len(seen), total_path))
-
-                # Restore all removed edges
-                for u, v, w in removed_edges:
-                    if not self.G.has_edge(u, v):
-                        self.G.add_edge(u, v, weight=w)
-
-            if not B:
-                break
-            cost, _, path = heapq.heappop(B)
-            A.append((path, cost))
-
-        return A
-
-    def select_ecmp_path(self, flow_tuple, k):
-        """Select a path index [0, k) using a hash of the 5-tuple.
-
-        Args:
-            flow_tuple: (src_ip, dst_ip, proto, src_port, dst_port)
-            k: number of available paths
+    def compute_optimal_path(self, src_dpid, dst_dpid, weight='weight'):
+        """Compute the single optimal (shortest) path using Dijkstra.
 
         Returns:
-            Integer index in [0, k), deterministic for a given flow_tuple.
+            (path_nodes, cost) tuple, or None if no path exists.
         """
-        if k <= 0:
-            return 0
-        return hash(flow_tuple) % k
+        if not (self.G.has_node(src_dpid) and self.G.has_node(dst_dpid)):
+            return None
+
+        if not nx.has_path(self.G, src_dpid, dst_dpid):
+            return None
+
+        path_nodes = nx.shortest_path(self.G, src_dpid, dst_dpid, weight=weight)
+        cost = self._path_cost(path_nodes, weight)
+        return path_nodes, cost
+
+    def compute_ecmp_path(self, src_dpid, dst_dpid, src_mac, dst_mac, weight='weight'):
+        """Compute shortest path with ECMP-aware selection for Fat-Tree.
+
+        When multiple equal-cost shortest paths exist, selects one based on
+        MAC pair hash to distribute traffic across different core switches.
+
+        Returns:
+            (path_nodes, cost) tuple, or None if no path exists.
+        """
+        if not (self.G.has_node(src_dpid) and self.G.has_node(dst_dpid)):
+            return None
+
+        if not nx.has_path(self.G, src_dpid, dst_dpid):
+            return None
+
+        all_paths = list(nx.all_shortest_paths(self.G, src_dpid, dst_dpid, weight=weight))
+
+        if not all_paths:
+            return None
+
+        if len(all_paths) == 1:
+            path_nodes = all_paths[0]
+        else:
+            mac_lo, mac_hi = sorted([src_mac, dst_mac])
+            idx = hash((mac_lo, mac_hi)) % len(all_paths)
+            path_nodes = all_paths[idx]
+
+        cost = self._path_cost(path_nodes, weight)
+        return path_nodes, cost
+
+    def compute_alternative_path(self, src_dpid, dst_dpid, primary_path, weight='weight'):
+        """Compute an alternative shortest path by temporarily removing primary path edges.
+
+        Returns:
+            (path_nodes, cost) tuple, or None if no alternative exists.
+        """
+        if not primary_path or len(primary_path) < 2:
+            return None
+
+        removed = []
+        for i in range(len(primary_path) - 1):
+            u, v = primary_path[i], primary_path[i + 1]
+            if self.G.has_edge(u, v):
+                w = self.G[u][v].get('weight', 1.0)
+                self.G.remove_edge(u, v)
+                removed.append((u, v, w))
+            if self.G.has_edge(v, u):
+                w = self.G[v][u].get('weight', 1.0)
+                self.G.remove_edge(v, u)
+                removed.append((v, u, w))
+
+        result = None
+        if nx.has_path(self.G, src_dpid, dst_dpid):
+            path_nodes = nx.shortest_path(self.G, src_dpid, dst_dpid, weight=weight)
+            cost = self._path_cost(path_nodes, weight)
+            result = (path_nodes, cost)
+
+        for u, v, w in removed:
+            self.G.add_edge(u, v, weight=w)
+
+        return result
 
     def compute_spanning_tree_ports(self):
-        """计算生成树端口集合，用于无环洪泛。
+        """返回生成树端口集合（由拓扑变更事件预计算）。
 
         返回: {dpid: set(port_no, ...)}
         """
-        if self._st_ports_cache is not None:
-            return self._st_ports_cache
-
-        undirected = self.G.to_undirected()
-        if not undirected.nodes():
-            return {}
-
-        try:
-            st = nx.minimum_spanning_tree(undirected)
-        except nx.NetworkXError:
-            return {}
-
-        st_ports = defaultdict(set)
-        for u, v in st.edges():
-            port_uv = self.link_ports.get((u, v))
-            port_vu = self.link_ports.get((v, u))
-            if port_uv is not None:
-                st_ports[u].add(port_uv)
-            if port_vu is not None:
-                st_ports[v].add(port_vu)
-
-        self._st_ports_cache = dict(st_ports)
+        if self._st_ports_cache is None:
+            self._recompute_spanning_tree()
         return self._st_ports_cache
 
     def get_flood_ports(self, dpid, in_port=None):
@@ -265,5 +241,24 @@ class TopologyManager:
 
         return fwd_ports, rev_ports
 
-    def _invalidate_cache(self):
-        self._st_ports_cache = None
+    def _recompute_spanning_tree(self):
+        """Eagerly recompute spanning tree ports on topology change."""
+        undirected = self.G.to_undirected()
+        if not undirected.nodes():
+            self._st_ports_cache = {}
+            return
+
+        if not nx.is_connected(undirected):
+            self._st_ports_cache = {}
+            return
+
+        st = nx.minimum_spanning_tree(undirected)
+        st_ports = defaultdict(set)
+        for u, v in st.edges():
+            port_uv = self.link_ports.get((u, v))
+            port_vu = self.link_ports.get((v, u))
+            if port_uv is not None:
+                st_ports[u].add(port_uv)
+            if port_vu is not None:
+                st_ports[v].add(port_vu)
+        self._st_ports_cache = dict(st_ports)

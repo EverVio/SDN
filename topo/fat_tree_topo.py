@@ -9,7 +9,7 @@ EDGE_PER_POD = K // 2   # 2
 AGG_PER_POD = K // 2     # 2
 HOST_PER_EDGE = K // 2   # 2
 
-BW_ACCESS = 100  # access links (high bw, effectively unlimited)
+BW_ACCESS = 10
 BW_EDGE_AGG = 10
 BW_AGG_CORE = 10
 

@@ -1,31 +1,24 @@
 import os
 import sys
 import time
-import atexit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
-from ryu.lib.packet import packet, ethernet, ether_types, arp, ipv4, tcp, udp
+from ryu.lib.packet import packet, ethernet, ether_types, arp
 from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER
 
 from controller.base_balancer import BaseBalancer
 from controller.weight_engine import DynamicWeightEngine
 
-# Constants
-K_PATHS = 3  # number of candidate paths to compute
+# 流表优先级
 PRIORITY_ACTIVE_PATH = 20
 PRIORITY_STANDBY_PATH = 10
-
-# Elephant/Mice flow separation
-PRIORITY_MICE = 10
-PRIORITY_ELEPHANT = 30
-ELEPHANT_THRESHOLD = 1_000_000  # 1 Mbps in bytes/sec
-FLOW_IDLE_TIMEOUT_MICE = 60
-FLOW_IDLE_TIMEOUT_ELEPHANT = 300
+FLOW_IDLE_TIMEOUT = 30  # 流表空闲超时（秒）
+SESSION_TIMEOUT = 60    # 会话清理超时（秒）
 
 
 class PredictiveBalancer(BaseBalancer):
@@ -33,51 +26,48 @@ class PredictiveBalancer(BaseBalancer):
 
     def __init__(self, *args, **kwargs):
         super(PredictiveBalancer, self).__init__(*args, **kwargs)
-        self.path_installed = False
-
-        # Per-flow tracking for elephant/mice separation
-        self.flow_table = {}  # flow_tuple -> {bytes, first_seen, last_seen, path_idx, is_elephant}
-        self.flow_rules_installed = set()  # (flow_tuple, dpid) for elephant rule cleanup
-
-        # K-path cache: list of (fwd_ports, rev_ports, path_nodes, cost)
-        self.k_paths = []
-        self.active_path_idx = 0
-
-        # Per-path util keys for StatsMixin labeling
-        self.path_util_keys = {}
+        self.active_sessions = {}  # (src_mac, dst_mac) -> {'path_nodes', 'fwd_ports', 'rev_ports', 'util_keys'}
+        self.path_installed = set()
 
         self.init_stats(topo_manager=self.topo)
 
-        # Dynamic weight engine (ML predictions)
         model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
         self.weight_engine = DynamicWeightEngine(model_dir=model_dir)
 
-        atexit.register(self._cleanup)
         self.decision_thread = hub.spawn(self._decision_loop)
 
     # ──────────────────────────────────────────────
     # BaseBalancer 抽象方法实现
     # ──────────────────────────────────────────────
     def _get_active_fwd_ports(self):
-        if self.k_paths and self.active_path_idx < len(self.k_paths):
-            return self.k_paths[self.active_path_idx][0]
+        if self.active_sessions:
+            first = next(iter(self.active_sessions.values()))
+            return first.get('fwd_ports')
         return None
 
     def _get_active_rev_ports(self):
-        if self.k_paths and self.active_path_idx < len(self.k_paths):
-            return self.k_paths[self.active_path_idx][1]
+        if self.active_sessions:
+            first = next(iter(self.active_sessions.values()))
+            return first.get('rev_ports')
         return None
 
     def _invalidate_paths(self):
-        """Clear K-path cache on topology change, triggering recomputation"""
-        self.k_paths = []
-        self.active_path_idx = 0
-        self.path_util_keys = {}
-        self.path_installed = False
+        self.active_sessions.clear()
+        self.path_installed.clear()
         self.logger.info("Paths invalidated due to topology change")
 
+    def _get_out_port(self, from_dpid, to_dpid):
+        """Override base class: compute output port via direct Dijkstra instead of session cache."""
+        result = self.topo.compute_optimal_path(from_dpid, to_dpid, weight=None)
+        if result:
+            path_nodes, _ = result
+            if len(path_nodes) >= 2:
+                fwd, _ = self.topo.path_to_ports(path_nodes)
+                return fwd.get(from_dpid)
+        return None
+
     # ──────────────────────────────────────────────
-    # Packet-In handling
+    # Packet-In 处理
     # ──────────────────────────────────────────────
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -117,65 +107,28 @@ class PredictiveBalancer(BaseBalancer):
         # Data packet handling
         self._install_reverse_rule(datapath, src, in_port)
 
-        # Ensure K paths are installed before flow-level routing
-        all_hosts = list(self.topo.host_table.keys())
-        if not self.path_installed and len(all_hosts) >= 2:
-            self._compute_and_install_paths()
+        # Compute and install path when both hosts are known
+        if dst in self.topo.host_table and src in self.topo.host_table:
+            session_key = (src, dst)
+            if session_key not in self.active_sessions:
+                self._compute_and_install_path(src, dst)
 
-        # --- 5-tuple flow tracking for IPv4 data packets ---
-        flow_tuple = self._parse_flow_tuple(pkt, eth)
-
-        if flow_tuple is not None and self.path_installed:
-            now = time.time()
-            is_elephant = self._update_flow_state(flow_tuple, msg.total_len, now)
-
-            if is_elephant:
-                # Elephant flow: install dedicated high-priority rule
-                src_loc = self.topo.get_host_location(src)
-                dst_loc = self.topo.get_host_location(dst)
-
-                if src_loc and dst_loc:
-                    fwd, rev = self._select_elephant_path(src_loc[0], dst_loc[0])
-
-                    if fwd is not None:
-                        self._migrate_elephant_flow(flow_tuple, fwd, rev)
-
-                        out_port = fwd.get(dpid)
-                        if out_port is not None:
-                            self._send_packet(datapath, in_port, out_port, msg)
-                            return
-
-            # Mice flow: use ECMP path selection
-            n_paths = len(self.k_paths)
-            if n_paths > 0:
-                path_idx = self.topo.select_ecmp_path(flow_tuple, n_paths)
-                fwd_ports = self.k_paths[path_idx][0]
-                out_port = fwd_ports.get(dpid)
-
+            if session_key in self.active_sessions:
+                self.active_sessions[session_key]['last_seen'] = time.time()
+                fwd = self.active_sessions[session_key]['fwd_ports']
+                out_port = fwd.get(dpid)
                 if out_port is not None:
                     buf_id = msg.buffer_id if msg.buffer_id != ofproto.OFP_NO_BUFFER else None
-                    self._install_flow_rule(
-                        datapath, flow_tuple, out_port,
-                        is_elephant=False, buffer_id=buf_id,
-                    )
-                    if buf_id is None:
+                    match = parser.OFPMatch(eth_src=src, eth_dst=dst)
+                    actions = [parser.OFPActionOutput(out_port)]
+                    if buf_id is not None:
+                        self.add_flow(datapath, PRIORITY_ACTIVE_PATH, match, actions, buf_id, idle_timeout=FLOW_IDLE_TIMEOUT)
+                    else:
+                        self.add_flow(datapath, PRIORITY_ACTIVE_PATH, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT)
                         self._send_packet(datapath, in_port, out_port, msg)
                     return
 
-        # --- MAC-only fallback (non-IPv4 or paths not yet installed) ---
-        if dst in self.topo.host_table:
-            out_port = self._get_path_out_port(dpid)
-            if out_port is not None:
-                match = parser.OFPMatch(eth_dst=dst)
-                actions = [parser.OFPActionOutput(out_port)]
-                if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                    self.add_flow(datapath, 10, match, actions, msg.buffer_id)
-                else:
-                    self.add_flow(datapath, 10, match, actions)
-                    self._send_packet(datapath, in_port, out_port, msg)
-                return
-
-        # Destination unknown: loop-free flooding
+        # Destination unknown or path not available: loop-free flooding
         flood_ports = self.topo.get_flood_ports(dpid, in_port)
         if flood_ports:
             for port in flood_ports:
@@ -196,11 +149,9 @@ class PredictiveBalancer(BaseBalancer):
         if target_mac:
             target_loc = self.topo.get_host_location(target_mac)
             if target_loc:
-                # Known target: controller proxy ARP Reply
                 self._send_arp_reply(datapath, in_port, arp_pkt, target_mac)
                 return
 
-        # Target unknown: loop-free flood along spanning tree
         flood_ports = self.topo.get_flood_ports(dpid, in_port)
         if flood_ports:
             for port in flood_ports:
@@ -257,471 +208,137 @@ class PredictiveBalancer(BaseBalancer):
         datapath.send_msg(out)
 
     # ──────────────────────────────────────────────
-    # 5-tuple flow parsing and elephant/mice separation
+    # 路径安装
     # ──────────────────────────────────────────────
-
-    def _parse_flow_tuple(self, pkt, eth):
-        """Extract 5-tuple from an IPv4 packet.
-
-        Returns:
-            (src_ip, dst_ip, proto, src_port, dst_port) or None if not IPv4.
-        """
-        if eth.ethertype != ether_types.ETH_TYPE_IP:
-            return None
-
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
-        if ip_pkt is None:
-            return None
-
-        src_ip = ip_pkt.src
-        dst_ip = ip_pkt.dst
-        proto = ip_pkt.proto
-
-        src_port = 0
-        dst_port = 0
-
-        if proto == 6:  # TCP
-            tcp_pkt = pkt.get_protocol(tcp.tcp)
-            if tcp_pkt:
-                src_port = tcp_pkt.src_port
-                dst_port = tcp_pkt.dst_port
-        elif proto == 17:  # UDP
-            udp_pkt = pkt.get_protocol(udp.udp)
-            if udp_pkt:
-                src_port = udp_pkt.src_port
-                dst_port = udp_pkt.dst_port
-
-        return (src_ip, dst_ip, proto, src_port, dst_port)
-
-    def _update_flow_state(self, flow_tuple, byte_count, now):
-        """Update per-flow byte tracking and detect elephant flows.
-
-        Returns:
-            True if the flow is currently classified as elephant.
-        """
-        if flow_tuple not in self.flow_table:
-            self.flow_table[flow_tuple] = {
-                'bytes': 0,
-                'first_seen': now,
-                'last_seen': now,
-                'path_fwd': None,
-                'is_elephant': False,
-            }
-
-        entry = self.flow_table[flow_tuple]
-        entry['bytes'] += byte_count
-        entry['last_seen'] = now
-
-        elapsed = now - entry['first_seen']
-        if elapsed < 0.5:
-            return entry['is_elephant']
-
-        rate = entry['bytes'] / elapsed  # bytes per second
-
-        was_elephant = entry['is_elephant']
-        entry['is_elephant'] = rate > ELEPHANT_THRESHOLD
-
-        if entry['is_elephant'] and not was_elephant:
-            self.logger.info(
-                "Flow promoted to ELEPHANT: %s (rate=%.2f Mbps)",
-                flow_tuple, rate * 8 / 1_000_000,
-            )
-
-        return entry['is_elephant']
-
-    def _install_flow_rule(self, datapath, flow_tuple, out_port, is_elephant, buffer_id=None):
-        """Install a 5-tuple flow rule on a switch."""
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-        src_ip, dst_ip, proto, src_port, dst_port = flow_tuple
-
-        priority = PRIORITY_ELEPHANT if is_elephant else PRIORITY_MICE
-        idle_timeout = FLOW_IDLE_TIMEOUT_ELEPHANT if is_elephant else FLOW_IDLE_TIMEOUT_MICE
-
-        match_kwargs = {
-            'eth_type': ether_types.ETH_TYPE_IP,
-            'ipv4_src': src_ip,
-            'ipv4_dst': dst_ip,
-            'ip_proto': proto,
-        }
-
-        if proto == 6:  # TCP
-            match_kwargs['tcp_src'] = src_port
-            match_kwargs['tcp_dst'] = dst_port
-        elif proto == 17:  # UDP
-            match_kwargs['udp_src'] = src_port
-            match_kwargs['udp_dst'] = dst_port
-
-        match = parser.OFPMatch(**match_kwargs)
-        actions = [parser.OFPActionOutput(out_port)]
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-
-        kwargs = {
-            'datapath': datapath,
-            'priority': priority,
-            'match': match,
-            'instructions': inst,
-            'idle_timeout': idle_timeout,
-            'hard_timeout': 0,
-            'flags': ofproto.OFPFF_SEND_FLOW_REM,
-        }
-
-        if buffer_id is not None:
-            kwargs['buffer_id'] = buffer_id
-
-        mod = parser.OFPFlowMod(**kwargs)
-        datapath.send_msg(mod)
-
-    def _select_elephant_path(self, src_dpid, dst_dpid):
-        """Select the best path for an elephant flow using ML weights.
-
-        Returns:
-            (fwd_ports, rev_ports) or (None, None) if no path found.
-        """
-        self.weight_engine.apply_weights_to_topology(self.topo)
-
-        paths_with_cost = self.topo.compute_k_shortest_paths(
-            src_dpid, dst_dpid, k=K_PATHS, weight='weight'
-        )
-
-        if not paths_with_cost:
-            return None, None
-
-        best_idx = 0
-        best_cost = float('inf')
-        for idx, (path_nodes, cost) in enumerate(paths_with_cost):
-            if cost < best_cost:
-                best_cost = cost
-                best_idx = idx
-
-        best_path = paths_with_cost[best_idx][0]
-        fwd, rev = self.topo.path_to_ports(best_path)
-
-        self.logger.info(
-            "Elephant path selected: ingress=s%d -> s%d, cost=%.2f",
-            src_dpid, dst_dpid, best_cost,
-        )
-
-        return fwd, rev
-
-    def _migrate_elephant_flow(self, flow_tuple, new_fwd, new_rev):
-        """Install elephant flow rules along the new path, replacing old ones."""
-        src_ip, dst_ip, proto, src_port, dst_port = flow_tuple
-
-        def _build_match_kwargs(sip, dip, sp, dp, p):
-            mk = {
-                'eth_type': ether_types.ETH_TYPE_IP,
-                'ipv4_src': sip,
-                'ipv4_dst': dip,
-                'ip_proto': p,
-            }
-            if p == 6:
-                mk['tcp_src'] = sp
-                mk['tcp_dst'] = dp
-            elif p == 17:
-                mk['udp_src'] = sp
-                mk['udp_dst'] = dp
-            return mk
-
-        # Forward direction
-        fwd_match = _build_match_kwargs(src_ip, dst_ip, src_port, dst_port, proto)
-        for dpid, out_port in new_fwd.items():
-            if dpid in self.datapaths:
-                dp = self.datapaths[dpid]
-                parser = dp.ofproto_parser
-                ofproto = dp.ofproto
-
-                old_key = (flow_tuple, dpid)
-                if old_key in self.flow_rules_installed:
-                    match = parser.OFPMatch(**fwd_match)
-                    mod = parser.OFPFlowMod(
-                        datapath=dp,
-                        command=ofproto.OFPFC_DELETE_STRICT,
-                        priority=PRIORITY_ELEPHANT,
-                        out_port=ofproto.OFPP_ANY,
-                        out_group=ofproto.OFPG_ANY,
-                        match=match,
-                    )
-                    dp.send_msg(mod)
-                    self.flow_rules_installed.discard(old_key)
-
-                self._install_flow_rule(dp, flow_tuple, out_port, is_elephant=True)
-                self.flow_rules_installed.add(old_key)
-
-        # Reverse direction
-        rev_tuple = (dst_ip, src_ip, proto, dst_port, src_port)
-        rev_match = _build_match_kwargs(dst_ip, src_ip, dst_port, src_port, proto)
-        for dpid, out_port in new_rev.items():
-            if dpid in self.datapaths:
-                dp = self.datapaths[dpid]
-                parser = dp.ofproto_parser
-                ofproto = dp.ofproto
-
-                old_key = (rev_tuple, dpid)
-                if old_key in self.flow_rules_installed:
-                    match = parser.OFPMatch(**rev_match)
-                    mod = parser.OFPFlowMod(
-                        datapath=dp,
-                        command=ofproto.OFPFC_DELETE_STRICT,
-                        priority=PRIORITY_ELEPHANT,
-                        out_port=ofproto.OFPP_ANY,
-                        out_group=ofproto.OFPG_ANY,
-                        match=match,
-                    )
-                    dp.send_msg(mod)
-                    self.flow_rules_installed.discard(old_key)
-
-                self._install_flow_rule(dp, rev_tuple, out_port, is_elephant=True)
-                self.flow_rules_installed.add(old_key)
-
-        entry = self.flow_table.get(flow_tuple)
-        if entry:
-            entry['path_fwd'] = new_fwd
-
-        self.logger.info("Elephant flow %s migrated to new path", flow_tuple)
-
-    def _check_elephant_flows(self):
-        """Check all active elephant flows for better path availability."""
-        now = time.time()
-        stale_flows = []
-
-        for flow_tuple, entry in self.flow_table.items():
-            if not entry['is_elephant']:
-                continue
-
-            if now - entry['last_seen'] > FLOW_IDLE_TIMEOUT_ELEPHANT:
-                stale_flows.append(flow_tuple)
-                continue
-
-            src_ip, dst_ip = flow_tuple[0], flow_tuple[1]
-            src_mac = self.ip_to_mac.get(src_ip)
-            dst_mac = self.ip_to_mac.get(dst_ip)
-            if not src_mac or not dst_mac:
-                continue
-
-            src_loc = self.topo.get_host_location(src_mac)
-            dst_loc = self.topo.get_host_location(dst_mac)
-            if not src_loc or not dst_loc:
-                continue
-
-            fwd, rev = self._select_elephant_path(src_loc[0], dst_loc[0])
-
-            if fwd is not None and entry.get('path_fwd') != fwd:
-                self.logger.info(
-                    "Elephant flow %s: better path found, migrating", flow_tuple
-                )
-                self._migrate_elephant_flow(flow_tuple, fwd, rev)
-
-        for ft in stale_flows:
-            self.flow_table.pop(ft, None)
-            self.flow_rules_installed = {
-                k for k in self.flow_rules_installed if k[0] != ft
-            }
-            self.logger.info("Elephant flow %s expired (idle timeout)", ft)
-
-    # ──────────────────────────────────────────────
-    # K-path computation and installation
-    # ──────────────────────────────────────────────
-    def _compute_and_install_paths(self):
-        """Compute K shortest paths using dynamic weights and install flow rules."""
-        hosts = list(self.topo.host_table.keys())
-        if len(hosts) < 2:
-            return
-
-        mac_a, mac_b = hosts[0], hosts[1]
-        loc_a = self.topo.get_host_location(mac_a)
-        loc_b = self.topo.get_host_location(mac_b)
-        if not loc_a or not loc_b:
-            return
-
-        src_dpid = loc_a[0]
-        dst_dpid = loc_b[0]
-
-        # Apply current weights to topology graph
-        self.weight_engine.apply_weights_to_topology(self.topo)
-
-        # Compute K shortest paths
-        paths_with_cost = self.topo.compute_k_shortest_paths(
-            src_dpid, dst_dpid, k=K_PATHS, weight='weight'
-        )
-
-        if not paths_with_cost:
-            self.logger.warning("No path found between s%d and s%d", src_dpid, dst_dpid)
-            return
-
-        self.k_paths = []
-        self.path_util_keys = {}
-
-        for idx, (path_nodes, cost) in enumerate(paths_with_cost):
-            fwd, rev = self.topo.path_to_ports(path_nodes)
-            util_keys = self.topo.get_path_util_keys(fwd, rev)
-            self.k_paths.append((fwd, rev, path_nodes, cost))
-            self.path_util_keys[str(idx)] = util_keys
-
-        # Install all candidate paths with standby priority
-        for idx, (fwd, rev, _, _) in enumerate(self.k_paths):
-            self._install_full_path_dynamic(str(idx), PRIORITY_STANDBY_PATH, fwd, rev)
-
-        self.active_path_idx = 0
-        self.set_path_util_keys(self.path_util_keys)
-        self.path_installed = True
-
-        self.logger.info(
-            "K=%d paths computed: ingress=s%d, costs=%s",
-            len(self.k_paths), src_dpid,
-            [f"{c:.2f}" for _, _, _, c in self.k_paths],
-        )
-
-    # ──────────────────────────────────────────────
-    # Path installation and switching (dynamic port mapping)
-    # ──────────────────────────────────────────────
-    def _install_full_path_dynamic(self, path_name, priority, fwd_ports, rev_ports):
-        """Install explicit flow rules on all switches along the path (dynamic port mapping)"""
-        hosts = list(self.topo.host_table.keys())
-        if len(hosts) < 2:
-            return
-
-        mac_dst = hosts[1]  # forward destination
-        mac_src = hosts[0]  # reverse destination
-
+    def _install_path_rules(self, src_mac, dst_mac, fwd_ports):
+        """Install eth_src+eth_dst rules along path to avoid multi-session collision."""
         for dpid, out_port in fwd_ports.items():
             if dpid in self.datapaths:
                 dp = self.datapaths[dpid]
                 parser = dp.ofproto_parser
-                # Forward: eth_dst=mac_dst -> path output port
-                match = parser.OFPMatch(eth_dst=mac_dst)
+                match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
                 actions = [parser.OFPActionOutput(out_port)]
-                self.add_flow(dp, priority, match, actions)
+                self.add_flow(dp, PRIORITY_ACTIVE_PATH, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT)
 
-        for dpid, out_port in rev_ports.items():
-            if dpid in self.datapaths:
-                dp = self.datapaths[dpid]
-                parser = dp.ofproto_parser
-                match = parser.OFPMatch(eth_dst=mac_src)
-                actions = [parser.OFPActionOutput(out_port)]
-                self.add_flow(dp, priority, match, actions)
-
-        self.logger.info("  Installed path %s (dynamic)", path_name)
-
-    def _get_path_out_port(self, dpid):
-        """Get output port for the currently active path."""
-        if not self.k_paths:
-            return None
-        fwd = self.k_paths[self.active_path_idx][0]
-        return fwd.get(dpid)
-
-    def _switch_path(self, new_idx):
-        """Switch to path at new_idx using make-before-break."""
-        old_idx = self.active_path_idx
-        self.logger.info(
-            ">>> Switching from path %d to path %d", old_idx, new_idx
-        )
-
-        if self.path_installed and new_idx < len(self.k_paths):
-            fwd, rev, _, _ = self.k_paths[new_idx]
-            self._install_full_path_dynamic(
-                str(new_idx), PRIORITY_STANDBY_PATH, fwd, rev
-            )
-
-        self.active_path_idx = new_idx
-        hub.spawn(self._async_cleanup_old_path, old_idx)
-
-    def _async_cleanup_old_path(self, old_idx):
-        """Remove flow rules for the old path."""
-        hub.sleep(0.2)
-        if old_idx >= len(self.k_paths):
+    def _compute_and_install_path(self, src_mac, dst_mac):
+        """Compute optimal path using current ML weights and install flow rules."""
+        src_loc = self.topo.get_host_location(src_mac)
+        dst_loc = self.topo.get_host_location(dst_mac)
+        if not src_loc or not dst_loc:
             return
 
-        fwd, rev, _, _ = self.k_paths[old_idx]
-        hosts = list(self.topo.host_table.keys())
-        if len(hosts) < 2:
-            return
+        src_dpid, dst_dpid = src_loc[0], dst_loc[0]
 
-        mac_dst = hosts[1]
-        mac_src = hosts[0]
+        self.weight_engine.apply_weights_to_topology(self.topo)
+        result = self.topo.compute_ecmp_path(src_dpid, dst_dpid, src_mac, dst_mac)
 
-        for dpid, out_port in fwd.items():
-            if dpid not in self.datapaths:
-                continue
-            dp = self.datapaths[dpid]
-            parser = dp.ofproto_parser
-            ofproto = dp.ofproto
-            match = parser.OFPMatch(eth_dst=mac_dst)
-            mod = parser.OFPFlowMod(
-                datapath=dp, command=ofproto.OFPFC_DELETE,
-                out_port=out_port, out_group=ofproto.OFPG_ANY, match=match,
+        if result:
+            path_nodes, cost = result
+            fwd, rev = self.topo.path_to_ports(path_nodes)
+            util_keys = self.topo.get_path_util_keys(fwd, rev)
+
+            session_key = (src_mac, dst_mac)
+            self.active_sessions[session_key] = {
+                'path_nodes': path_nodes,
+                'fwd_ports': fwd,
+                'rev_ports': rev,
+                'util_keys': util_keys,
+                'last_seen': time.time(),
+            }
+
+            self._install_path_rules(src_mac, dst_mac, fwd)
+            self._install_path_rules(dst_mac, src_mac, rev)
+
+            self.logger.info(
+                "Path installed: %s -> %s, nodes=%s, cost=%.2f",
+                src_mac, dst_mac, path_nodes, cost,
             )
-            dp.send_msg(mod)
-
-        for dpid, out_port in rev.items():
-            if dpid not in self.datapaths:
-                continue
-            dp = self.datapaths[dpid]
-            parser = dp.ofproto_parser
-            ofproto = dp.ofproto
-            match = parser.OFPMatch(eth_dst=mac_src)
-            mod = parser.OFPFlowMod(
-                datapath=dp, command=ofproto.OFPFC_DELETE,
-                out_port=out_port, out_group=ofproto.OFPG_ANY, match=match,
-            )
-            dp.send_msg(mod)
-
-        self.logger.info("  Cleaned up flows for path %d", old_idx)
 
     # ──────────────────────────────────────────────
-    # Decision loop
+    # 决策循环：周期性预测并触发动态重路由
     # ──────────────────────────────────────────────
     def _decision_loop(self):
-        """Periodically update weights, predict, and select best path."""
         while True:
             hub.sleep(self.curr_poll_interval)
-            if not self.datapaths or not self.k_paths:
+            if not self.datapaths or not self.active_sessions:
                 continue
 
-            # Feed current utilizations to weight engine
             for (dpid, port_no), util in self.link_utilization.items():
                 self.weight_engine.register_link(dpid, port_no)
                 self.weight_engine.update_utilization(dpid, port_no, util)
 
-            # Run ML predictions
             self.weight_engine.predict_all()
-
-            # Recompute weights and find best path
             self.weight_engine.apply_weights_to_topology(self.topo)
 
-            best_idx = self.active_path_idx
-            best_cost = float('inf')
-            for idx, (fwd, rev, path_nodes, _) in enumerate(self.k_paths):
-                cost = self.topo._path_cost(path_nodes, weight='weight')
-                if cost < best_cost:
-                    best_cost = cost
-                    best_idx = idx
+            for (src_mac, dst_mac), session in list(self.active_sessions.items()):
+                src_loc = self.topo.get_host_location(src_mac)
+                dst_loc = self.topo.get_host_location(dst_mac)
+                if not src_loc or not dst_loc:
+                    continue
 
-            # Log state
+                src_dpid, dst_dpid = src_loc[0], dst_loc[0]
+                result = self.topo.compute_ecmp_path(src_dpid, dst_dpid, src_mac, dst_mac)
+
+                if result:
+                    new_path, new_cost = result
+                    old_path = session['path_nodes']
+
+                    if new_path != old_path:
+                        self.logger.info(
+                            "Rerouting %s -> %s: cost %.2f", src_mac, dst_mac, new_cost,
+                        )
+                        new_fwd, new_rev = self.topo.path_to_ports(new_path)
+                        new_util_keys = self.topo.get_path_util_keys(new_fwd, new_rev)
+
+                        self._install_path_rules(src_mac, dst_mac, new_fwd)
+                        self._install_path_rules(dst_mac, src_mac, new_rev)
+
+                        self._cleanup_stale_rules(src_mac, dst_mac, session['fwd_ports'], new_fwd)
+                        self._cleanup_stale_rules(dst_mac, src_mac, session['rev_ports'], new_rev)
+
+                        session['path_nodes'] = new_path
+                        session['fwd_ports'] = new_fwd
+                        session['rev_ports'] = new_rev
+                        session['util_keys'] = new_util_keys
+
+            # Clean up stale sessions
+            now = time.time()
+            stale = [
+                k for k, v in self.active_sessions.items()
+                if now - v.get('last_seen', 0) > SESSION_TIMEOUT
+            ]
+            for k in stale:
+                src_mac, dst_mac = k
+                session = self.active_sessions.pop(k)
+                self._cleanup_stale_rules(src_mac, dst_mac, session['fwd_ports'], {})
+                self._cleanup_stale_rules(dst_mac, src_mac, session['rev_ports'], {})
+                self.logger.info("Session expired: %s -> %s", src_mac, dst_mac)
+
             summary = self.weight_engine.get_state_summary()
-            utils = [self._get_path_util(i) for i in range(len(self.k_paths))]
+            max_util = max(self.link_utilization.values()) if self.link_utilization else 0
             self.logger.info(
-                "Paths: %s, Active: %d, Best: %d (%.2f), ML: %d links predicted",
-                [f"{u*100:.0f}%" for u in utils],
-                self.active_path_idx, best_idx, best_cost,
+                "ML: %d links predicted, max_util=%.1f%%, active sessions=%d",
                 summary["links_with_prediction"],
+                max_util * 100,
+                len(self.active_sessions),
             )
 
-            # Switch if a different path is better
-            if best_idx != self.active_path_idx:
-                self._switch_path(best_idx)
-
-            # Monitor elephant flows for migration
-            self._check_elephant_flows()
-
-    def _get_path_util(self, path_idx):
-        """Get bottleneck utilization for path at given index."""
-        key = str(path_idx)
-        keys = self.path_util_keys.get(key, set())
-        if not keys:
-            return 0
-        utils = [self.link_utilization.get(k, 0) for k in keys]
-        return max(utils) if utils else 0
-
-    def _cleanup(self):
-        pass  # DynamicWeightEngine has no file handles to close
+    def _cleanup_stale_rules(self, src_mac, dst_mac, old_ports, new_ports):
+        """Remove flow rules on switches that are in old path but not new path."""
+        for dpid, out_port in old_ports.items():
+            if dpid in new_ports:
+                continue
+            if dpid not in self.datapaths:
+                continue
+            dp = self.datapaths[dpid]
+            parser = dp.ofproto_parser
+            ofproto = dp.ofproto
+            match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
+            mod = parser.OFPFlowMod(
+                datapath=dp,
+                command=ofproto.OFPFC_DELETE,
+                out_port=out_port,
+                out_group=ofproto.OFPG_ANY,
+                match=match,
+            )
+            dp.send_msg(mod)
