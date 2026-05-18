@@ -23,7 +23,6 @@ from scripts.traffic_gen import (
     generate_sawtooth_noise_commands,
     generate_step_commands,
     generate_sine_commands,
-    generate_fat_tree_commands,
 )
 
 DATA_DIR = "data"

@@ -5,17 +5,14 @@ import atexit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ryu.base import app_manager
-from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 from ryu.lib.packet import packet, ethernet, ether_types, arp, ipv4, tcp, udp
-from ryu.topology import event as topo_event
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER
 
-from controller.stats_mixin import StatsMixin
-from controller.topology_manager import TopologyManager
+from controller.base_balancer import BaseBalancer
 from controller.weight_engine import DynamicWeightEngine
 
 # Constants
@@ -31,21 +28,16 @@ FLOW_IDLE_TIMEOUT_MICE = 60
 FLOW_IDLE_TIMEOUT_ELEPHANT = 300
 
 
-class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
+class PredictiveBalancer(BaseBalancer):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(PredictiveBalancer, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}
-        self.ip_to_mac = {}
-        self.datapaths = {}
         self.path_installed = False
 
         # Per-flow tracking for elephant/mice separation
         self.flow_table = {}  # flow_tuple -> {bytes, first_seen, last_seen, path_idx, is_elephant}
         self.flow_rules_installed = set()  # (flow_tuple, dpid) for elephant rule cleanup
-
-        self.topo = TopologyManager()
 
         # K-path cache: list of (fwd_ports, rev_ports, path_nodes, cost)
         self.k_paths = []
@@ -64,24 +56,25 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
         self.decision_thread = hub.spawn(self._decision_loop)
 
     # ──────────────────────────────────────────────
-    # Switch connection: install table-miss rule
+    # BaseBalancer 抽象方法实现
     # ──────────────────────────────────────────────
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-        match = parser.OFPMatch()
-        actions = [
-            parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)
-        ]
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(
-            datapath=datapath, priority=0, match=match, instructions=inst
-        )
-        datapath.send_msg(mod)
-        self.datapaths[datapath.id] = datapath
-        self.logger.info("Switch %s connected, table-miss installed", datapath.id)
+    def _get_active_fwd_ports(self):
+        if self.k_paths and self.active_path_idx < len(self.k_paths):
+            return self.k_paths[self.active_path_idx][0]
+        return None
+
+    def _get_active_rev_ports(self):
+        if self.k_paths and self.active_path_idx < len(self.k_paths):
+            return self.k_paths[self.active_path_idx][1]
+        return None
+
+    def _invalidate_paths(self):
+        """Clear K-path cache on topology change, triggering recomputation"""
+        self.k_paths = []
+        self.active_path_idx = 0
+        self.path_util_keys = {}
+        self.path_installed = False
+        self.logger.info("Paths invalidated due to topology change")
 
     # ──────────────────────────────────────────────
     # Packet-In handling
@@ -262,86 +255,6 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
             data=eth_pkt.data,
         )
         datapath.send_msg(out)
-
-    # ──────────────────────────────────────────────
-    # Flow table installation helpers
-    # ──────────────────────────────────────────────
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        kwargs = dict(
-            datapath=datapath, priority=priority, match=match, instructions=inst
-        )
-        if buffer_id is not None:
-            kwargs["buffer_id"] = buffer_id
-        mod = parser.OFPFlowMod(**kwargs)
-        datapath.send_msg(mod)
-
-    def _send_packet(self, datapath, in_port, out_port, msg):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        actions = [parser.OFPActionOutput(out_port)]
-        data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=data,
-        )
-        datapath.send_msg(out)
-
-    def _install_reverse_rule(self, datapath, mac, in_port):
-        """Install reverse flow rule on current switch: eth_dst=mac -> in_port"""
-        parser = datapath.ofproto_parser
-        match = parser.OFPMatch(eth_dst=mac)
-        actions = [parser.OFPActionOutput(in_port)]
-        self.add_flow(datapath, 10, match, actions)
-
-    def _get_path_out_port(self, dpid):
-        """Get output port for the currently active path."""
-        if not self.k_paths:
-            return None
-        fwd = self.k_paths[self.active_path_idx][0]
-        return fwd.get(dpid)
-
-    def _get_out_port(self, from_dpid, to_dpid):
-        """Compute output port from from_dpid to to_dpid (based on topology graph)."""
-        # Check active path's forward direction
-        if self.k_paths:
-            fwd = self.k_paths[self.active_path_idx][0]
-            rev = self.k_paths[self.active_path_idx][1]
-
-            if fwd and from_dpid in fwd:
-                fwd_chain = list(fwd.keys())
-                try:
-                    idx = fwd_chain.index(from_dpid)
-                    if idx + 1 < len(fwd_chain) and fwd_chain[idx + 1] == to_dpid:
-                        return fwd[from_dpid]
-                except ValueError:
-                    pass
-
-            if rev and from_dpid in rev:
-                rev_chain = list(rev.keys())
-                try:
-                    idx = rev_chain.index(from_dpid)
-                    if idx + 1 < len(rev_chain) and rev_chain[idx + 1] == to_dpid:
-                        return rev[from_dpid]
-                except ValueError:
-                    pass
-
-        return None
-
-    def _arp_lookup(self, ip):
-        return self.ip_to_mac.get(ip)
-
-    def _learn_arp_binding(self, arp_pkt, eth_src):
-        if arp_pkt.src_ip and arp_pkt.src_mac:
-            self.ip_to_mac[arp_pkt.src_ip] = arp_pkt.src_mac
-        if arp_pkt.opcode == arp.ARP_REPLY:
-            if arp_pkt.dst_ip and arp_pkt.dst_mac:
-                self.ip_to_mac[arp_pkt.dst_ip] = arp_pkt.dst_mac
 
     # ──────────────────────────────────────────────
     # 5-tuple flow parsing and elephant/mice separation
@@ -690,6 +603,13 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
 
         self.logger.info("  Installed path %s (dynamic)", path_name)
 
+    def _get_path_out_port(self, dpid):
+        """Get output port for the currently active path."""
+        if not self.k_paths:
+            return None
+        fwd = self.k_paths[self.active_path_idx][0]
+        return fwd.get(dpid)
+
     def _switch_path(self, new_idx):
         """Switch to path at new_idx using make-before-break."""
         old_idx = self.active_path_idx
@@ -805,54 +725,3 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
 
     def _cleanup(self):
         pass  # DynamicWeightEngine has no file handles to close
-
-    # ──────────────────────────────────────────────
-    # Stats reply
-    # ──────────────────────────────────────────────
-    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
-    def port_stats_reply_handler(self, ev):
-        self.handle_port_stats_reply(ev)
-
-    # ──────────────────────────────────────────────
-    # Topology discovery (LLDP -> dynamic graph maintenance)
-    # ──────────────────────────────────────────────
-    @set_ev_cls(topo_event.EventSwitchEnter)
-    def _switch_add_handler(self, ev):
-        dpid = ev.switch.dp.id
-        self.datapaths[dpid] = ev.switch.dp
-        self.topo.add_switch(dpid)
-        self.logger.info("Topology: switch s%d added (graph node created)", dpid)
-
-    @set_ev_cls(topo_event.EventSwitchLeave)
-    def _switch_del_handler(self, ev):
-        dpid = ev.switch.dp.id
-        self.datapaths.pop(dpid, None)
-        self.topo.remove_switch(dpid)
-        self.logger.info("Topology: switch s%d removed (graph node deleted)", dpid)
-
-    @set_ev_cls(topo_event.EventLinkAdd)
-    def _link_add_handler(self, ev):
-        src = ev.link.src
-        dst = ev.link.dst
-        self.topo.add_link(src.dpid, src.port_no, dst.dpid, dst.port_no)
-        self.logger.info(
-            "Topology: link s%d:p%d -> s%d:p%d (graph edges added)",
-            src.dpid, src.port_no, dst.dpid, dst.port_no,
-        )
-        self._invalidate_paths()
-
-    @set_ev_cls(topo_event.EventLinkDelete)
-    def _link_del_handler(self, ev):
-        src = ev.link.src
-        dst = ev.link.dst
-        self.topo.remove_link(src.dpid, dst.dpid)
-        self.logger.info("Topology: link s%d -> s%d removed", src.dpid, dst.dpid)
-        self._invalidate_paths()
-
-    def _invalidate_paths(self):
-        """Clear K-path cache on topology change, triggering recomputation"""
-        self.k_paths = []
-        self.active_path_idx = 0
-        self.path_util_keys = {}
-        self.path_installed = False
-        self.logger.info("Paths invalidated due to topology change")

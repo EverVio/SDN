@@ -4,7 +4,7 @@
 
 **Goal:** 基于 Ryu 控制器 + Mininet Fat-Tree k=4 数据中心拓扑，实现一个"AI 预测驱动的主动式动态负载均衡调度器"。通过 K-Shortest Path 算法计算多条候选路径，结合机器学习模型预测链路拥塞趋势，在拥塞发生**之前**提前重路由。引入大小流分离机制：老鼠流使用 ECMP 哈希分流，大象流使用 ML 加权专用路径。通过三阶段对照实验（无负载均衡 → 阈值响应式 → AI 预测式）验证 AI 赋能的优势。
 
-**Architecture:** Mininet 构建 Fat-Tree k=4 拓扑（20 交换机 + 16 主机，4 个 Pod），Ryu 控制器作为 SDN 控制平面。控制器使用 Yen's K-Shortest Path 算法在加权图上计算多条候选路径，边权由 `DynamicWeightEngine` 动态计算（基础跳数 + 当前利用率 + ML 预测利用率）。逐链路 Random Forest 模型替代旧的逐路径模型。引入大象流/老鼠流分离：通过 5 元组（src_ip, dst_ip, proto, src_port, dst_port）匹配流表，老鼠流 priority=10 ECMP 分流，大象流 priority=30 ML 加权专用路径。
+**Architecture:** Mininet 构建 Fat-Tree k=4 拓扑（20 交换机 + 16 主机，4 个 Pod），Ryu 控制器作为 SDN 控制平面。`BaseBalancer` 基类提取公共逻辑（table-miss、流表安装、ARP、拓扑事件），`ThresholdBalancer` 和 `PredictiveBalancer` 继承并实现差异化策略。控制器使用 Yen's K-Shortest Path 算法在加权图上计算多条候选路径，边权由 `DynamicWeightEngine` 动态计算（基础跳数 + 当前利用率 + ML 预测利用率）。逐链路 Random Forest 模型替代旧的逐路径模型。引入大象流/老鼠流分离：通过 5 元组（src_ip, dst_ip, proto, src_port, dst_port）匹配流表，老鼠流 priority=10 ECMP 分流，大象流 priority=30 ML 加权专用路径。
 
 **Tech Stack:** Python 3.12 / Ryu SDN Framework / Mininet / Open vSwitch / OpenFlow 1.3 / NetworkX / scikit-learn (RandomForestRegressor) / joblib / numpy / pandas / matplotlib
 
@@ -23,8 +23,8 @@
 | 控制器 | 角色 | 架构 | 对比意义 |
 |--------|------|------|---------|
 | `base_controller.py` | 基准对照（无负载均衡） | L2 学习交换机：MAC 学习 + 泛洪 | 证明负载均衡的必要性 |
-| `threshold_balancer.py` | 对照组（阈值响应式） | K 路径 + TopologyManager + if util>70% 则切换 | 传统方法的延迟响应 |
-| `predictive_balancer.py` | 实验组（AI 预测式） | K 路径 + DynamicWeightEngine + 大小流分离 + RF 预测 | **核心创新** |
+| `threshold_balancer.py` | 对照组（阈值响应式） | 继承 BaseBalancer + TopologyManager + if util>70% 则切换 | 传统方法的延迟响应 |
+| `predictive_balancer.py` | 实验组（AI 预测式） | 继承 BaseBalancer + DynamicWeightEngine + 大小流分离 + RF 预测 | **核心创新** |
 
 实验对比维度：`无 LB` vs `阈值 LB` vs `AI LB`，突出 AI 预测的**提前切换能力**、**大小流分离的精细化调度**和**高负载下的吞吐量平稳度**。
 
@@ -73,6 +73,13 @@ h0_0 h0_1 h1_0 h1_1 h2_0 h2_1 h3_0 h3_1 h4_0 h4_1 h5_0 h5_1 h6_0 h6_1 h7_0 h7_1
 ┌─────────────────────────────────────────────────────┐
 │                  Ryu Controller                      │
 │  ┌───────────────────────────────────────────────┐  │
+│  │     BaseBalancer (公共基类)                    │  │
+│  │  - table-miss / 流表安装 / 数据包发送         │  │
+│  │  - ARP 学习与查找                             │  │
+│  │  - 拓扑事件处理 (LLDP)                        │  │
+│  │  - 出端口计算 (模板方法)                      │  │
+│  └───────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────┐  │
 │  │        TopologyManager (NetworkX DiGraph)     │  │
 │  │  - Yen's K-Shortest Paths (k=3)              │  │
 │  │  - Dynamic edge weights                      │  │
@@ -117,9 +124,13 @@ h0_0 h0_1 h1_0 h1_1 h2_0 h2_1 h3_0 h3_1 h4_0 h4_1 h5_0 h5_1 h6_0 h6_1 h7_0 h7_1
 ```
 /home/yang/SDN/
 ├── topo/                        # Mininet 拓扑脚本
-│   ├── fat_tree_topo.py         # Fat-Tree k=4 拓扑生成器 ✅
-│   └── dual_path_topo.py        # 旧双路径拓扑（保留兼容）
+│   └── fat_tree_topo.py         # Fat-Tree k=4 拓扑生成器 ✅
 ├── controller/                  # Ryu 控制器代码
+│   ├── base_balancer.py         # 负载均衡控制器公共基类 ✅
+│   │                              - table-miss / 流表安装 / 数据包发送
+│   │                              - ARP 学习与查找
+│   │                              - 拓扑事件处理（LLDP）
+│   │                              - 出端口计算（模板方法模式）
 │   ├── base_controller.py       # L2 学习交换机（对照基准）✅
 │   ├── topology_manager.py      # NetworkX 拓扑管理器 ✅
 │   │                              - Yen's K-Shortest Paths
@@ -132,9 +143,11 @@ h0_0 h0_1 h1_0 h1_1 h2_0 h2_1 h3_0 h3_1 h4_0 h4_1 h5_0 h5_1 h6_0 h6_1 h7_0 h7_1
 │   │                              - 自适应轮询
 │   │                              - Fat-Tree 链路标签
 │   ├── threshold_balancer.py    # 阈值响应式负载均衡（对照组）✅
+│   │                              - 继承 BaseBalancer
 │   │                              - K 路径 + TopologyManager
 │   │                              - 阈值决策 (util > 70%)
 │   └── predictive_balancer.py   # AI 预测式负载均衡（实验组）✅
+│                                  - 继承 BaseBalancer
 │                                  - K 路径 + DynamicWeightEngine
 │                                  - 大小流分离 (5-tuple)
 │                                  - 老鼠流 ECMP + 大象流 ML 路径
@@ -149,11 +162,10 @@ h0_0 h0_1 h1_0 h1_1 h2_0 h2_1 h3_0 h3_1 h4_0 h4_1 h5_0 h5_1 h6_0 h6_1 h7_0 h7_1
 │   └── training_features.csv    # 组装后的训练特征
 ├── models/                      # ML 模型文件
 │   └── model_link_{name}.pkl   # 逐链路 RF 模型 ✅ (e.g. model_link_edge_s1_p1.pkl)
-├── figures/                     # 可视化图表
+├── figures/                     # 可视化图表（由 train_model.py 生成）
 ├── docs/
 │   └── superpowers/plans/
-│       ├── 2026-05-08-sdn-load-balancer.md  # 本文件
-│       └── 2026-05-18-fat-tree-upgrade.md   # Fat-Tree 升级方案
+│       └── 2026-05-08-sdn-load-balancer.md  # 本文件
 └── README.md
 ```
 
@@ -254,7 +266,6 @@ python3 -c "from topo.fat_tree_topo import create_topology, cleanup; print('Impo
 | `path_to_ports(path)` | 节点路径 → 端口映射 |
 | `get_path_util_keys(fwd, rev)` | 提取 (dpid, port) 集合用于利用率统计 |
 | `compute_spanning_tree_ports()` | 最小生成树用于无环洪泛 |
-| `compute_edge_disjoint_paths()` | 旧版兼容（内部调用 K-Shortest） |
 
 ### 2.3 Yen's 算法实现要点
 
@@ -347,6 +358,37 @@ def _get_link_label(self, dpid, port_no):
 
 ---
 
+## Phase 4.5：BaseBalancer — 负载均衡控制器公共基类 ✅
+
+**状态：已完成**
+
+**文件：** `controller/base_balancer.py`
+
+从 `threshold_balancer.py` 和 `predictive_balancer.py` 中提取的公共代码，消除重复。
+
+### 公共方法
+
+| 方法 | 功能 |
+|------|------|
+| `switch_features_handler()` | table-miss 规则安装 |
+| `add_flow()` | 流表安装辅助 |
+| `_send_packet()` | 数据包发送辅助 |
+| `_install_reverse_rule()` | 反向流表安装 |
+| `_arp_lookup()` / `_learn_arp_binding()` | ARP 学习与查找 |
+| `_get_out_port()` | 出端口计算（模板方法，调用子类实现的 `_get_active_fwd/rev_ports()`） |
+| `_switch_add_handler()` 等 | 拓扑事件处理（LLDP） |
+| `port_stats_reply_handler()` | 统计回复处理 |
+
+### 抽象方法（子类必须实现）
+
+| 方法 | 说明 |
+|------|------|
+| `_get_active_fwd_ports()` | 返回当前活跃路径的正向端口映射 |
+| `_get_active_rev_ports()` | 返回当前活跃路径的反向端口映射 |
+| `_invalidate_paths()` | 拓扑变化时清除路径缓存 |
+
+---
+
 ## Phase 5：阈值响应式负载均衡控制器（对照组）✅
 
 **状态：已完成**
@@ -356,19 +398,21 @@ def _get_link_label(self, dpid, port_no):
 ### 5.1 架构
 
 ```
-threshold_balancer.py
+threshold_balancer.py (继承 BaseBalancer)
+├── BaseBalancer                 # 公共基类：table-miss / 流表安装 / ARP / 拓扑事件
 ├── TopologyManager              # 拓扑发现 + K 路径计算
 ├── __init__                     # 双路径缓存 (path_fwd/rev A/B)
-├── switch_features_handler()    # table-miss 规则
 ├── packet_in_handler()          # ARP 单播 + host 学习 + 数据包转发
 ├── _compute_paths()             # K-Shortest Paths (k=2, weight=None)
 ├── _install_full_path()         # 在路径交换机安装 eth_dst 流表
 ├── _switch_path()               # 先建后拆（Make-Before-Break）
 ├── _decision_loop()             # util > 70% → 切换到另一条路径
-└── topology event handlers      # LLDP 邻居发现
+└── _get_active_fwd/rev_ports()  # 实现 BaseBalancer 抽象方法
 ```
 
 ### 5.2 与 PredictiveBalancer 的区别
+
+两者均继承 `BaseBalancer`，共享 table-miss 安装、流表辅助、ARP 处理、拓扑事件等公共逻辑。差异点：
 
 | | threshold_balancer | predictive_balancer |
 |---|---|---|
@@ -389,10 +433,10 @@ threshold_balancer.py
 ### 6.1 架构总览
 
 ```
-predictive_balancer.py
+predictive_balancer.py (继承 BaseBalancer)
+├── BaseBalancer                 # 公共基类：table-miss / 流表安装 / ARP / 拓扑事件
 ├── TopologyManager + DynamicWeightEngine
 ├── __init__                     # K 路径缓存 + flow_table {bytes, first_seen, last_seen, path_fwd, is_elephant}
-├── switch_features_handler()    # table-miss 规则
 ├── packet_in_handler()          # ARP + 5-tuple 解析 + ECMP/大象流路由
 │   ├── _parse_flow_tuple()      # IPv4/TCP/UDP → 5 元组
 │   ├── _update_flow_state()     # 字节累计 → 大象流检测
@@ -404,7 +448,7 @@ predictive_balancer.py
 ├── _switch_path()               # 先建后拆
 ├── _decision_loop()             # ML 预测 + 大象流监控
 │   └── _check_elephant_flows()  # 检查大象流是否需要迁移
-└── topology event handlers      # LLDP 邻居发现
+└── _get_active_fwd/rev_ports()  # 实现 BaseBalancer 抽象方法
 ```
 
 ### 6.2 Packet-In 处理流程
@@ -555,10 +599,12 @@ sudo python3 scripts/collect_training_data.py
 
 ### 8.4 结果可视化
 
+待实现：需要编写 `scripts/plot_results.py` 对比三个控制器的实验结果。
+
 ```bash
-python3 scripts/plot_results.py
 # 生成 figures/utilization_comparison.png
 # 生成 figures/prediction_accuracy.png
+python3 scripts/plot_results.py
 ```
 
 ---
@@ -636,7 +682,6 @@ cd scripts && python3 train_model.py
 | `sudo python3 scripts/collect_training_data.py` | 自动批量数据采集（10 批次） |
 | `cd scripts && python3 assemble_features.py` | 组装逐链路训练特征 |
 | `cd scripts && python3 train_model.py` | 训练逐链路 ML 模型 |
-| `python3 scripts/plot_results.py` | 生成对比图表 |
 
 ---
 
@@ -646,6 +691,7 @@ cd scripts && python3 train_model.py
 - [x] **Phase 2：** TopologyManager — Yen's K-Shortest Paths + has_path() + select_ecmp_path()
 - [x] **Phase 3：** DynamicWeightEngine — ML 加权链路代价
 - [x] **Phase 4：** StatsMixin — Fat-Tree 链路标签 + 自适应轮询
+- [x] **Phase 4.5：** BaseBalancer — 公共基类（消除 threshold/predictive 重复代码）
 - [x] **Phase 5：** threshold_balancer — K 路径 + TopologyManager 对照组
 - [x] **Phase 6：** predictive_balancer — K 路径 + DynamicWeightEngine + 大小流分离
 - [x] **Phase 7：** 数据采集 + 特征组装 + 逐链路模型训练
@@ -660,7 +706,7 @@ cd scripts && python3 train_model.py
 |------|----------------------|---------------------|
 | 拓扑 | 4 交换机 + 4 主机 | 20 交换机 + 16 主机 |
 | 路径数 | 2 条固定路径 | K 条动态计算路径（Yen's） |
-| 路径算法 | Suurballe edge-disjoint | Yen's K-Shortest Path |
+| 路径算法 | 边不相交路径 | Yen's K-Shortest Path |
 | 边权 | 无（纯跳数） | 动态 ML 加权 (α·hop + β·cur + γ·pred) |
 | ML 模型 | 逐路径 (model_path_A/B.pkl) | 逐链路 (model_link_{safe_name}.pkl) |
 | 流表匹配 | eth_dst only | 5-tuple (大象流) + eth_dst (回退) |

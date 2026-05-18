@@ -1,15 +1,11 @@
 """
-随机森林模型训练与可视化分析
+随机森林模型训练（Fat-Tree per-link）
 功能：
   1. 读取 data/training_features.csv（由 collect_training_data.py + assemble_features.py 生成）
-  2. 按链路（path_A / path_B）分别建模
-  3. 使用 TimeSeriesSplit 交叉验证评估模型稳定性
-  4. 使用 GridSearchCV 进行超参数调优
-  5. 按时间顺序划分训练/测试集（前80%训练，后20%测试）
-  6. 使用 Random Forest 进行回归，记录 MAE / RMSE / R² / 相关系数
-  7. 生成多种可视化图表：预测值散点图、特征重要性、残差分析、误差分布、CV分数、学习曲线
-  8. 全量数据训练并导出最终模型至 models/model_path_A.pkl 和 models/model_path_B.pkl
-  9. 输出模型评估摘要 CSV
+  2. 按链路标签分别建模（edge_s*, agg_s*, core_s* 等 Fat-Tree 链路）
+  3. 使用 GridSearchCV + TimeSeriesSplit 进行超参数调优
+  4. 导出模型至 models/model_link_*.pkl
+  5. 输出模型评估摘要 CSV
 
 前置步骤：
   1. sudo python3 scripts/collect_training_data.py   # 采集真实 Mininet 数据
@@ -37,8 +33,6 @@ OUTPUT_MODEL_DIR = "../models"
 FIGURES_DIR = "../figures"
 SUMMARY_CSV = "../data/model_evaluation_summary.csv"
 TRAINING_CSV = "../data/training_features.csv"
-TEST_SPLIT = 0.2
-CV_FOLDS = 5
 RANDOM_STATE = 42
 
 # 超参数搜索空间
@@ -60,29 +54,6 @@ def load_data(csv_path):
     df = pd.read_csv(csv_path)
     feat_cols = [c for c in df.columns if c.startswith("feat_")]
     return df, feat_cols
-
-
-def split_time_series(X, y, test_size=0.2):
-    """按时间顺序划分训练/测试集（不打乱）"""
-    split_idx = int(len(X) * (1 - test_size))
-    return X[:split_idx], X[split_idx:], y[:split_idx], y[split_idx:]
-
-
-def evaluate_model(y_true, y_pred, model_name=""):
-    """计算并打印常用回归指标，返回指标字典"""
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
-    corr = np.corrcoef(y_true, y_pred)[0, 1]
-
-    print(
-        f"  {model_name} — MAE: {mae:.4f}, RMSE: {rmse:.4f}, "
-        f"R²: {r2:.4f}, Corr: {corr:.4f}"
-    )
-    return {"MAE": mae, "RMSE": rmse, "R²": r2, "Correlation": corr}
-
-
-# ======================== 交叉验证与超参数调优 ========================
 
 
 def cross_validate_rf(X, y, n_splits=5, link_name=""):
@@ -107,26 +78,6 @@ def cross_validate_rf(X, y, n_splits=5, link_name=""):
     print(f"    RMSE: {metrics_df['RMSE'].mean():.4f} ± {metrics_df['RMSE'].std():.4f}")
     print(f"    R²:   {metrics_df['R²'].mean():.4f} ± {metrics_df['R²'].std():.4f}")
     return metrics_df
-
-
-def tune_hyperparameters(X, y, n_splits=5, link_name=""):
-    """GridSearchCV + TimeSeriesSplit 超参数调优"""
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    rf = RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1)
-
-    grid = GridSearchCV(
-        rf,
-        PARAM_GRID,
-        cv=tscv,
-        scoring="neg_mean_absolute_error",
-        n_jobs=-1,
-        verbose=0,
-    )
-    grid.fit(X, y)
-
-    print(f"\n  {link_name} — 最优超参数: {grid.best_params_}")
-    print(f"    最优 CV MAE: {-grid.best_score_:.4f}")
-    return grid.best_estimator_, grid.best_params_
 
 
 # ======================== 可视化函数 ========================
@@ -324,89 +275,6 @@ def plot_prediction_time_series(y_true, y_pred, link_name):
     plt.savefig(filepath, dpi=150)
     plt.close()
     print(f"  时间序列对比图表已保存: {filepath}")
-
-
-# ======================== 核心训练流程 ========================
-
-
-def get_tree_predictions(X, rf_model):
-    """获取每棵树的预测值，用于计算置信区间"""
-    tree_preds = np.array([tree.predict(X) for tree in rf_model.estimators_])
-    return tree_preds.mean(axis=0), tree_preds.std(axis=0)
-
-
-def train_and_analyze(df, feat_cols, link_name):
-    """对指定链路进行完整的 RF 训练与分析流水线"""
-    print(f"\n{'='*60}")
-    print(f"分析链路: {link_name}")
-    print(f"{'='*60}")
-
-    df_link = df[df["target_label"] == link_name].copy()
-    X = df_link[feat_cols].values
-    y = df_link["U_next"].values
-
-    print(f"样本总数: {len(X)}")
-    print(
-        f"目标值统计: mean={y.mean():.4f}, std={y.std():.4f}, "
-        f"min={y.min():.4f}, max={y.max():.4f}"
-    )
-
-    # ---- 1. 交叉验证 ----
-    print("\n--- 交叉验证 (TimeSeriesSplit) ---")
-    cv_df = cross_validate_rf(X, y, n_splits=CV_FOLDS, link_name=link_name)
-
-    # ---- 2. 超参数调优 ----
-    print("\n--- 超参数调优 (GridSearchCV) ---")
-    best_model, best_params = tune_hyperparameters(
-        X, y, n_splits=CV_FOLDS, link_name=link_name
-    )
-
-    # ---- 3. 训练/测试集评估 ----
-    X_train, X_test, y_train, y_test = split_time_series(X, y, TEST_SPLIT)
-    print(f"\n训练集: {len(X_train)}, 测试集: {len(X_test)}")
-
-    best_model.fit(X_train, y_train)
-    y_pred = best_model.predict(X_test)
-    test_metrics = evaluate_model(y_test, y_pred, model_name="RF (tuned)")
-
-    # 树方差置信区间
-    _, y_pred_std = get_tree_predictions(X_test, best_model)
-    print(f"  平均预测标准差: {y_pred_std.mean():.4f}")
-
-    # OOB 分数（如果支持）
-    if hasattr(best_model, "oob_score_") and best_model.oob_score_:
-        print(f"  OOB R²: {best_model.oob_score_:.4f}")
-
-    # 特征重要性
-    importances = best_model.feature_importances_
-    print(
-        f"  特征重要性: {np.array2string(importances, precision=4, suppress_small=True)}"
-    )
-
-    # ---- 4. 可视化 ----
-    print("\n--- 生成可视化图表 ---")
-    plot_cv_scores(cv_df, link_name)
-    plot_learning_curve(best_model, X, y, link_name)
-    plot_predictions(y_test, y_pred, link_name, y_pred_std)
-    plot_feature_importance(best_model, feat_cols, link_name)
-    plot_residuals(y_test, y_pred, link_name)
-    plot_error_distribution(y_test, y_pred, link_name)
-    plot_prediction_time_series(y_test, y_pred, link_name)
-
-    # ---- 5. 全量训练并导出 ----
-    print("\n--- 全量训练 & 导出模型 ---")
-    final_model = RandomForestRegressor(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
-    final_model.fit(X, y)
-
-    model_path = os.path.join(OUTPUT_MODEL_DIR, f"model_{link_name}.pkl")
-    joblib.dump(final_model, model_path)
-    file_size_kb = os.path.getsize(model_path) / 1024
-    print(f"  模型已保存: {model_path} ({file_size_kb:.1f} KB)")
-
-    y_all_pred = final_model.predict(X)
-    evaluate_model(y, y_all_pred, model_name="Full data")
-
-    return final_model, test_metrics, best_params, cv_df
 
 
 # ======================== 主函数 ========================

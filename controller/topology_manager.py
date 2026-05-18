@@ -9,7 +9,7 @@ class TopologyManager:
     1. 维护有向图 G=(V, E)，节点=交换机 DPID，边=物理链路
     2. 管理主机位置表 Host_Table: MAC -> (dpid, port)
     3. 识别边缘接入端口（排除骨干端口）
-    4. 计算边不相交路径（Suurballe 算法）
+    4. 计算 K 最短路径（Yen 算法）
     5. 计算生成树（用于无环洪泛）
     """
 
@@ -17,7 +17,6 @@ class TopologyManager:
         self.G = nx.DiGraph()
         self.host_table = {}          # MAC -> (dpid, port)
         self.link_ports = {}          # (src_dpid, dst_dpid) -> out_port
-        self._edge_ports_cache = None
         self._st_ports_cache = None
 
     # ──────────────────────────────────────────────
@@ -92,7 +91,7 @@ class TopologyManager:
         return port_no not in backbone
 
     # ──────────────────────────────────────────────
-    # 路径计算：边不相交路径（Suurballe）
+    # 路径计算
     # ──────────────────────────────────────────────
 
     def set_edge_weight(self, src_dpid, dst_dpid, weight):
@@ -198,18 +197,6 @@ class TopologyManager:
             return 0
         return hash(flow_tuple) % k
 
-    def compute_edge_disjoint_paths(self, src_dpid, dst_dpid):
-        """Legacy: compute two edge-disjoint paths (Suurballe variant)."""
-        paths = self.compute_k_shortest_paths(src_dpid, dst_dpid, k=2, weight=None)
-        if len(paths) >= 2:
-            fwd1, rev1 = self._path_to_ports(paths[0][0])
-            fwd2, rev2 = self._path_to_ports(paths[1][0])
-            return fwd1, rev1, fwd2, rev2
-        elif len(paths) == 1:
-            fwd, rev = self._path_to_ports(paths[0][0])
-            return fwd, rev, None, None
-        return None, None, None, None
-
     def compute_spanning_tree_ports(self):
         """计算生成树端口集合，用于无环洪泛。
 
@@ -279,5 +266,4 @@ class TopologyManager:
         return fwd_ports, rev_ports
 
     def _invalidate_cache(self):
-        self._edge_ports_cache = None
         self._st_ports_cache = None
