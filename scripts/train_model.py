@@ -56,11 +56,9 @@ os.makedirs(FIGURES_DIR, exist_ok=True)
 
 
 def load_data(csv_path):
-    """加载特征文件，返回 DataFrame"""
+    """Load feature file, return DataFrame"""
     df = pd.read_csv(csv_path)
     feat_cols = [c for c in df.columns if c.startswith("feat_")]
-    if len(feat_cols) != 6:
-        raise ValueError(f"期望6个特征列，实际找到 {len(feat_cols)} 个")
     return df, feat_cols
 
 
@@ -415,49 +413,58 @@ def train_and_analyze(df, feat_cols, link_name):
 
 
 def main():
-    print("===== SDN 负载均衡 — Random Forest 模型训练流水线 =====")
+    print("===== Fat-Tree Per-Link Model Training =====")
 
-    # Step 1: 加载训练数据
-    print(f"\n--- 加载训练数据: {TRAINING_CSV} ---")
     if not os.path.exists(TRAINING_CSV):
-        print(f"错误: {TRAINING_CSV} 不存在！")
-        print("请先执行:")
+        print(f"Error: {TRAINING_CSV} not found!")
+        print("Please run first:")
         print("  1. sudo python3 scripts/collect_training_data.py")
         print("  2. cd scripts && python3 assemble_features.py")
         return
 
     df, feat_cols = load_data(TRAINING_CSV)
-    print(f"特征列: {feat_cols}")
-    print(f"总样本数: {len(df)}")
-    print(f"链路分布:\n{df['target_label'].value_counts()}")
+    links = df["target_label"].unique()
+    print(f"Features: {feat_cols}, Links: {len(links)}, Samples: {len(df)}")
 
-    # Step 2: 训练与评估
     all_results = []
+    for link in sorted(links):
+        df_link = df[df["target_label"] == link]
+        if len(df_link) < 20:
+            print(f"  Skipping {link}: only {len(df_link)} samples")
+            continue
 
-    for link in ["path_A", "path_B"]:
-        _, metrics, params, cv_df = train_and_analyze(df, feat_cols, link)
-        all_results.append({
-            "link": link,
-            **metrics,
-            "best_params": str(params),
-            "cv_MAE_mean": cv_df["MAE"].mean(),
-            "cv_MAE_std": cv_df["MAE"].std(),
-            "cv_R²_mean": cv_df["R²"].mean(),
-            "cv_R²_std": cv_df["R²"].std(),
-        })
+        X = df_link[feat_cols].values
+        y = df_link["U_next"].values
 
-    # 输出摘要
-    print(f"\n{'='*60}")
-    print("模型评估摘要")
-    print(f"{'='*60}")
-    summary_df = pd.DataFrame(all_results)
-    print(summary_df.to_string(index=False))
-    summary_df.to_csv(SUMMARY_CSV, index=False)
-    print(f"\n摘要已保存: {SUMMARY_CSV}")
+        # Train/test split (temporal)
+        split_idx = int(len(X) * 0.8)
+        X_train, X_test = X[:split_idx], X[split_idx:]
+        y_train, y_test = y[:split_idx], y[split_idx:]
 
-    print(f"\n===== 训练流水线完成 =====")
-    print(f"模型文件: {OUTPUT_MODEL_DIR}/")
-    print(f"分析图表: {FIGURES_DIR}/")
+        # Quick hyperparameter search
+        tscv = TimeSeriesSplit(n_splits=3)
+        rf = RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1)
+        grid = GridSearchCV(
+            rf, PARAM_GRID, cv=tscv,
+            scoring="neg_mean_absolute_error", n_jobs=-1, verbose=0,
+        )
+        grid.fit(X_train, y_train)
+        best = grid.best_estimator_
+
+        y_pred = best.predict(X_test)
+        mae = mean_absolute_error(y_test, y_pred)
+
+        # Save model
+        safe_name = link.replace(" ", "_").replace("/", "_")
+        model_path = os.path.join(OUTPUT_MODEL_DIR, f"model_link_{safe_name}.pkl")
+        joblib.dump(best, model_path)
+
+        all_results.append({"link": link, "MAE": mae, "samples": len(df_link)})
+        print(f"  {link}: MAE={mae:.4f}, n={len(df_link)}")
+
+    summary = pd.DataFrame(all_results)
+    summary.to_csv(SUMMARY_CSV, index=False)
+    print(f"\nTrained {len(all_results)} models, summary saved to {SUMMARY_CSV}")
 
 
 if __name__ == "__main__":
