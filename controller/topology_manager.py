@@ -65,6 +65,12 @@ class TopologyManager:
     def get_host_location(self, mac):
         return self.host_table.get(mac)
 
+    def has_path(self, src_dpid, dst_dpid):
+        """Check whether a directed path exists between two switches."""
+        if not (self.G.has_node(src_dpid) and self.G.has_node(dst_dpid)):
+            return False
+        return nx.has_path(self.G, src_dpid, dst_dpid)
+
     # ──────────────────────────────────────────────
     # 边缘端口识别
     # ──────────────────────────────────────────────
@@ -89,43 +95,120 @@ class TopologyManager:
     # 路径计算：边不相交路径（Suurballe）
     # ──────────────────────────────────────────────
 
-    def compute_edge_disjoint_paths(self, src_dpid, dst_dpid):
-        """计算两条边不相交路径（Suurballe 算法变体）。
+    def set_edge_weight(self, src_dpid, dst_dpid, weight):
+        """Set weight on a directed edge (both directions)."""
+        if self.G.has_edge(src_dpid, dst_dpid):
+            self.G[src_dpid][dst_dpid]['weight'] = weight
+        if self.G.has_edge(dst_dpid, src_dpid):
+            self.G[dst_dpid][src_dpid]['weight'] = weight
 
-        返回: (fwd1, rev1, fwd2, rev2)
-              每个元素为 {dpid: out_port} 映射。
-              若拓扑不支持两条不相交路径，fwd2/rev2 为 None。
+    def get_edge_weight(self, src_dpid, dst_dpid):
+        """Get weight of a directed edge, default 1.0."""
+        if self.G.has_edge(src_dpid, dst_dpid):
+            return self.G[src_dpid][dst_dpid].get('weight', 1.0)
+        return float('inf')
+
+    def _path_cost(self, path, weight='weight'):
+        """Compute total weight of a path (list of nodes)."""
+        cost = 0.0
+        for i in range(len(path) - 1):
+            edge_data = self.G.get_edge_data(path[i], path[i + 1], default={})
+            cost += edge_data.get(weight, 1.0)
+        return cost
+
+    def compute_k_shortest_paths(self, src_dpid, dst_dpid, k=3, weight='weight'):
+        """Compute up to K shortest paths using Yen's algorithm.
+
+        Returns: List of (path, cost) tuples sorted by cost ascending.
         """
+        import heapq
+
         if not (self.G.has_node(src_dpid) and self.G.has_node(dst_dpid)):
-            return None, None, None, None
+            return []
 
-        # 步骤 1：计算第一条最短路径
-        try:
-            path1 = nx.shortest_path(self.G, src_dpid, dst_dpid)
-        except nx.NetworkXNoPath:
-            return None, None, None, None
+        if not nx.has_path(self.G, src_dpid, dst_dpid):
+            return []
+        first_path = nx.shortest_path(self.G, src_dpid, dst_dpid, weight=weight)
+        first_cost = self._path_cost(first_path, weight)
 
-        # 步骤 2：移除 path1 的边，构造残余图
-        edges_in_path1 = set(zip(path1[:-1], path1[1:]))
-        residual = self.G.copy()
-        residual.remove_edges_from(edges_in_path1)
+        A = [(first_path, first_cost)]
+        B = []  # min-heap of (cost, tiebreaker, path)
+        seen = {tuple(first_path)}
 
-        # 步骤 3：在残余图上计算第二条路径
-        try:
-            path2 = nx.shortest_path(residual, src_dpid, dst_dpid)
-        except nx.NetworkXNoPath:
-            fwd, rev = self._path_to_ports(path1)
-            return fwd, rev, None, None
+        for i in range(1, k):
+            prev_path = A[-1][0]
 
-        # 步骤 4：验证边不相交（双重保障）
-        edges2 = set(zip(path2[:-1], path2[1:]))
-        if edges_in_path1.isdisjoint(edges2):
-            fwd1, rev1 = self._path_to_ports(path1)
-            fwd2, rev2 = self._path_to_ports(path2)
+            for j in range(len(prev_path) - 1):
+                spur_node = prev_path[j]
+                root_path = prev_path[:j + 1]
+                root_cost = self._path_cost(root_path, weight)
+
+                # Remove edges used by confirmed paths with same root
+                removed_edges = []
+                for path, _ in A:
+                    if len(path) > j and path[:j + 1] == root_path:
+                        u, v = path[j], path[j + 1]
+                        if self.G.has_edge(u, v):
+                            w = self.G[u][v].get('weight', 1.0)
+                            self.G.remove_edge(u, v)
+                            removed_edges.append((u, v, w))
+
+                # Remove root path internal nodes to prevent revisiting
+                for node in root_path[:-1]:
+                    for neighbor in list(self.G.neighbors(node)):
+                        w = self.G[node][neighbor].get('weight', 1.0)
+                        removed_edges.append((node, neighbor, w))
+                        self.G.remove_edge(node, neighbor)
+
+                if nx.has_path(self.G, spur_node, dst_dpid):
+                    spur_path = nx.shortest_path(
+                        self.G, spur_node, dst_dpid, weight=weight
+                    )
+                    total_path = root_path[:-1] + spur_path
+                    total_cost = root_cost + self._path_cost(spur_path, weight)
+
+                    key = tuple(total_path)
+                    if key not in seen:
+                        seen.add(key)
+                        heapq.heappush(B, (total_cost, len(seen), total_path))
+
+                # Restore all removed edges
+                for u, v, w in removed_edges:
+                    if not self.G.has_edge(u, v):
+                        self.G.add_edge(u, v, weight=w)
+
+            if not B:
+                break
+            cost, _, path = heapq.heappop(B)
+            A.append((path, cost))
+
+        return A
+
+    def select_ecmp_path(self, flow_tuple, k):
+        """Select a path index [0, k) using a hash of the 5-tuple.
+
+        Args:
+            flow_tuple: (src_ip, dst_ip, proto, src_port, dst_port)
+            k: number of available paths
+
+        Returns:
+            Integer index in [0, k), deterministic for a given flow_tuple.
+        """
+        if k <= 0:
+            return 0
+        return hash(flow_tuple) % k
+
+    def compute_edge_disjoint_paths(self, src_dpid, dst_dpid):
+        """Legacy: compute two edge-disjoint paths (Suurballe variant)."""
+        paths = self.compute_k_shortest_paths(src_dpid, dst_dpid, k=2, weight=None)
+        if len(paths) >= 2:
+            fwd1, rev1 = self._path_to_ports(paths[0][0])
+            fwd2, rev2 = self._path_to_ports(paths[1][0])
             return fwd1, rev1, fwd2, rev2
-        else:
-            fwd, rev = self._path_to_ports(path1)
+        elif len(paths) == 1:
+            fwd, rev = self._path_to_ports(paths[0][0])
             return fwd, rev, None, None
+        return None, None, None, None
 
     def compute_spanning_tree_ports(self):
         """计算生成树端口集合，用于无环洪泛。
@@ -178,6 +261,10 @@ class TopologyManager:
     # ──────────────────────────────────────────────
     # 内部辅助
     # ──────────────────────────────────────────────
+
+    def path_to_ports(self, path):
+        """Convert a node list to (fwd_ports, rev_ports) dicts."""
+        return self._path_to_ports(path)
 
     def _path_to_ports(self, path):
         """将节点路径转换为端口映射 (fwd, rev)"""

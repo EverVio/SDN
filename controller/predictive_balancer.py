@@ -11,7 +11,7 @@ from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
-from ryu.lib.packet import packet, ethernet, ether_types, arp
+from ryu.lib.packet import packet, ethernet, ether_types, arp, ipv4, tcp, udp
 from ryu.topology import event as topo_event
 
 from controller.stats_mixin import StatsMixin
@@ -23,6 +23,13 @@ K_PATHS = 3  # number of candidate paths to compute
 PRIORITY_ACTIVE_PATH = 20
 PRIORITY_STANDBY_PATH = 10
 
+# Elephant/Mice flow separation
+PRIORITY_MICE = 10
+PRIORITY_ELEPHANT = 30
+ELEPHANT_THRESHOLD = 1_000_000  # 1 Mbps in bytes/sec
+FLOW_IDLE_TIMEOUT_MICE = 60
+FLOW_IDLE_TIMEOUT_ELEPHANT = 300
+
 
 class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -33,6 +40,10 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
         self.ip_to_mac = {}
         self.datapaths = {}
         self.path_installed = False
+
+        # Per-flow tracking for elephant/mice separation
+        self.flow_table = {}  # flow_tuple -> {bytes, first_seen, last_seen, path_idx, is_elephant}
+        self.flow_rules_installed = set()  # (flow_tuple, dpid) for elephant rule cleanup
 
         self.topo = TopologyManager()
 
@@ -113,16 +124,52 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
         # Data packet handling
         self._install_reverse_rule(datapath, src, in_port)
 
-        # Check if paths need to be installed (get all discovered host MACs)
+        # Ensure K paths are installed before flow-level routing
         all_hosts = list(self.topo.host_table.keys())
         if not self.path_installed and len(all_hosts) >= 2:
             self._compute_and_install_paths()
-            if self.path_installed:
-                out_port = self._get_path_out_port(dpid)
+
+        # --- 5-tuple flow tracking for IPv4 data packets ---
+        flow_tuple = self._parse_flow_tuple(pkt, eth)
+
+        if flow_tuple is not None and self.path_installed:
+            now = time.time()
+            is_elephant = self._update_flow_state(flow_tuple, msg.total_len, now)
+
+            if is_elephant:
+                # Elephant flow: install dedicated high-priority rule
+                src_loc = self.topo.get_host_location(src)
+                dst_loc = self.topo.get_host_location(dst)
+
+                if src_loc and dst_loc:
+                    fwd, rev = self._select_elephant_path(src_loc[0], dst_loc[0])
+
+                    if fwd is not None:
+                        self._migrate_elephant_flow(flow_tuple, fwd, rev)
+
+                        out_port = fwd.get(dpid)
+                        if out_port is not None:
+                            self._send_packet(datapath, in_port, out_port, msg)
+                            return
+
+            # Mice flow: use ECMP path selection
+            n_paths = len(self.k_paths)
+            if n_paths > 0:
+                path_idx = self.topo.select_ecmp_path(flow_tuple, n_paths)
+                fwd_ports = self.k_paths[path_idx][0]
+                out_port = fwd_ports.get(dpid)
+
                 if out_port is not None:
-                    self._send_packet(datapath, in_port, out_port, msg)
+                    buf_id = msg.buffer_id if msg.buffer_id != ofproto.OFP_NO_BUFFER else None
+                    self._install_flow_rule(
+                        datapath, flow_tuple, out_port,
+                        is_elephant=False, buffer_id=buf_id,
+                    )
+                    if buf_id is None:
+                        self._send_packet(datapath, in_port, out_port, msg)
                     return
 
+        # --- MAC-only fallback (non-IPv4 or paths not yet installed) ---
         if dst in self.topo.host_table:
             out_port = self._get_path_out_port(dpid)
             if out_port is not None:
@@ -295,6 +342,269 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
         if arp_pkt.opcode == arp.ARP_REPLY:
             if arp_pkt.dst_ip and arp_pkt.dst_mac:
                 self.ip_to_mac[arp_pkt.dst_ip] = arp_pkt.dst_mac
+
+    # ──────────────────────────────────────────────
+    # 5-tuple flow parsing and elephant/mice separation
+    # ──────────────────────────────────────────────
+
+    def _parse_flow_tuple(self, pkt, eth):
+        """Extract 5-tuple from an IPv4 packet.
+
+        Returns:
+            (src_ip, dst_ip, proto, src_port, dst_port) or None if not IPv4.
+        """
+        if eth.ethertype != ether_types.ETH_TYPE_IP:
+            return None
+
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        if ip_pkt is None:
+            return None
+
+        src_ip = ip_pkt.src
+        dst_ip = ip_pkt.dst
+        proto = ip_pkt.proto
+
+        src_port = 0
+        dst_port = 0
+
+        if proto == 6:  # TCP
+            tcp_pkt = pkt.get_protocol(tcp.tcp)
+            if tcp_pkt:
+                src_port = tcp_pkt.src_port
+                dst_port = tcp_pkt.dst_port
+        elif proto == 17:  # UDP
+            udp_pkt = pkt.get_protocol(udp.udp)
+            if udp_pkt:
+                src_port = udp_pkt.src_port
+                dst_port = udp_pkt.dst_port
+
+        return (src_ip, dst_ip, proto, src_port, dst_port)
+
+    def _update_flow_state(self, flow_tuple, byte_count, now):
+        """Update per-flow byte tracking and detect elephant flows.
+
+        Returns:
+            True if the flow is currently classified as elephant.
+        """
+        if flow_tuple not in self.flow_table:
+            self.flow_table[flow_tuple] = {
+                'bytes': 0,
+                'first_seen': now,
+                'last_seen': now,
+                'path_fwd': None,
+                'is_elephant': False,
+            }
+
+        entry = self.flow_table[flow_tuple]
+        entry['bytes'] += byte_count
+        entry['last_seen'] = now
+
+        elapsed = now - entry['first_seen']
+        if elapsed < 0.5:
+            return entry['is_elephant']
+
+        rate = entry['bytes'] / elapsed  # bytes per second
+
+        was_elephant = entry['is_elephant']
+        entry['is_elephant'] = rate > ELEPHANT_THRESHOLD
+
+        if entry['is_elephant'] and not was_elephant:
+            self.logger.info(
+                "Flow promoted to ELEPHANT: %s (rate=%.2f Mbps)",
+                flow_tuple, rate * 8 / 1_000_000,
+            )
+
+        return entry['is_elephant']
+
+    def _install_flow_rule(self, datapath, flow_tuple, out_port, is_elephant, buffer_id=None):
+        """Install a 5-tuple flow rule on a switch."""
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        src_ip, dst_ip, proto, src_port, dst_port = flow_tuple
+
+        priority = PRIORITY_ELEPHANT if is_elephant else PRIORITY_MICE
+        idle_timeout = FLOW_IDLE_TIMEOUT_ELEPHANT if is_elephant else FLOW_IDLE_TIMEOUT_MICE
+
+        match_kwargs = {
+            'eth_type': ether_types.ETH_TYPE_IP,
+            'ipv4_src': src_ip,
+            'ipv4_dst': dst_ip,
+            'ip_proto': proto,
+        }
+
+        if proto == 6:  # TCP
+            match_kwargs['tcp_src'] = src_port
+            match_kwargs['tcp_dst'] = dst_port
+        elif proto == 17:  # UDP
+            match_kwargs['udp_src'] = src_port
+            match_kwargs['udp_dst'] = dst_port
+
+        match = parser.OFPMatch(**match_kwargs)
+        actions = [parser.OFPActionOutput(out_port)]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        kwargs = {
+            'datapath': datapath,
+            'priority': priority,
+            'match': match,
+            'instructions': inst,
+            'idle_timeout': idle_timeout,
+            'hard_timeout': 0,
+            'flags': ofproto.OFPFF_SEND_FLOW_REM,
+        }
+
+        if buffer_id is not None:
+            kwargs['buffer_id'] = buffer_id
+
+        mod = parser.OFPFlowMod(**kwargs)
+        datapath.send_msg(mod)
+
+    def _select_elephant_path(self, src_dpid, dst_dpid):
+        """Select the best path for an elephant flow using ML weights.
+
+        Returns:
+            (fwd_ports, rev_ports) or (None, None) if no path found.
+        """
+        self.weight_engine.apply_weights_to_topology(self.topo)
+
+        paths_with_cost = self.topo.compute_k_shortest_paths(
+            src_dpid, dst_dpid, k=K_PATHS, weight='weight'
+        )
+
+        if not paths_with_cost:
+            return None, None
+
+        best_idx = 0
+        best_cost = float('inf')
+        for idx, (path_nodes, cost) in enumerate(paths_with_cost):
+            if cost < best_cost:
+                best_cost = cost
+                best_idx = idx
+
+        best_path = paths_with_cost[best_idx][0]
+        fwd, rev = self.topo.path_to_ports(best_path)
+
+        self.logger.info(
+            "Elephant path selected: ingress=s%d -> s%d, cost=%.2f",
+            src_dpid, dst_dpid, best_cost,
+        )
+
+        return fwd, rev
+
+    def _migrate_elephant_flow(self, flow_tuple, new_fwd, new_rev):
+        """Install elephant flow rules along the new path, replacing old ones."""
+        src_ip, dst_ip, proto, src_port, dst_port = flow_tuple
+
+        def _build_match_kwargs(sip, dip, sp, dp, p):
+            mk = {
+                'eth_type': ether_types.ETH_TYPE_IP,
+                'ipv4_src': sip,
+                'ipv4_dst': dip,
+                'ip_proto': p,
+            }
+            if p == 6:
+                mk['tcp_src'] = sp
+                mk['tcp_dst'] = dp
+            elif p == 17:
+                mk['udp_src'] = sp
+                mk['udp_dst'] = dp
+            return mk
+
+        # Forward direction
+        fwd_match = _build_match_kwargs(src_ip, dst_ip, src_port, dst_port, proto)
+        for dpid, out_port in new_fwd.items():
+            if dpid in self.datapaths:
+                dp = self.datapaths[dpid]
+                parser = dp.ofproto_parser
+                ofproto = dp.ofproto
+
+                old_key = (flow_tuple, dpid)
+                if old_key in self.flow_rules_installed:
+                    match = parser.OFPMatch(**fwd_match)
+                    mod = parser.OFPFlowMod(
+                        datapath=dp,
+                        command=ofproto.OFPFC_DELETE_STRICT,
+                        priority=PRIORITY_ELEPHANT,
+                        out_port=ofproto.OFPP_ANY,
+                        out_group=ofproto.OFPG_ANY,
+                        match=match,
+                    )
+                    dp.send_msg(mod)
+                    self.flow_rules_installed.discard(old_key)
+
+                self._install_flow_rule(dp, flow_tuple, out_port, is_elephant=True)
+                self.flow_rules_installed.add(old_key)
+
+        # Reverse direction
+        rev_tuple = (dst_ip, src_ip, proto, dst_port, src_port)
+        rev_match = _build_match_kwargs(dst_ip, src_ip, dst_port, src_port, proto)
+        for dpid, out_port in new_rev.items():
+            if dpid in self.datapaths:
+                dp = self.datapaths[dpid]
+                parser = dp.ofproto_parser
+                ofproto = dp.ofproto
+
+                old_key = (rev_tuple, dpid)
+                if old_key in self.flow_rules_installed:
+                    match = parser.OFPMatch(**rev_match)
+                    mod = parser.OFPFlowMod(
+                        datapath=dp,
+                        command=ofproto.OFPFC_DELETE_STRICT,
+                        priority=PRIORITY_ELEPHANT,
+                        out_port=ofproto.OFPP_ANY,
+                        out_group=ofproto.OFPG_ANY,
+                        match=match,
+                    )
+                    dp.send_msg(mod)
+                    self.flow_rules_installed.discard(old_key)
+
+                self._install_flow_rule(dp, rev_tuple, out_port, is_elephant=True)
+                self.flow_rules_installed.add(old_key)
+
+        entry = self.flow_table.get(flow_tuple)
+        if entry:
+            entry['path_fwd'] = new_fwd
+
+        self.logger.info("Elephant flow %s migrated to new path", flow_tuple)
+
+    def _check_elephant_flows(self):
+        """Check all active elephant flows for better path availability."""
+        now = time.time()
+        stale_flows = []
+
+        for flow_tuple, entry in self.flow_table.items():
+            if not entry['is_elephant']:
+                continue
+
+            if now - entry['last_seen'] > FLOW_IDLE_TIMEOUT_ELEPHANT:
+                stale_flows.append(flow_tuple)
+                continue
+
+            src_ip, dst_ip = flow_tuple[0], flow_tuple[1]
+            src_mac = self.ip_to_mac.get(src_ip)
+            dst_mac = self.ip_to_mac.get(dst_ip)
+            if not src_mac or not dst_mac:
+                continue
+
+            src_loc = self.topo.get_host_location(src_mac)
+            dst_loc = self.topo.get_host_location(dst_mac)
+            if not src_loc or not dst_loc:
+                continue
+
+            fwd, rev = self._select_elephant_path(src_loc[0], dst_loc[0])
+
+            if fwd is not None and entry.get('path_fwd') != fwd:
+                self.logger.info(
+                    "Elephant flow %s: better path found, migrating", flow_tuple
+                )
+                self._migrate_elephant_flow(flow_tuple, fwd, rev)
+
+        for ft in stale_flows:
+            self.flow_table.pop(ft, None)
+            self.flow_rules_installed = {
+                k for k in self.flow_rules_installed if k[0] != ft
+            }
+            self.logger.info("Elephant flow %s expired (idle timeout)", ft)
 
     # ──────────────────────────────────────────────
     # K-path computation and installation
@@ -480,6 +790,9 @@ class PredictiveBalancer(app_manager.RyuApp, StatsMixin):
             # Switch if a different path is better
             if best_idx != self.active_path_idx:
                 self._switch_path(best_idx)
+
+            # Monitor elephant flows for migration
+            self._check_elephant_flows()
 
     def _get_path_util(self, path_idx):
         """Get bottleneck utilization for path at given index."""

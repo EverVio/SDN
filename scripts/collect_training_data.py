@@ -54,7 +54,7 @@ def kill_ryu():
 def start_ryu():
     """启动 Ryu 控制器子进程，返回 Popen 对象"""
     proc = subprocess.Popen(
-        [sys.executable, "-m", "ryu.manager", "controller/threshold_balancer.py",
+        ["ryu-manager", "controller/threshold_balancer.py",
          "--observe-links"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -69,9 +69,9 @@ def start_ryu():
 def run_single_experiment(net, pattern, duration):
     """Run traffic between multiple host pairs in the Fat-Tree."""
     pairs = [
-        ("h0_0", "h3_0"),  # cross-pod: pod 0 -> pod 1
-        ("h0_1", "h6_0"),  # cross-pod: pod 0 -> pod 3
-        ("h2_0", "h5_0"),  # cross-pod: pod 1 -> pod 2
+        ("h0_0", "h1_0"),  # cross-pod: pod 0 -> pod 1
+        ("h0_1", "h3_0"),  # cross-pod: pod 0 -> pod 3
+        ("h2_0", "h3_1"),  # cross-pod: pod 1 -> pod 2
     ]
 
     for src_name, dst_name in pairs:

@@ -9,7 +9,7 @@ EDGE_PER_POD = K // 2   # 2
 AGG_PER_POD = K // 2     # 2
 HOST_PER_EDGE = K // 2   # 2
 
-BW_ACCESS = 0    # unlimited
+BW_ACCESS = 100  # access links (high bw, effectively unlimited)
 BW_EDGE_AGG = 10
 BW_AGG_CORE = 10
 
@@ -50,14 +50,14 @@ def create_topology(controller_ip="127.0.0.1", controller_port=6633):
     for pod in range(PODS):
         for i in range(EDGE_PER_POD):
             dpid = _edge_dpid(pod, i)
-            net.addSwitch(f"s{dpid}", dpid=dpid, protocols="OpenFlow13")
+            net.addSwitch(f"s{dpid}", dpid=str(dpid), protocols="OpenFlow13")
         for i in range(AGG_PER_POD):
             dpid = _agg_dpid(pod, i)
-            net.addSwitch(f"s{dpid}", dpid=dpid, protocols="OpenFlow13")
+            net.addSwitch(f"s{dpid}", dpid=str(dpid), protocols="OpenFlow13")
 
     for i in range((K // 2) ** 2):
         dpid = _core_dpid(i)
-        net.addSwitch(f"s{dpid}", dpid=dpid, protocols="OpenFlow13")
+        net.addSwitch(f"s{dpid}", dpid=str(dpid), protocols="OpenFlow13")
 
     # Add hosts and access links
     for pod in range(PODS):
