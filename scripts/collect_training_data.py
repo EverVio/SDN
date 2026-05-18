@@ -18,18 +18,19 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append("/usr/lib/python3/dist-packages")
 
 from mininet.log import setLogLevel
-from topo.dual_path_topo import create_topology, cleanup
+from topo.fat_tree_topo import create_topology, cleanup
 from scripts.traffic_gen import (
     generate_sawtooth_noise_commands,
     generate_step_commands,
     generate_sine_commands,
+    generate_fat_tree_commands,
 )
 
 DATA_DIR = "data"
 SRC_CSV = os.path.join(DATA_DIR, "traffic_data.csv")
 RYU_PORT = 6633
 DURATION = 120
-STP_WAIT = 20  # STP 收敛等待时间（秒）
+STP_WAIT = 30  # STP 收敛等待时间（秒）
 
 
 def wait_for_port(port, timeout=30):
@@ -66,32 +67,35 @@ def start_ryu():
 
 
 def run_single_experiment(net, pattern, duration):
-    """在已启动的 Mininet 中执行一轮流量生成"""
-    h1 = net.get("h1")
-    h3 = net.get("h3")
+    """Run traffic between multiple host pairs in the Fat-Tree."""
+    pairs = [
+        ("h0_0", "h3_0"),  # cross-pod: pod 0 -> pod 1
+        ("h0_1", "h6_0"),  # cross-pod: pod 0 -> pod 3
+        ("h2_0", "h5_0"),  # cross-pod: pod 1 -> pod 2
+    ]
 
-    # 启动 iperf 服务器
-    h3.cmd("iperf -s -u &")
-    time.sleep(1)
+    for src_name, dst_name in pairs:
+        src = net.get(src_name)
+        dst = net.get(dst_name)
+        if src is None or dst is None:
+            continue
 
-    # 选择流量模式
-    if pattern == "sawtooth":
-        cmds = generate_sawtooth_noise_commands(duration)
-    elif pattern == "step":
-        cmds = generate_step_commands(duration)
-    elif pattern == "sine":
-        cmds = generate_sine_commands(duration)
-    else:
-        cmds = generate_sawtooth_noise_commands(duration)
+        dst.cmd("iperf -s -u &")
+        time.sleep(0.5)
 
-    # 逐条发送 iperf 命令
-    for t_start, bw in cmds:
-        h1.cmd(f"iperf -c {h3.IP()} -u -b {bw}M -t 3 -i 1 &")
-        time.sleep(3)
+        if pattern == "sawtooth":
+            cmds = generate_sawtooth_noise_commands(duration)
+        elif pattern == "step":
+            cmds = generate_step_commands(duration)
+        else:
+            cmds = generate_sine_commands(duration)
 
-    # 清理 iperf
-    h3.cmd("killall -9 iperf 2>/dev/null")
-    time.sleep(1)
+        for t_start, bw in cmds:
+            src.cmd(f"iperf -c {dst.IP()} -u -b {bw}M -t 3 -i 1 &")
+            time.sleep(3)
+
+        dst.cmd("killall -9 iperf 2>/dev/null")
+        time.sleep(1)
 
 
 def collect_batch(batch_idx, pattern, duration):

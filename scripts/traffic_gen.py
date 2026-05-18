@@ -41,6 +41,18 @@ def generate_sawtooth_noise_commands(
     return commands
 
 
+def generate_fat_tree_commands(duration=120, center=2.0, amplitude=1.5, period=30):
+    """Lower-bandwidth traffic for Fat-Tree (more concurrent flows)."""
+    commands = []
+    t = 0
+    while t < duration:
+        bw = center + amplitude * np.sin(2 * np.pi * t / period)
+        bw = max(0.3, min(4.0, bw))
+        commands.append((t, round(bw, 2)))
+        t += 3
+    return commands
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
