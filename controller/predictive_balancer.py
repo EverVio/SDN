@@ -28,11 +28,17 @@ class PredictiveBalancer(BaseBalancer):
         super(PredictiveBalancer, self).__init__(*args, **kwargs)
         self.active_sessions = {}  # (src_mac, dst_mac) -> {'path_nodes', 'fwd_ports', 'rev_ports', 'util_keys'}
         self.path_installed = set()
+        # Broadcast storm cache: (dpid, src_mac, eth_type) -> timestamp
+        self.broadcast_cache = {}
+        # Route flapping prevention
+        self.last_reroute_time = {}  # (src_mac, dst_mac) -> timestamp
+        self.REROUTE_COOLDOWN = 10.0  # seconds between reroutes per session
+        self.COST_THRESHOLD = 0.15   # new path must be 15% cheaper
 
         self.init_stats(topo_manager=self.topo)
 
-        model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
-        self.weight_engine = DynamicWeightEngine(model_dir=model_dir)
+        model_path = os.path.join(os.path.dirname(__file__), "..", "models", "global_mlp_model.pkl")
+        self.weight_engine = DynamicWeightEngine(model_path=model_path)
 
         self.decision_thread = hub.spawn(self._decision_loop)
 
@@ -86,6 +92,17 @@ class PredictiveBalancer(BaseBalancer):
         src = eth.src
         dst = eth.dst
 
+        # Broadcast storm suppression (same as L2 controller)
+        if dst == "ff:ff:ff:ff:ff:ff":
+            cache_key = (dpid, src, eth.ethertype)
+            now = time.time()
+            if len(self.broadcast_cache) > 1000:
+                self.broadcast_cache.clear()
+            if cache_key in self.broadcast_cache:
+                if now - self.broadcast_cache[cache_key] < 0.5:
+                    return
+            self.broadcast_cache[cache_key] = now
+
         # Learn host location via topology manager
         self.topo.learn_host(src, dpid, in_port)
 
@@ -95,6 +112,12 @@ class PredictiveBalancer(BaseBalancer):
 
         # ARP proxy + loop-free flooding
         if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            # ====== Cold-start: force physical flood until full topology discovered ======
+            if len(self.topo.G.nodes) < 20:
+                self._send_packet(datapath, in_port, ofproto.OFPP_FLOOD, msg)
+                return
+            # ============================================================================
+
             arp_pkt = pkt.get_protocol(arp.arp)
             if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
                 self._handle_arp_request(datapath, in_port, dpid, arp_pkt, src, msg)
@@ -152,12 +175,9 @@ class PredictiveBalancer(BaseBalancer):
                 self._send_arp_reply(datapath, in_port, arp_pkt, target_mac)
                 return
 
-        flood_ports = self.topo.get_flood_ports(dpid, in_port)
-        if flood_ports:
-            for port in flood_ports:
-                self._send_packet(datapath, in_port, port, msg)
-        else:
-            self._send_packet(datapath, in_port, datapath.ofproto.OFPP_FLOOD, msg)
+        # Flood ARP request via all ports (same as L2 controller).
+        # Broadcast storm is prevented by the broadcast_cache above.
+        self._send_packet(datapath, in_port, datapath.ofproto.OFPP_FLOOD, msg)
 
     def _handle_arp_reply(self, datapath, in_port, dpid, dst_mac, arp_pkt, src_mac, msg):
         """ARP reply: learn binding + forward"""
@@ -263,13 +283,12 @@ class PredictiveBalancer(BaseBalancer):
             if not self.datapaths or not self.active_sessions:
                 continue
 
-            for (dpid, port_no), util in self.link_utilization.items():
-                self.weight_engine.register_link(dpid, port_no)
-                self.weight_engine.update_utilization(dpid, port_no, util)
+            self.weight_engine.update_all_utilizations(self.link_utilization)
 
             self.weight_engine.predict_all()
             self.weight_engine.apply_weights_to_topology(self.topo)
 
+            now = time.time()
             for (src_mac, dst_mac), session in list(self.active_sessions.items()):
                 src_loc = self.topo.get_host_location(src_mac)
                 dst_loc = self.topo.get_host_location(dst_mac)
@@ -284,8 +303,22 @@ class PredictiveBalancer(BaseBalancer):
                     old_path = session['path_nodes']
 
                     if new_path != old_path:
+                        # Compute old path cost under current weights
+                        old_cost = self.topo._path_cost(old_path)
+
+                        # Cooldown check: skip if rerouted recently
+                        time_since_last = now - self.last_reroute_time.get((src_mac, dst_mac), 0)
+                        if time_since_last < self.REROUTE_COOLDOWN:
+                            continue
+
+                        # Cost improvement threshold: must be meaningfully better
+                        if old_cost > 0 and (old_cost - new_cost) < (old_cost * self.COST_THRESHOLD):
+                            continue
+
+                        self.last_reroute_time[(src_mac, dst_mac)] = now
                         self.logger.info(
-                            "Rerouting %s -> %s: cost %.2f", src_mac, dst_mac, new_cost,
+                            "Rerouting %s -> %s: cost %.2f -> %.2f",
+                            src_mac, dst_mac, old_cost, new_cost,
                         )
                         new_fwd, new_rev = self.topo.path_to_ports(new_path)
                         new_util_keys = self.topo.get_path_util_keys(new_fwd, new_rev)
@@ -302,7 +335,6 @@ class PredictiveBalancer(BaseBalancer):
                         session['util_keys'] = new_util_keys
 
             # Clean up stale sessions
-            now = time.time()
             stale = [
                 k for k, v in self.active_sessions.items()
                 if now - v.get('last_seen', 0) > SESSION_TIMEOUT
@@ -318,7 +350,7 @@ class PredictiveBalancer(BaseBalancer):
             max_util = max(self.link_utilization.values()) if self.link_utilization else 0
             self.logger.info(
                 "ML: %d links predicted, max_util=%.1f%%, active sessions=%d",
-                summary["links_with_prediction"],
+                summary["links_monitored"],
                 max_util * 100,
                 len(self.active_sessions),
             )

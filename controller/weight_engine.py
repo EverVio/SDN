@@ -4,71 +4,89 @@ import joblib
 
 
 class DynamicWeightEngine:
-    """Computes dynamic edge weights for routing decisions.
+    """Computes dynamic edge weights using a single Global MLP model.
 
     Weight formula:
         w = alpha * hop_cost + beta * current_util + gamma * predicted_util
 
-    Where:
-        hop_cost = 1.0 (constant per hop)
-        current_util = current link utilization [0, 1]
-        predicted_util = ML-predicted next-period utilization [0, 1]
+    The global model takes a sliding window of all backbone link utilizations
+    as input and predicts the next-timestep utilization for all links at once.
+    This eliminates the per-link model I/O bottleneck of the old approach.
     """
 
     ALPHA = 1.0   # base hop cost coefficient
     BETA = 2.0    # current utilization coefficient
     GAMMA = 3.0   # predicted utilization coefficient (highest priority)
-    WINDOW_SIZE = 3  # sliding window for ML features
 
-    def __init__(self, model_dir=None):
-        self.link_models = {}       # (dpid, port_no) -> sklearn model
-        self.feature_queues = {}    # (dpid, port_no) -> deque of util values
-        self.current_utils = {}     # (dpid, port_no) -> current utilization
-        self.predicted_utils = {}   # (dpid, port_no) -> predicted utilization
-        self.monitored_links = set()
+    def __init__(self, model_path=None):
+        self.global_model = None
+        self.scaler_X = None
+        self.scaler_Y = None
+        self.link_keys = []
+        self.window_size = 3
+
+        self.feature_history = []
+        self.current_utils = {}
+        self.predicted_utils = {}
         self.models_loaded = False
 
-        if model_dir:
-            self.load_models(model_dir)
+        if model_path and os.path.exists(model_path):
+            self._load_global_model(model_path)
 
-    def load_models(self, model_dir):
-        """Load per-link ML models from directory."""
-        import glob
-        model_files = glob.glob(os.path.join(model_dir, "model_link_*.pkl"))
-        for mf in model_files:
-            basename = os.path.basename(mf)
-            parts = basename.replace("model_link_", "").replace(".pkl", "").split("_")
-            if len(parts) == 2:
-                key = (int(parts[0]), int(parts[1]))
-                self.link_models[key] = joblib.load(mf)
-        self.models_loaded = len(self.link_models) > 0
+    def _load_global_model(self, model_path):
+        """Load Global MLP model bundle (model + scalers + link_keys)."""
+        data = joblib.load(model_path)
+        self.global_model = data['model']
+        self.scaler_X = data['scaler_X']
+        self.scaler_Y = data['scaler_Y']
+        self.link_keys = data['link_keys']
+        self.window_size = data.get('window_size', 3)
+        self.models_loaded = True
+
+        # Cold-start: fill sliding window with zeros
+        num_links = len(self.link_keys)
+        self.feature_history = [[0.0] * num_links for _ in range(self.window_size)]
 
     def register_link(self, dpid, port_no):
-        """Register a link for monitoring."""
-        key = (dpid, port_no)
-        self.monitored_links.add(key)
-        if key not in self.feature_queues:
-            from collections import deque
-            self.feature_queues[key] = deque(maxlen=self.WINDOW_SIZE)
+        """No-op in global model mode — link set is fixed at model load time."""
+        pass
 
     def update_utilization(self, dpid, port_no, utilization):
-        """Update current utilization for a link and feed the feature queue."""
-        key = (dpid, port_no)
-        self.current_utils[key] = utilization
-        if key in self.feature_queues:
-            self.feature_queues[key].append(utilization)
+        """No-op in global model mode — use update_all_utilizations() instead."""
+        pass
+
+    def update_all_utilizations(self, link_util_dict):
+        """Update the sliding window with a full snapshot of all link utilizations.
+
+        Called once per polling cycle with the complete link_utilization dict
+        from StatsMixin. Maintains a FIFO queue of WINDOW_SIZE snapshots.
+        """
+        self.current_utils = link_util_dict
+
+        # Build feature vector in the exact order of link_keys
+        current_vector = []
+        for key in self.link_keys:
+            current_vector.append(link_util_dict.get(key, 0.0))
+
+        self.feature_history.pop(0)
+        self.feature_history.append(current_vector)
 
     def predict_all(self):
-        """Run ML prediction for all monitored links with enough data."""
-        self.predicted_utils.clear()
-        for key in self.monitored_links:
-            queue = self.feature_queues.get(key)
-            if queue and len(queue) >= self.WINDOW_SIZE:
-                features = list(queue)
-                if key in self.link_models:
-                    X = np.array(features).reshape(1, -1)
-                    pred = float(self.link_models[key].predict(X)[0])
-                    self.predicted_utils[key] = max(0.0, min(1.0, pred))
+        """Run O(1) global matrix inference — single forward pass for all links."""
+        if not self.global_model:
+            return
+
+        # Flatten sliding window into (1, num_links * window_size)
+        X = np.array(self.feature_history, dtype=np.float32).flatten().reshape(1, -1)
+
+        # Scale -> predict -> inverse scale -> clip
+        X_scaled = self.scaler_X.transform(X)
+        pred_scaled = self.global_model.predict(X_scaled)
+        pred = self.scaler_Y.inverse_transform(pred_scaled.reshape(1, -1))[0]
+        pred = np.clip(pred, 0.0, 1.0)
+
+        for i, key in enumerate(self.link_keys):
+            self.predicted_utils[key] = float(pred[i])
 
     def compute_weight(self, src_dpid, src_port, dst_dpid, dst_port):
         """Compute the dynamic weight for a directed edge."""
@@ -91,13 +109,8 @@ class DynamicWeightEngine:
     def get_state_summary(self):
         """Return a dict summarizing current engine state."""
         return {
-            "monitored_links": len(self.monitored_links),
-            "models_loaded": len(self.link_models),
-            "links_with_prediction": len(self.predicted_utils),
-            "avg_current_util": (
-                np.mean(list(self.current_utils.values()))
-                if self.current_utils else 0.0
-            ),
+            "models_loaded": 1 if self.global_model else 0,
+            "links_monitored": len(self.link_keys),
             "avg_predicted_util": (
                 np.mean(list(self.predicted_utils.values()))
                 if self.predicted_utils else 0.0

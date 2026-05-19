@@ -8,6 +8,7 @@
 import os
 import sys
 import time
+import random
 import shutil
 import signal
 import socket
@@ -19,17 +20,19 @@ sys.path.append("/usr/lib/python3/dist-packages")
 
 from mininet.log import setLogLevel
 from topo.fat_tree_topo import create_topology, cleanup
-from scripts.traffic_gen import (
-    generate_sawtooth_noise_commands,
-    generate_step_commands,
-    generate_sine_commands,
-)
 
 DATA_DIR = "data"
 SRC_CSV = os.path.join(DATA_DIR, "traffic_data.csv")
 RYU_PORT = 6633
 DURATION = 120
 STP_WAIT = 30  # STP 收敛等待时间（秒）
+
+# Fat-Tree k=4: 16 hosts across 4 pods
+ALL_HOSTS = [f"h{pod}_{idx}" for pod in range(4) for idx in range(4)]
+
+# Traffic permutation parameters
+PERMUTATION_INTERVAL = 15  # seconds between reshuffles
+NUM_PAIRS = 8              # concurrent communication pairs per round
 
 
 def wait_for_port(port, timeout=30):
@@ -65,42 +68,58 @@ def start_ryu():
     return proc
 
 
-def run_single_experiment(net, pattern, duration):
-    """Run traffic between multiple host pairs in the Fat-Tree."""
-    pairs = [
-        ("h0_0", "h1_0"),  # cross-pod: pod 0 -> pod 1
-        ("h0_1", "h3_0"),  # cross-pod: pod 0 -> pod 3
-        ("h2_0", "h3_1"),  # cross-pod: pod 1 -> pod 2
-    ]
+def run_single_experiment(net, duration):
+    """Run dynamic random traffic permutation to exercise all ECMP paths.
 
-    for src_name, dst_name in pairs:
-        src = net.get(src_name)
-        dst = net.get(dst_name)
-        if src is None or dst is None:
-            continue
+    Every PERMUTATION_INTERVAL seconds, shuffle all 16 hosts into 8 random
+    pairs and start new iperf UDP flows with random bandwidth (2-8 Mbps).
+    This breaks deterministic hashing: different (src, dst) pairs map to
+    different ECMP paths, forcing traffic across all aggregation and core
+    switches within a single batch.
+    """
+    # Start iperf servers on all hosts (idempotent)
+    for host_name in ALL_HOSTS:
+        h = net.get(host_name)
+        if h is not None:
+            h.cmd("iperf -s -u &")
+    time.sleep(1)
 
-        dst.cmd("iperf -s -u &")
-        time.sleep(0.5)
+    num_rounds = duration // PERMUTATION_INTERVAL
+    for round_idx in range(num_rounds):
+        # Shuffle and pair
+        shuffled = ALL_HOSTS[:]
+        random.shuffle(shuffled)
+        pairs = [(shuffled[i], shuffled[i + 1]) for i in range(0, len(shuffled), 2)]
 
-        if pattern == "sawtooth":
-            cmds = generate_sawtooth_noise_commands(duration)
-        elif pattern == "step":
-            cmds = generate_step_commands(duration)
-        else:
-            cmds = generate_sine_commands(duration)
+        # Random bandwidth per pair: 2-8 Mbps
+        for src_name, dst_name in pairs:
+            src = net.get(src_name)
+            dst = net.get(dst_name)
+            if src is None or dst is None:
+                continue
+            bw = round(random.uniform(2.0, 8.0), 1)
+            # iperf -t PERMUTATION_INTERVAL: flow lives for the full round
+            src.cmd(
+                f"iperf -c {dst.IP()} -u -b {bw}M "
+                f"-t {PERMUTATION_INTERVAL} -i 1 &"
+            )
 
-        for t_start, bw in cmds:
-            src.cmd(f"iperf -c {dst.IP()} -u -b {bw}M -t 3 -i 1 &")
-            time.sleep(3)
+        print(f"    Round {round_idx + 1}/{num_rounds}: "
+              f"{len(pairs)} pairs, bandwidth 2-8 Mbps")
+        time.sleep(PERMUTATION_INTERVAL)
 
-        dst.cmd("killall -9 iperf 2>/dev/null")
-        time.sleep(1)
+    # Cleanup all iperf processes
+    for host_name in ALL_HOSTS:
+        h = net.get(host_name)
+        if h is not None:
+            h.cmd("killall -9 iperf 2>/dev/null")
+    time.sleep(1)
 
 
-def collect_batch(batch_idx, pattern, duration):
-    """完整执行一轮实验：Ryu → Mininet → 流量 → 保存 CSV"""
+def collect_batch(batch_idx, duration):
+    """完整执行一轮实验：Ryu → Mininet → 动态随机流量 → 保存 CSV"""
     print(f"\n{'='*60}")
-    print(f"批次 {batch_idx}: 模式={pattern}, 时长={duration}s")
+    print(f"批次 {batch_idx}: 动态随机置换, 时长={duration}s")
     print(f"{'='*60}")
 
     # 1. 清理 + 启动 Ryu
@@ -120,9 +139,9 @@ def collect_batch(batch_idx, pattern, duration):
         print(f"  等待 STP 收敛 ({STP_WAIT}s)...")
         time.sleep(STP_WAIT)
 
-        # 3. 执行流量
-        print(f"  开始流量生成 ({pattern})...")
-        run_single_experiment(net, pattern, duration)
+        # 3. 执行动态随机流量
+        print(f"  开始流量生成 (动态随机置换, {duration // PERMUTATION_INTERVAL} 轮)...")
+        run_single_experiment(net, duration)
         print("  流量生成完成")
 
         # 4. 停止 Mininet（触发 CSV flush）
@@ -160,26 +179,16 @@ def collect_batch(batch_idx, pattern, duration):
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # 定义实验批次：(批次号, 流量模式)
-    batches = [
-        (1, "sawtooth"),
-        (2, "sawtooth"),
-        (3, "step"),
-        (4, "step"),
-        (5, "sine"),
-        (6, "sine"),
-        (7, "sawtooth"),
-        (8, "step"),
-        (9, "sine"),
-        (10, "sawtooth"),
-    ]
+    num_batches = 10
 
-    print(f"===== 训练数据采集 =====")
-    print(f"共 {len(batches)} 批次，每批 {DURATION} 秒")
-    print(f"预计总耗时: {len(batches) * (DURATION + STP_WAIT + 20) / 60:.0f} 分钟")
+    print(f"===== 训练数据采集 (动态随机置换) =====")
+    print(f"共 {num_batches} 批次，每批 {DURATION} 秒")
+    print(f"每批 {DURATION // PERMUTATION_INTERVAL} 轮置换，"
+          f"每轮 {NUM_PAIRS} 对随机通信")
+    print(f"预计总耗时: {num_batches * (DURATION + STP_WAIT + 20) / 60:.0f} 分钟")
 
-    for idx, pattern in batches:
-        collect_batch(idx, pattern, DURATION)
+    for idx in range(1, num_batches + 1):
+        collect_batch(idx, DURATION)
 
     print(f"\n{'='*60}")
     print(f"全部采集完成！")
@@ -191,7 +200,7 @@ def main():
     for f in csv_files:
         size_kb = os.path.getsize(os.path.join(DATA_DIR, f)) / 1024
         print(f"  {f} ({size_kb:.1f} KB)")
-    print(f"\n下一步: cd scripts && python3 assemble_features.py")
+    print(f"\n下一步: cd scripts && python3 assemble_global_features.py && python3 train_global_mlp.py")
 
 
 if __name__ == "__main__":

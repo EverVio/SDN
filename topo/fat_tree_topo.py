@@ -9,8 +9,8 @@ EDGE_PER_POD = K // 2   # 2
 AGG_PER_POD = K // 2     # 2
 HOST_PER_EDGE = K // 2   # 2
 
-BW_ACCESS = 10
-BW_EDGE_AGG = 10
+BW_ACCESS = 100
+BW_EDGE_AGG = 100
 BW_AGG_CORE = 10
 
 
@@ -95,12 +95,14 @@ def create_topology(controller_ip="127.0.0.1", controller_port=6633):
 
 
 def cleanup():
-    """Remove all Fat-Tree OVS bridges."""
+    """Remove all Fat-Tree OVS bridges, namespaces, and veth pairs."""
+    os.system("mn -c 2>/dev/null")
+    os.system("killall -9 iperf 2>/dev/null")
     for pod in range(PODS):
         for i in range(EDGE_PER_POD):
-            os.system(f"sudo ovs-vsctl --if-exists del-br s{_edge_dpid(pod, i)} 2>/dev/null")
+            os.system(f"ovs-vsctl --if-exists del-br s{_edge_dpid(pod, i)} 2>/dev/null")
         for i in range(AGG_PER_POD):
-            os.system(f"sudo ovs-vsctl --if-exists del-br s{_agg_dpid(pod, i)} 2>/dev/null")
+            os.system(f"ovs-vsctl --if-exists del-br s{_agg_dpid(pod, i)} 2>/dev/null")
     for i in range((K // 2) ** 2):
-        os.system(f"sudo ovs-vsctl --if-exists del-br s{_core_dpid(i)} 2>/dev/null")
+        os.system(f"ovs-vsctl --if-exists del-br s{_core_dpid(i)} 2>/dev/null")
     print("Fat-Tree cleanup completed.")
