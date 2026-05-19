@@ -5,15 +5,15 @@
 实验设计 — 抽屉原理保证的大象流碰撞 (Pigeonhole Collision)：
 
   Fat-Tree k=4 在 Pod 0 ↔ Pod 3 之间有 4 条等价 Core 路径，
-  总横截带宽 = 4 × 10Mbps = 40Mbps。
+  总横截带宽 = 4 × 2Mbps = 8Mbps。
 
-  注入 5 条 8Mbps 的独立 UDP 流（5 > 4），根据抽屉原理，
-  必定至少有一条 Core 链路承载 2 条流（16Mbps > 10Mbps）。
+  注入 5 条 1.5Mbps 的独立 UDP 流（5 > 4），根据抽屉原理，
+  必定至少有一条 Core 链路承载 2 条流（3Mbps > 2Mbps）。
 
-  阶段 1 (t=0s):  启动前 4 条流（40Mbps 注入，4 路径刚好容纳，无丢包）
-  阶段 2 (t=20s): 启动第 5 条流（总注入 40Mbps，碰撞链路 16Mbps → 丢包）
+  阶段 1 (t=0s):  启动前 4 条流（6Mbps 注入，4 路径容纳，无丢包）
+  阶段 2 (t=20s): 启动第 5 条流（总注入 7.5Mbps，碰撞链路 3Mbps → 丢包）
 
-  - L2 基线组：静态哈希无法迁移，碰撞链路持续丢包 ~37.5%
+  - L2 基线组：静态哈希无法迁移，碰撞链路持续丢包 ~33%
   - 阈值均衡组：检测到 >70% 后响应式切换，2-4 秒滞后丢包
   - Global MLP 组：预测引擎识别趋势，主动将第 5 条流迁至空闲路径
 
@@ -32,16 +32,18 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append("/usr/lib/python3/dist-packages")
 
 from mininet.log import setLogLevel
-from topo.fat_tree_topo import create_topology, cleanup
+from topo.fat_tree_topo import create_topology, cleanup, configure_select_hash
 
 RYU_PORT = 6633
 TEST_DURATION = 60  # 测试持续时间（秒）
-UDP_BANDWIDTH = 8  # 每条流的 UDP 带宽 (Mbps)
+UDP_BANDWIDTH = 1.5  # 每条流的 UDP 带宽 (Mbps)
 BURST_DELAY = 20  # 第 5 条流的启动延迟（秒）
+BASE_PORT = 5000  # iperf 端口基准（每条流使用 BASE_PORT + flow_number）
+CORE_LINK_BW = 2  # 每条核心链路带宽 (Mbps)，与 BW_AGG_CORE 一致
 
 # 5 条独立流：Pod 0 → Pod 3，使用不同的 (src_mac, dst_mac) 对
 # 保证 5 条流的哈希值各不相同，覆盖所有 4 条 ECMP 路径
-# 抽屉原理：5 流 / 4 路径 → 至少 1 条路径承载 2 流 (16Mbps > 10Mbps)
+# 抽屉原理：5 流 / 4 路径 → 至少 1 条路径承载 2 流 (3Mbps > 2Mbps)
 BACKGROUND_FLOWS = [
     ("h0_0", "h3_0"),  # 流 1: 第 0 秒启动
     ("h0_1", "h3_1"),  # 流 2: 第 0 秒启动
@@ -73,8 +75,9 @@ def kill_ryu():
     time.sleep(1)
 
 
-def start_ryu(controller_script):
-    ryu_log = open("/tmp/ryu_run.log", "w")
+def start_ryu(controller_script, group_name="run"):
+    log_path = f"data/ryu_{group_name}.log"
+    ryu_log = open(log_path, "w")
     proc = subprocess.Popen(
         ["ryu-manager", controller_script, "--observe-links"],
         stdout=ryu_log,
@@ -82,9 +85,9 @@ def start_ryu(controller_script):
     )
     if not wait_for_port(RYU_PORT, timeout=30):
         proc.kill()
-        print(f"  ERROR: Ryu failed to start. Check /tmp/ryu_run.log")
+        print(f"  ERROR: Ryu failed to start. Check {log_path}")
         sys.exit(1)
-    print(f"  Ryu started: {controller_script}")
+    print(f"  Ryu started: {controller_script} (log: {log_path})")
     return proc
 
 
@@ -147,13 +150,13 @@ def run_experiment_group(group_name, controller_script):
     print(f"  Flow 5: {BURST_FLOW[0]}->{BURST_FLOW[1]} @ {UDP_BANDWIDTH}Mbps")
     print(
         f"Total injection: 5 x {UDP_BANDWIDTH} = {5 * UDP_BANDWIDTH}Mbps "
-        f"on {4 * UDP_BANDWIDTH}Mbps capacity"
+        f"on {4 * CORE_LINK_BW}Mbps capacity"
     )
     print(f"{'='*60}")
 
     cleanup()
     kill_ryu()
-    ryu_proc = start_ryu(controller_script)
+    ryu_proc = start_ryu(controller_script, group_name)
 
     results = {}
     net = None
@@ -165,6 +168,7 @@ def run_experiment_group(group_name, controller_script):
         net.build()
         c0.start()
         net.start()
+        configure_select_hash()
         print("  Waiting for active topology convergence (LLDP Discovery)...")
         converged = False
         for attempt in range(60):
@@ -174,13 +178,14 @@ def run_experiment_group(group_name, controller_script):
                 break
         print("  Topology core networks stabilized.")
 
-        # Start iperf servers on all destination hosts (capture server-side output)
+        # Start iperf servers on all destination hosts (each flow uses unique port)
         all_flows = BACKGROUND_FLOWS + [BURST_FLOW]
         for i, (_, dst_name) in enumerate(all_flows):
             dst = net.get(dst_name)
             if dst:
+                port = BASE_PORT + i + 1
                 dst.cmd(
-                    f"iperf -s -u -i 1 "
+                    f"iperf -s -u -p {port} -i 1 "
                     f"> /tmp/iperf_server_flow{i+1}.log 2>&1 &"
                 )
         time.sleep(1)
@@ -205,8 +210,9 @@ def run_experiment_group(group_name, controller_script):
             src = net.get(src_name)
             dst = net.get(dst_name)
             if src and dst:
+                port = BASE_PORT + i + 1
                 src.cmd(
-                    f"iperf -c {dst.IP()} -u -b {UDP_BANDWIDTH}M "
+                    f"iperf -c {dst.IP()} -u -b {UDP_BANDWIDTH}M -p {port} "
                     f"-t {TEST_DURATION} -i 5 "
                     f"> /tmp/iperf_flow{i+1}.log 2>&1 &"
                 )
@@ -221,8 +227,9 @@ def run_experiment_group(group_name, controller_script):
         src_b = net.get(BURST_FLOW[0])
         dst_b = net.get(BURST_FLOW[1])
         if src_b and dst_b:
+            port = BASE_PORT + 5
             src_b.cmd(
-                f"iperf -c {dst_b.IP()} -u -b {UDP_BANDWIDTH}M "
+                f"iperf -c {dst_b.IP()} -u -b {UDP_BANDWIDTH}M -p {port} "
                 f"-t {remaining} -i 5 "
                 f"> /tmp/iperf_flow5.log 2>&1 &"
             )
@@ -298,16 +305,16 @@ def print_summary(all_results):
     print(f"EXPERIMENT SUMMARY: Pigeonhole Collision")
     print(f"{'='*60}")
     print(f"Topology: Fat-Tree k=4, 4 equal-cost Core paths (Pod 0 <-> Pod 3)")
-    print(f"Link capacity: 10Mbps per link, 40Mbps total cross-section")
+    print(f"Link capacity: {CORE_LINK_BW}Mbps per link, {4 * CORE_LINK_BW}Mbps total cross-section")
     print(f"Background: 4 x {UDP_BANDWIDTH}Mbps = {4 * UDP_BANDWIDTH}Mbps (Phase 1)")
     print(
         f"Burst:      1 x {UDP_BANDWIDTH}Mbps = {UDP_BANDWIDTH}Mbps (Phase 2, t={BURST_DELAY}s)"
     )
     print(
-        f"Total:      5 x {UDP_BANDWIDTH}Mbps = {5 * UDP_BANDWIDTH}Mbps > 40Mbps capacity"
+        f"Total:      5 x {UDP_BANDWIDTH}Mbps = {5 * UDP_BANDWIDTH}Mbps > {4 * CORE_LINK_BW}Mbps capacity"
     )
     print(
-        f"Guarantee:  Pigeonhole principle -> at least 1 link carries 2 flows (16Mbps > 10Mbps)"
+        f"Guarantee:  Pigeonhole principle -> at least 1 link carries 2 flows ({2 * UDP_BANDWIDTH}Mbps > {CORE_LINK_BW}Mbps)"
     )
     print()
 

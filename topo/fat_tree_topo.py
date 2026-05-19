@@ -11,7 +11,7 @@ HOST_PER_EDGE = K // 2   # 2
 
 BW_ACCESS = 100
 BW_EDGE_AGG = 100
-BW_AGG_CORE = 10
+BW_AGG_CORE = 2
 
 
 def _edge_dpid(pod, idx):
@@ -89,9 +89,31 @@ def create_topology(controller_ip="127.0.0.1", controller_port=6633):
                 net.addLink(
                     net.get(f"s{agg_dpid}"), net.get(f"s{core_dpid}"),
                     bw=BW_AGG_CORE,
+                    max_queue_size=30,
                 )
 
     return net, c0
+
+
+def configure_select_hash():
+    """Configure OVS Group Table hash method (dp_hash) on agg/core switches.
+
+    Must be called AFTER net.start() — bridges only exist at that point.
+    dp_hash ensures same 5-tuple → same bucket (同流同径).
+    """
+    for pod in range(PODS):
+        for i in range(AGG_PER_POD):
+            dpid = _agg_dpid(pod, i)
+            os.system(
+                f"ovs-vsctl set bridge s{dpid} "
+                f"other_config:group-table-selection-method=dp_hash"
+            )
+    for i in range((K // 2) ** 2):
+        dpid = _core_dpid(i)
+        os.system(
+            f"ovs-vsctl set bridge s{dpid} "
+            f"other_config:group-table-selection-method=dp_hash"
+        )
 
 
 def cleanup():

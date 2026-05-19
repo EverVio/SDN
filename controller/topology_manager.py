@@ -193,6 +193,38 @@ class TopologyManager:
 
         return result
 
+    def enumerate_all_shortest_paths(self, src_dpid, dst_dpid, weight='weight'):
+        """Enumerate all equal-cost shortest paths between two switches.
+
+        Returns:
+            list of path node lists, or empty list if no path exists.
+        """
+        if not (self.G.has_node(src_dpid) and self.G.has_node(dst_dpid)):
+            return []
+        if not nx.has_path(self.G, src_dpid, dst_dpid):
+            return []
+        return list(nx.all_shortest_paths(self.G, src_dpid, dst_dpid, weight=weight))
+
+    def get_core_facing_ports(self, dpid):
+        """Return [(port_no, core_dpid), ...] for an aggregation switch's core-facing ports.
+
+        DPID ranges (Mininet passes dpid as hex to OVS):
+          Edge switches:  0x01-0x08 → decimal 1-8
+          Agg switches:   0x09-0x16 → decimal 9-22
+          Core switches:  0x17-0x20 → decimal 23-32
+        """
+        CORE_DPID_MIN = 23   # 0x17
+        CORE_DPID_MAX = 32   # 0x20
+        ports = []
+        if not self.G.has_node(dpid):
+            return ports
+        for neighbor in self.G[dpid]:
+            if CORE_DPID_MIN <= neighbor <= CORE_DPID_MAX:
+                port_no = self.link_ports.get((dpid, neighbor))
+                if port_no is not None:
+                    ports.append((port_no, neighbor))
+        return ports
+
     def compute_spanning_tree_ports(self):
         """返回生成树端口集合（由拓扑变更事件预计算）。
 

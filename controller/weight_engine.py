@@ -106,6 +106,42 @@ class DynamicWeightEngine:
             weight = self.compute_weight(src, port, dst, None)
             topo_manager.set_edge_weight(src, dst, weight)
 
+    def get_group_weights(self, topo_manager):
+        """Compute Group Table bucket weights for all aggregation switches.
+
+        Returns: {agg_dpid: [(port_no, weight), ...]} for each agg switch.
+        Weight = proportional to predicted available bandwidth (1.0 - predicted_util).
+        Falls back to current_util when prediction is unavailable.
+        """
+        AGG_DPID_MIN, AGG_DPID_MAX = 9, 22  # 0x09-0x16
+        result = {}
+
+        for dpid in range(AGG_DPID_MIN, AGG_DPID_MAX + 1):
+            core_ports = topo_manager.get_core_facing_ports(dpid)
+            if len(core_ports) < 2:
+                continue
+
+            available_list = []
+            for port_no, _ in core_ports:
+                key = (dpid, port_no)
+                util = self.predicted_utils.get(key)
+                if util is None:
+                    util = self.current_utils.get(key, 0.0)
+                available_list.append(max(0.0, 1.0 - util))
+
+            total = sum(available_list)
+            weights = []
+            for i, (port_no, _) in enumerate(core_ports):
+                if total > 0:
+                    w = max(1, int(available_list[i] / total * 100))
+                else:
+                    w = 50
+                weights.append((port_no, w))
+
+            result[dpid] = weights
+
+        return result
+
     def get_state_summary(self):
         """Return a dict summarizing current engine state."""
         return {
