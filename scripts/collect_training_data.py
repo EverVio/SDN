@@ -14,14 +14,15 @@ import signal
 import socket
 import subprocess
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
 # Mininet 仅安装在系统 Python 中，conda 环境需要手动添加路径（追加到末尾，避免覆盖 conda 的 numpy）
 sys.path.append("/usr/lib/python3/dist-packages")
 
 from mininet.log import setLogLevel
 from topo.fat_tree_topo import create_topology, cleanup
 
-DATA_DIR = "data"
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 SRC_CSV = os.path.join(DATA_DIR, "traffic_data.csv")
 RYU_PORT = 6633
 DURATION = 120
@@ -55,11 +56,13 @@ def kill_ryu():
 
 def start_ryu():
     """启动 Ryu 控制器子进程，返回 Popen 对象"""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    controller_path = os.path.join(project_root, "controller", "threshold_balancer.py")
     proc = subprocess.Popen(
-        ["ryu-manager", "controller/threshold_balancer.py",
-         "--observe-links"],
+        ["ryu-manager", controller_path, "--observe-links"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        cwd=project_root,
     )
     if not wait_for_port(RYU_PORT, timeout=30):
         proc.kill()
@@ -136,7 +139,8 @@ def collect_batch(batch_idx, duration):
         net.build()
         c0.start()
         net.start()
-        print(f"  等待 STP 收敛 ({STP_WAIT}s)...")
+        net.staticArp()
+        print(f"  等待拓扑收敛 ({STP_WAIT}s)...")
         time.sleep(STP_WAIT)
 
         # 3. 执行动态随机流量

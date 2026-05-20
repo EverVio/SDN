@@ -17,10 +17,11 @@ from controller.weight_engine import DynamicWeightEngine
 # 流表优先级
 PRIORITY_ACTIVE_PATH = 20
 PRIORITY_STANDBY_PATH = 10
-FLOW_IDLE_TIMEOUT = 30  # 流表空闲超时（秒）
-SESSION_TIMEOUT = 60    # 会话清理超时（秒）
-AGG_DPID_MIN = 9    # 0x09
-AGG_DPID_MAX = 22   # 0x16
+PRIORITY_ELEPHANT = 100
+FLOW_IDLE_TIMEOUT = 30
+SESSION_TIMEOUT = 60
+AGG_DPID_MIN = 9
+AGG_DPID_MAX = 16  # 聚合交换机真实十进制最大 DPID 为 16
 
 
 class PredictiveBalancer(BaseBalancer):
@@ -28,7 +29,9 @@ class PredictiveBalancer(BaseBalancer):
 
     def __init__(self, *args, **kwargs):
         super(PredictiveBalancer, self).__init__(*args, **kwargs)
-        self.active_sessions = {}  # (src_mac, dst_mac) -> {'switch_set', 'fwd_ports', 'last_seen'}
+        self.active_sessions = (
+            {}
+        )  # (src_mac, dst_mac) -> {'switch_set', 'fwd_ports', 'last_seen'}
         self.path_installed = set()
         self.groups_installed = set()  # set of agg dpids with installed Group Tables
         # Broadcast storm cache: (dpid, src_mac, eth_type) -> timestamp
@@ -36,7 +39,9 @@ class PredictiveBalancer(BaseBalancer):
 
         self.init_stats(topo_manager=self.topo)
 
-        model_path = os.path.join(os.path.dirname(__file__), "..", "models", "global_mlp_model.pkl")
+        model_path = os.path.join(
+            os.path.dirname(__file__), "..", "models", "global_mlp_model.pkl"
+        )
         self.weight_engine = DynamicWeightEngine(model_path=model_path)
 
         self.decision_thread = hub.spawn(self._decision_loop)
@@ -47,7 +52,7 @@ class PredictiveBalancer(BaseBalancer):
     def _get_active_fwd_ports(self):
         if self.active_sessions:
             first = next(iter(self.active_sessions.values()))
-            return first.get('fwd_ports')
+            return first.get("fwd_ports")
         return None
 
     def _get_active_rev_ports(self):
@@ -75,19 +80,40 @@ class PredictiveBalancer(BaseBalancer):
     # Group Table 管理
     # ──────────────────────────────────────────────
     def _safe_flood(self, datapath, in_port, msg):
-        """安全无环洪泛：生成树骨干端口（防环）+ 边缘端口（达主机）"""
+        """
+        安全无环泛洪机制
+        修复：将所有合法出端口组合进单个 actions 列表发送，避免 OpenFlow 缓冲区被首次 PacketOut 提前消耗导致后续泛洪失败。
+        """
         dpid = datapath.id
         st_ports = self.topo.compute_spanning_tree_ports().get(dpid, set())
-        
-        # 使用 list() 获取当前端口键的静态快照
-        # 避免 Ryu 拓扑发现模块在其他协程中异步增删端口导致字典大小改变引发崩溃
         active_ports = list(datapath.ports.keys())
-        
+
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        actions = []
+
+        # 收集所有允许转发的端口（生成树骨干端口 + 边缘接入端口）
         for port_no in active_ports:
-            if port_no >= datapath.ofproto.OFPP_MAX or port_no == in_port:
+            if port_no >= ofproto.OFPP_MAX or port_no == in_port:
                 continue
             if self.topo.is_edge_port(dpid, port_no) or port_no in st_ports:
-                self._send_packet(datapath, in_port, port_no, msg)
+                actions.append(parser.OFPActionOutput(port_no))
+
+        if not actions:
+            return
+
+        # 仅当 buffer_id 无效时携带完整 packet data，减轻控制通道负载
+        data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+
+        # 使用单个 PacketOut 聚合所有输出动作
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data,
+        )
+        datapath.send_msg(out)
 
     @staticmethod
     def _is_agg_switch(dpid):
@@ -142,7 +168,8 @@ class PredictiveBalancer(BaseBalancer):
         self.groups_installed.add(dpid)
         self.logger.info(
             "Group Table created: s%d, buckets=%s",
-            dpid, [(p, c) for p, c in core_ports],
+            dpid,
+            [(p, c) for p, c in core_ports],
         )
         return True
 
@@ -232,10 +259,13 @@ class PredictiveBalancer(BaseBalancer):
                     return
             self.broadcast_cache[cache_key] = now
 
-        # Learn host location via topology manager
-        self.topo.learn_host(src, dpid, in_port)
+        # 仅从边缘接入端口学习主机位置，防止骨干网交换机在泛洪期间错误覆写主机拓扑位置
+        if self.topo.is_edge_port(dpid, in_port):
+            self.topo.learn_host(src, dpid, in_port)
 
+        # Learn host location via topology manager
         self.mac_to_port.setdefault(dpid, {})
+
         if src not in self.mac_to_port[dpid]:
             self.mac_to_port[dpid][src] = in_port
 
@@ -266,21 +296,38 @@ class PredictiveBalancer(BaseBalancer):
                 self._compute_and_install_path(src, dst)
 
             if session_key in self.active_sessions:
-                self.active_sessions[session_key]['last_seen'] = time.time()
-                fwd = self.active_sessions[session_key]['fwd_ports']
+                session = self.active_sessions[session_key]
+                session["last_seen"] = time.time()
+
+                # Reinstall flow rules if they have likely expired
+                now = time.time()
+                if now - session.get("last_install", 0) > FLOW_IDLE_TIMEOUT + 5:
+                    self._reinstall_session_rules(session)
+                    session["last_install"] = now
+
+                fwd = session["fwd_ports"]
                 out_port = fwd.get(dpid)
+
                 if out_port is not None:
-                    buf_id = msg.buffer_id if msg.buffer_id != ofproto.OFP_NO_BUFFER else None
-                    match = parser.OFPMatch(eth_src=src, eth_dst=dst)
-                    if self._is_core_facing_port(dpid, out_port) and dpid in self.groups_installed:
+                    # 预测均衡器：如果是连向核心交换机的上行端口，且 Group Table 已建立，将其导向组表
+                    if (
+                        self._is_core_facing_port(dpid, out_port)
+                        and dpid in self.groups_installed
+                    ):
                         actions = [parser.OFPActionGroup(group_id=dpid)]
                     else:
                         actions = [parser.OFPActionOutput(out_port)]
-                    if buf_id is not None:
-                        self.add_flow(datapath, PRIORITY_ACTIVE_PATH, match, actions, buf_id, idle_timeout=FLOW_IDLE_TIMEOUT)
-                    else:
-                        self.add_flow(datapath, PRIORITY_ACTIVE_PATH, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT)
-                        self._send_packet(datapath, in_port, out_port, msg)
+
+                    # 修复：摒弃重复的 add_flow 调用，直接用 PacketOut 发出当前包，让后续包自然命中已下发的硬件表项
+                    data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+                    out = parser.OFPPacketOut(
+                        datapath=datapath,
+                        buffer_id=msg.buffer_id,
+                        in_port=in_port,
+                        actions=actions,
+                        data=data,
+                    )
+                    datapath.send_msg(out)
                     return
 
         # Destination unknown or path not available: safe flood
@@ -305,7 +352,9 @@ class PredictiveBalancer(BaseBalancer):
         # Flood ARP request via safe flood (spanning tree + edge ports)
         self._safe_flood(datapath, in_port, msg)
 
-    def _handle_arp_reply(self, datapath, in_port, dpid, dst_mac, arp_pkt, src_mac, msg):
+    def _handle_arp_reply(
+        self, datapath, in_port, dpid, dst_mac, arp_pkt, src_mac, msg
+    ):
         """ARP reply: learn binding + forward"""
         self._learn_arp_binding(arp_pkt, src_mac)
         self._install_reverse_rule(datapath, src_mac, in_port)
@@ -331,18 +380,22 @@ class PredictiveBalancer(BaseBalancer):
         parser = datapath.ofproto_parser
 
         eth_pkt = packet.Packet()
-        eth_pkt.add_protocol(ethernet.ethernet(
-            ethertype=ether_types.ETH_TYPE_ARP,
-            dst=req_arp_pkt.src_mac,
-            src=target_mac,
-        ))
-        eth_pkt.add_protocol(arp.arp(
-            opcode=arp.ARP_REPLY,
-            src_mac=target_mac,
-            src_ip=req_arp_pkt.dst_ip,
-            dst_mac=req_arp_pkt.src_mac,
-            dst_ip=req_arp_pkt.src_ip,
-        ))
+        eth_pkt.add_protocol(
+            ethernet.ethernet(
+                ethertype=ether_types.ETH_TYPE_ARP,
+                dst=req_arp_pkt.src_mac,
+                src=target_mac,
+            )
+        )
+        eth_pkt.add_protocol(
+            arp.arp(
+                opcode=arp.ARP_REPLY,
+                src_mac=target_mac,
+                src_ip=req_arp_pkt.dst_ip,
+                dst_mac=req_arp_pkt.src_mac,
+                dst_ip=req_arp_pkt.src_ip,
+            )
+        )
         eth_pkt.serialize()
 
         actions = [parser.OFPActionOutput(in_port)]
@@ -359,15 +412,20 @@ class PredictiveBalancer(BaseBalancer):
     # 路径安装（Group Table 模式）
     # ──────────────────────────────────────────────
     def _install_path_rules_for_all_paths(self, src_mac, dst_mac, all_paths):
-        """Install flow rules for all ECMP paths, using Group Table on agg switches for upward traffic.
-
-        Returns: set of all dpids where rules were installed.
-        """
         switch_set = set()
         fwd_ports = {}
 
+        src_loc = self.topo.get_host_location(src_mac)
+        dst_loc = self.topo.get_host_location(dst_mac)
+        src_dpid, dst_dpid = src_loc[0], dst_loc[0]
+        src_port, dst_port = src_loc[1], dst_loc[1]
+
         for path_nodes in all_paths:
             fwd, rev = self.topo.path_to_ports(path_nodes)
+
+            # 修复：在路径组中，为每一个路径实例补全最后一跳的接入边缘端口
+            fwd[dst_dpid] = dst_port
+            rev[src_dpid] = src_port
 
             # Install forward rules
             for dpid, out_port in fwd.items():
@@ -375,14 +433,29 @@ class PredictiveBalancer(BaseBalancer):
                     dp = self.datapaths[dpid]
                     parser = dp.ofproto_parser
                     match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
-                    if self._is_core_facing_port(dpid, out_port) and self._ensure_group_table(dpid):
+                    if self._is_core_facing_port(
+                        dpid, out_port
+                    ) and self._ensure_group_table(dpid):
                         actions = [parser.OFPActionGroup(group_id=dpid)]
                     else:
                         actions = [parser.OFPActionOutput(out_port)]
-                    self.add_flow(dp, PRIORITY_ACTIVE_PATH, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT)
-                    switch_set.add(dpid)
-                    if dpid not in fwd_ports:
-                        fwd_ports[dpid] = out_port
+                    self.add_flow(
+                        dp,
+                        PRIORITY_ACTIVE_PATH,
+                        match,
+                        actions,
+                        idle_timeout=FLOW_IDLE_TIMEOUT,
+                    )
+                else:
+                    self.add_flow_ovs(
+                        dpid, PRIORITY_ACTIVE_PATH,
+                        f"eth_src={src_mac},eth_dst={dst_mac}",
+                        f"output={out_port}",
+                        idle_timeout=FLOW_IDLE_TIMEOUT,
+                    )
+                switch_set.add(dpid)
+                if dpid not in fwd_ports:
+                    fwd_ports[dpid] = out_port
 
             # Install reverse rules
             for dpid, out_port in rev.items():
@@ -390,12 +463,27 @@ class PredictiveBalancer(BaseBalancer):
                     dp = self.datapaths[dpid]
                     parser = dp.ofproto_parser
                     match = parser.OFPMatch(eth_src=dst_mac, eth_dst=src_mac)
-                    if self._is_core_facing_port(dpid, out_port) and self._ensure_group_table(dpid):
+                    if self._is_core_facing_port(
+                        dpid, out_port
+                    ) and self._ensure_group_table(dpid):
                         actions = [parser.OFPActionGroup(group_id=dpid)]
                     else:
                         actions = [parser.OFPActionOutput(out_port)]
-                    self.add_flow(dp, PRIORITY_ACTIVE_PATH, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT)
-                    switch_set.add(dpid)
+                    self.add_flow(
+                        dp,
+                        PRIORITY_ACTIVE_PATH,
+                        match,
+                        actions,
+                        idle_timeout=FLOW_IDLE_TIMEOUT,
+                    )
+                else:
+                    self.add_flow_ovs(
+                        dpid, PRIORITY_ACTIVE_PATH,
+                        f"eth_src={dst_mac},eth_dst={src_mac}",
+                        f"output={out_port}",
+                        idle_timeout=FLOW_IDLE_TIMEOUT,
+                    )
+                switch_set.add(dpid)
 
         return switch_set, fwd_ports
 
@@ -453,7 +541,9 @@ class PredictiveBalancer(BaseBalancer):
 
         session_key = (src_mac, dst_mac)
         switch_set, fwd_ports = self._install_path_rules_for_all_paths(
-            src_mac, dst_mac, all_full_paths,
+            src_mac,
+            dst_mac,
+            all_full_paths,
         )
 
         # 计算主路径的 util_keys，用于大象流带宽估算
@@ -461,17 +551,22 @@ class PredictiveBalancer(BaseBalancer):
         util_keys = self.topo.get_path_util_keys(primary_fwd, primary_rev)
 
         self.active_sessions[session_key] = {
-            'src_mac': src_mac,
-            'dst_mac': dst_mac,
-            'switch_set': switch_set,
-            'fwd_ports': fwd_ports,
-            'util_keys': util_keys,
-            'last_seen': time.time(),
+            "src_mac": src_mac,
+            "dst_mac": dst_mac,
+            "switch_set": switch_set,
+            "fwd_ports": fwd_ports,
+            "util_keys": util_keys,
+            "last_seen": time.time(),
+            "last_install": time.time(),
         }
 
         self.logger.info(
             "Path installed: %s -> %s, primary=%s, paths=%d, cost=%.2f",
-            src_mac, dst_mac, primary_path, len(all_full_paths), cost,
+            src_mac,
+            dst_mac,
+            primary_path,
+            len(all_full_paths),
+            cost,
         )
 
     # ──────────────────────────────────────────────
@@ -480,14 +575,27 @@ class PredictiveBalancer(BaseBalancer):
     ELEPHANT_THRESHOLD = 0.50  # 链路利用率超过 50% 视为拥塞
 
     def _install_explicit_path(self, src_mac, dst_mac, fwd_ports, rev_ports):
-        """安装优先级更高的明确路径规则，绕过组表实现强制迁移"""
+        """安装高优先级精确匹配规则，绕过组表实现大象流强制重定向"""
         for dpid, out_port in fwd_ports.items():
             if dpid in self.datapaths:
                 dp = self.datapaths[dpid]
                 parser = dp.ofproto_parser
                 match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
                 actions = [parser.OFPActionOutput(out_port)]
-                self.add_flow(dp, PRIORITY_ACTIVE_PATH + 5, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT)
+                self.add_flow(
+                    dp,
+                    PRIORITY_ELEPHANT,
+                    match,
+                    actions,
+                    idle_timeout=FLOW_IDLE_TIMEOUT,
+                )
+            else:
+                self.add_flow_ovs(
+                    dpid, PRIORITY_ELEPHANT,
+                    f"eth_src={src_mac},eth_dst={dst_mac}",
+                    f"output={out_port}",
+                    idle_timeout=FLOW_IDLE_TIMEOUT,
+                )
 
         for dpid, out_port in rev_ports.items():
             if dpid in self.datapaths:
@@ -495,14 +603,35 @@ class PredictiveBalancer(BaseBalancer):
                 parser = dp.ofproto_parser
                 match = parser.OFPMatch(eth_src=dst_mac, eth_dst=src_mac)
                 actions = [parser.OFPActionOutput(out_port)]
-                self.add_flow(dp, PRIORITY_ACTIVE_PATH + 5, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT)
+                self.add_flow(
+                    dp,
+                    PRIORITY_ELEPHANT,
+                    match,
+                    actions,
+                    idle_timeout=FLOW_IDLE_TIMEOUT,
+                )
+            else:
+                self.add_flow_ovs(
+                    dpid, PRIORITY_ELEPHANT,
+                    f"eth_src={dst_mac},eth_dst={src_mac}",
+                    f"output={out_port}",
+                    idle_timeout=FLOW_IDLE_TIMEOUT,
+                )
 
     def _find_congested_sessions(self):
-        """找出经过拥塞链路的会话（大象流候选）"""
+        """找出经过拥塞链路的会话（基于当前真实利用率）"""
+        return self._find_sessions_above_threshold(self.link_utilization)
+
+    def _find_predicted_congested_sessions(self, pred_utils):
+        """找出预测将拥塞的会话（基于 MLP 预测利用率）"""
+        return self._find_sessions_above_threshold(pred_utils)
+
+    def _find_sessions_above_threshold(self, util_dict):
+        """通用辅助：从给定利用率字典中找出经过高利用率链路的会话"""
         congested = []
         for session_key, session in self.active_sessions.items():
-            for dpid in session.get('switch_set', set()):
-                for (link_dpid, link_port), util in self.link_utilization.items():
+            for dpid in session.get("switch_set", set()):
+                for (link_dpid, link_port), util in util_dict.items():
                     if link_dpid == dpid and util > self.ELEPHANT_THRESHOLD:
                         congested.append(session_key)
                         break
@@ -524,16 +653,14 @@ class PredictiveBalancer(BaseBalancer):
             self.weight_engine.update_all_utilizations(self.link_utilization)
             self.weight_engine.predict_all()
 
-            # 2. 更新拓扑链路权重 + Group Table 权重（新流自动按权重分配）
+            # 2. 更新拓扑链路权重（影响 Dijkstra 路径计算）
             self.weight_engine.apply_weights_to_topology(self.topo)
-            if self.groups_installed:
-                self._update_group_weights()
 
-            # 3. 串行大象流迁移：容量占位防止群聚震荡
-            max_util = max(self.link_utilization.values()) if self.link_utilization else 0
-            if max_util > self.ELEPHANT_THRESHOLD:
-                congested_keys = self._find_congested_sessions()
-                # 虚拟利用率表：初始值 = 当前真实利用率
+            # 3. 串行大象流迁移：基于【预测利用率】触发，实现提前避让
+            pred_utils = self.weight_engine.predicted_utils
+            max_pred = max(pred_utils.values()) if pred_utils else 0
+            if max_pred > self.ELEPHANT_THRESHOLD:
+                congested_keys = self._find_predicted_congested_sessions(pred_utils)
                 virtual_util = dict(self.link_utilization)
                 migrated = 0
 
@@ -541,16 +668,20 @@ class PredictiveBalancer(BaseBalancer):
                     session = self.active_sessions.get(session_key)
                     if not session:
                         continue
-                    src_mac, dst_mac = session['src_mac'], session['dst_mac']
+                    src_mac, dst_mac = session["src_mac"], session["dst_mac"]
                     src_loc = self.topo.get_host_location(src_mac)
                     dst_loc = self.topo.get_host_location(dst_mac)
                     if not (src_loc and dst_loc):
                         continue
 
-                    # 用虚拟利用率更新图权重，使已迁移流的路径"变重"
+                    src_dpid, dst_dpid = src_loc[0], dst_loc[0]
+                    src_port, dst_port = src_loc[1], dst_loc[1]
+
                     self._apply_virtual_weights(virtual_util)
                     result = self.topo.compute_optimal_path(
-                        src_loc[0], dst_loc[0], weight='weight',
+                        src_loc[0],
+                        dst_loc[0],
+                        weight="weight",
                     )
                     if not result:
                         continue
@@ -558,14 +689,22 @@ class PredictiveBalancer(BaseBalancer):
                     path_nodes, _ = result
                     fwd, rev = self.topo.path_to_ports(path_nodes)
 
+                    # 修复：显式高优先级重定向路径，同样必须包含最后一跳交换机到主机的端口映射
+                    fwd[dst_dpid] = dst_port
+                    rev[src_dpid] = src_port
+
                     # 模拟占位：为新路径上的每条链路预留带宽
                     self._book_capacity(virtual_util, fwd, rev, session_key)
 
                     self._install_explicit_path(src_mac, dst_mac, fwd, rev)
+                    session["last_install"] = time.time()
                     migrated += 1
                     self.logger.info(
                         "Elephant migration #%d: %s -> %s, path=%s",
-                        migrated, src_mac, dst_mac, path_nodes,
+                        migrated,
+                        src_mac,
+                        dst_mac,
+                        path_nodes,
                     )
 
                 # 恢复真实权重（虚拟占位仅用于本轮决策）
@@ -574,8 +713,9 @@ class PredictiveBalancer(BaseBalancer):
             # 4. 清理过期会话
             now = time.time()
             stale = [
-                k for k, v in self.active_sessions.items()
-                if now - v.get('last_seen', 0) > SESSION_TIMEOUT
+                k
+                for k, v in self.active_sessions.items()
+                if now - v.get("last_seen", 0) > SESSION_TIMEOUT
             ]
             for k in stale:
                 session = self.active_sessions.pop(k)
@@ -583,12 +723,15 @@ class PredictiveBalancer(BaseBalancer):
                 self.logger.info("Session expired: %s -> %s", k[0], k[1])
 
             # 5. 日志摘要
+            max_real = (
+                max(self.link_utilization.values()) if self.link_utilization else 0
+            )
             summary = self.weight_engine.get_state_summary()
             self.logger.info(
-                "ML: %d links predicted, max_util=%.1f%%, groups=%d, sessions=%d",
+                "ML: %d links, max_pred=%.1f%%, max_real=%.1f%%, sessions=%d",
                 summary["links_monitored"],
-                max_util * 100,
-                len(self.groups_installed),
+                max_pred * 100,
+                max_real * 100,
                 len(self.active_sessions),
             )
 
@@ -617,7 +760,7 @@ class PredictiveBalancer(BaseBalancer):
 
         # 尝试从当前路径链路估算该流的带宽贡献
         est_bw = 0.0
-        old_keys = session.get('util_keys', set())
+        old_keys = session.get("util_keys", set())
         if old_keys:
             utils_on_path = [self.link_utilization.get(k, 0) for k in old_keys]
             if utils_on_path:
@@ -642,9 +785,9 @@ class PredictiveBalancer(BaseBalancer):
 
     def _cleanup_session_rules(self, session):
         """Remove all flow rules for an expired session."""
-        src_mac = session.get('src_mac')
-        dst_mac = session.get('dst_mac')
-        for dpid in session.get('switch_set', set()):
+        src_mac = session.get("src_mac")
+        dst_mac = session.get("dst_mac")
+        for dpid in session.get("switch_set", set()):
             if dpid not in self.datapaths:
                 continue
             dp = self.datapaths[dpid]
@@ -668,3 +811,30 @@ class PredictiveBalancer(BaseBalancer):
                 match=match_rev,
             )
             dp.send_msg(mod_rev)
+
+    def _reinstall_session_rules(self, session):
+        """Reinstall expired flow rules for an existing session."""
+        src_mac = session.get("src_mac")
+        dst_mac = session.get("dst_mac")
+        fwd_ports = session.get("fwd_ports", {})
+
+        for dpid, out_port in fwd_ports.items():
+            if dpid in self.datapaths:
+                dp = self.datapaths[dpid]
+                parser = dp.ofproto_parser
+                match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
+                if self._is_core_facing_port(dpid, out_port) and dpid in self.groups_installed:
+                    actions = [parser.OFPActionGroup(group_id=dpid)]
+                else:
+                    actions = [parser.OFPActionOutput(out_port)]
+                self.add_flow(
+                    dp, PRIORITY_ACTIVE_PATH, match, actions,
+                    idle_timeout=FLOW_IDLE_TIMEOUT,
+                )
+            else:
+                self.add_flow_ovs(
+                    dpid, PRIORITY_ACTIVE_PATH,
+                    f"eth_src={src_mac},eth_dst={dst_mac}",
+                    f"output={out_port}",
+                    idle_timeout=FLOW_IDLE_TIMEOUT,
+                )

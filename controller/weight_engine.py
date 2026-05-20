@@ -14,9 +14,9 @@ class DynamicWeightEngine:
     This eliminates the per-link model I/O bottleneck of the old approach.
     """
 
-    ALPHA = 1.0   # base hop cost coefficient
-    BETA = 2.0    # current utilization coefficient
-    GAMMA = 3.0   # predicted utilization coefficient (highest priority)
+    ALPHA = 1.0  # base hop cost coefficient
+    BETA = 2.0  # current utilization coefficient
+    GAMMA = 3.0  # predicted utilization coefficient (highest priority)
 
     def __init__(self, model_path=None):
         self.global_model = None
@@ -29,6 +29,7 @@ class DynamicWeightEngine:
         self.current_utils = {}
         self.predicted_utils = {}
         self.models_loaded = False
+        self._last_group_ratios = {}  # dpid -> [ratio_per_port, ...]，用于权重变化死区
 
         if model_path and os.path.exists(model_path):
             self._load_global_model(model_path)
@@ -36,11 +37,11 @@ class DynamicWeightEngine:
     def _load_global_model(self, model_path):
         """Load Global MLP model bundle (model + scalers + link_keys)."""
         data = joblib.load(model_path)
-        self.global_model = data['model']
-        self.scaler_X = data['scaler_X']
-        self.scaler_Y = data['scaler_Y']
-        self.link_keys = data['link_keys']
-        self.window_size = data.get('window_size', 3)
+        self.global_model = data["model"]
+        self.scaler_X = data["scaler_X"]
+        self.scaler_Y = data["scaler_Y"]
+        self.link_keys = data["link_keys"]
+        self.window_size = data.get("window_size", 3)
         self.models_loaded = True
 
         # Cold-start: fill sliding window with zeros
@@ -94,11 +95,7 @@ class DynamicWeightEngine:
         current = self.current_utils.get(key, 0.0)
         predicted = self.predicted_utils.get(key, current)
 
-        return (
-            self.ALPHA * 1.0
-            + self.BETA * current
-            + self.GAMMA * predicted
-        )
+        return self.ALPHA * 1.0 + self.BETA * current + self.GAMMA * predicted
 
     def apply_weights_to_topology(self, topo_manager):
         """Update all edge weights in the TopologyManager graph."""
@@ -107,13 +104,8 @@ class DynamicWeightEngine:
             topo_manager.set_edge_weight(src, dst, weight)
 
     def get_group_weights(self, topo_manager):
-        """Compute Group Table bucket weights for all aggregation switches.
-
-        Returns: {agg_dpid: [(port_no, weight), ...]} for each agg switch.
-        Weight = proportional to predicted available bandwidth (1.0 - predicted_util).
-        Falls back to current_util when prediction is unavailable.
-        """
-        AGG_DPID_MIN, AGG_DPID_MAX = 9, 22  # 0x09-0x16
+        WEIGHT_DEADBAND = 0.10
+        AGG_DPID_MIN, AGG_DPID_MAX = 9, 16  # 聚合交换机真实十进制 DPID 范围是 9-16
         result = {}
 
         for dpid in range(AGG_DPID_MIN, AGG_DPID_MAX + 1):
@@ -130,6 +122,20 @@ class DynamicWeightEngine:
                 available_list.append(max(0.0, 1.0 - util))
 
             total = sum(available_list)
+            # 计算各端口的空闲带宽比例
+            if total > 0:
+                ratios = [a / total for a in available_list]
+            else:
+                ratios = [1.0 / len(core_ports)] * len(core_ports)
+
+            # 死区检查：与上次下发的比例对比，变化不超过阈值则跳过
+            last_ratios = self._last_group_ratios.get(dpid)
+            if last_ratios is not None and len(last_ratios) == len(ratios):
+                max_delta = max(abs(r - lr) for r, lr in zip(ratios, last_ratios))
+                if max_delta < WEIGHT_DEADBAND:
+                    continue
+
+            # 计算整数权重
             weights = []
             for i, (port_no, _) in enumerate(core_ports):
                 if total > 0:
@@ -139,6 +145,7 @@ class DynamicWeightEngine:
                 weights.append((port_no, w))
 
             result[dpid] = weights
+            self._last_group_ratios[dpid] = ratios
 
         return result
 
@@ -149,6 +156,7 @@ class DynamicWeightEngine:
             "links_monitored": len(self.link_keys),
             "avg_predicted_util": (
                 np.mean(list(self.predicted_utils.values()))
-                if self.predicted_utils else 0.0
+                if self.predicted_utils
+                else 0.0
             ),
         }

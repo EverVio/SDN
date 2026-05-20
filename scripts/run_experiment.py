@@ -2,20 +2,23 @@
 """
 三组对比实验脚本：L2 基线 / 阈值均衡 / Global MLP 预测均衡。
 
-实验设计 — 抽屉原理保证的大象流碰撞 (Pigeonhole Collision)：
+实验设计 — 概率哈希碰撞 + 渐进突发 (Probabilistic Hash Collision + Ramp-up)：
 
   Fat-Tree k=4 在 Pod 0 ↔ Pod 3 之间有 4 条等价 Core 路径，
   总横截带宽 = 4 × 2Mbps = 8Mbps。
 
-  注入 5 条 1.5Mbps 的独立 UDP 流（5 > 4），根据抽屉原理，
-  必定至少有一条 Core 链路承载 2 条流（3Mbps > 2Mbps）。
+  阶段 1 (t=0s):  启动 3 条 1.5Mbps 背景流（4.5Mbps，4 路径各 ~1.125Mbps，无拥塞）
+  阶段 2 (t=20s): 渐进启动突发流（3 条 0.5Mbps 子流，间隔 5s，模拟带宽爬升）
+    - t=20s: 子流 A 0.5Mbps → 总 5.0Mbps
+    - t=25s: 子流 B 0.5Mbps → 总 5.5Mbps
+    - t=30s: 子流 C 0.5Mbps → 总 6.0Mbps
 
-  阶段 1 (t=0s):  启动前 4 条流（6Mbps 注入，4 路径容纳，无丢包）
-  阶段 2 (t=20s): 启动第 5 条流（总注入 7.5Mbps，碰撞链路 3Mbps → 丢包）
+  哈希碰撞概率：3 背景流占 3 条路径，突发流有 25% 概率哈希到已占用路径。
+  碰撞时该链路承载 2.625Mbps > 2Mbps → 丢包。
 
-  - L2 基线组：静态哈希无法迁移，碰撞链路持续丢包 ~33%
-  - 阈值均衡组：检测到 >70% 后响应式切换，2-4 秒滞后丢包
-  - Global MLP 组：预测引擎识别趋势，主动将第 5 条流迁至空闲路径
+  - L2 基线组：静态哈希，碰撞后持续丢包
+  - 阈值均衡组：碰撞后 2-3 秒检测到拥塞，响应式迁移
+  - Global MLP 组：预测引擎在爬升阶段识别趋势，主动迁移，0 丢包
 
 用法：sudo python3 scripts/run_experiment.py --group [l2|threshold|predictive|all]
 """
@@ -28,7 +31,8 @@ import socket
 import subprocess
 import re
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
 sys.path.append("/usr/lib/python3/dist-packages")
 
 from mininet.log import setLogLevel
@@ -36,21 +40,26 @@ from topo.fat_tree_topo import create_topology, cleanup, configure_select_hash
 
 RYU_PORT = 6633
 TEST_DURATION = 60  # 测试持续时间（秒）
-UDP_BANDWIDTH = 1.5  # 每条流的 UDP 带宽 (Mbps)
-BURST_DELAY = 20  # 第 5 条流的启动延迟（秒）
+UDP_BANDWIDTH = 1.5  # 背景流每条带宽 (Mbps)
+BURST_DELAY = 20  # 突发流启动延迟（秒）
+BURST_STAGGER = 5  # 突发子流间隔（秒）
+BURST_SUB_BW = 0.5  # 每条突发子流带宽 (Mbps)
 BASE_PORT = 5000  # iperf 端口基准（每条流使用 BASE_PORT + flow_number）
 CORE_LINK_BW = 2  # 每条核心链路带宽 (Mbps)，与 BW_AGG_CORE 一致
 
-# 5 条独立流：Pod 0 → Pod 3，使用不同的 (src_mac, dst_mac) 对
-# 保证 5 条流的哈希值各不相同，覆盖所有 4 条 ECMP 路径
-# 抽屉原理：5 流 / 4 路径 → 至少 1 条路径承载 2 流 (3Mbps > 2Mbps)
+# 3 条背景流：Pod 0 → Pod 3，各占一条路径（~1.125Mbps/链路，远低于 2Mbps 容量）
 BACKGROUND_FLOWS = [
-    ("h0_0", "h3_0"),  # 流 1: 第 0 秒启动
-    ("h0_1", "h3_1"),  # 流 2: 第 0 秒启动
-    ("h0_2", "h3_2"),  # 流 3: 第 0 秒启动
-    ("h0_3", "h3_3"),  # 流 4: 第 0 秒启动
+    ("h0_0", "h3_0"),  # 流 1
+    ("h0_1", "h3_1"),  # 流 2
+    ("h0_2", "h3_2"),  # 流 3
 ]
-BURST_FLOW = ("h0_0", "h3_3")  # 流 5: 第 BURST_DELAY 秒启动（复用源主机，新 MAC 对）
+# 突发流：3 条 0.5Mbps 子流，渐进启动（模拟带宽爬升，给 MLP 趋势信号）
+# 不同 (src, dst) 对 → 不同 MAC 哈希 → 25% 概率碰撞已占用路径
+BURST_SUBFLOWS = [
+    ("h0_3", "h3_3"),  # 子流 A: t=20s 启动
+    ("h0_0", "h3_3"),  # 子流 B: t=25s 启动（复用 h0_0，新 MAC 对）
+    ("h0_1", "h3_3"),  # 子流 C: t=30s 启动（复用 h0_1，新 MAC 对）
+]
 
 CONTROLLERS = {
     "l2": "controller/base_controller.py",
@@ -76,12 +85,15 @@ def kill_ryu():
 
 
 def start_ryu(controller_script, group_name="run"):
-    log_path = f"data/ryu_{group_name}.log"
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    controller_path = os.path.join(project_root, controller_script)
+    log_path = os.path.join(project_root, "data", f"ryu_{group_name}.log")
     ryu_log = open(log_path, "w")
     proc = subprocess.Popen(
-        ["ryu-manager", controller_script, "--observe-links"],
+        ["ryu-manager", controller_path],
         stdout=ryu_log,
         stderr=subprocess.STDOUT,
+        cwd=project_root,
     )
     if not wait_for_port(RYU_PORT, timeout=30):
         proc.kill()
@@ -91,15 +103,17 @@ def start_ryu(controller_script, group_name="run"):
     return proc
 
 
+def _to_mbps(bw_value, unit):
+    """Convert bandwidth value to Mbits/sec."""
+    if "Kbits" in unit:
+        return bw_value / 1000.0
+    return bw_value
+
+
 def parse_iperf_udp_output(output, expected_bw_mbps=None):
     """Parse iperf2 UDP client output for loss, jitter, and bandwidth.
 
-    iperf2 client output format depends on whether the server report is received:
-      - With server report:  "X Mbits/sec  Y ms  Z/W (L%)"
-      - Without server report: "X Mbits/sec" (no jitter/loss line)
-
-    When server report is missing, we compute approximate loss by comparing
-    received bandwidth to the expected send rate.
+    Handles both Mbits/sec and Kbits/sec units from iperf2 output.
     """
     loss_pct = 0.0
     jitter_ms = 0.0
@@ -110,26 +124,25 @@ def parse_iperf_udp_output(output, expected_bw_mbps=None):
         loss_pct = 100.0
 
     for line in output.split("\n"):
-        # Full server report line: bw + jitter + loss
+        # Full server report line: bw + jitter + loss (Mbits or Kbits)
         m = re.search(
-            r"(\d+\.?\d*)\s+Mbits/sec\s+(\d+\.?\d*)\s+ms\s+\d+/\s*\d+\s+\((\d+\.?\d*)%\)",
+            r"(\d+\.?\d*)\s+([MK])bits/sec\s+(\d+\.?\d*)\s+ms\s+\d+/\s*\d+\s+\((\d+\.?\d*)%\)",
             line,
         )
         if m:
-            bandwidth_mbps = float(m.group(1))
-            jitter_ms = float(m.group(2))
-            loss_pct = float(m.group(3))
+            bandwidth_mbps = _to_mbps(float(m.group(1)), m.group(2) + "bits/sec")
+            jitter_ms = float(m.group(3))
+            loss_pct = float(m.group(4))
             has_server_report = True
             continue
 
-        # Fallback: extract bandwidth from summary line (no jitter/loss)
-        # Match the total summary line (with longer decimal in sec)
+        # Interval/summary line: ... X.Y sec  Z WBytes  BW [MK]bits/sec
         m2 = re.search(
-            r"(\d+\.?\d*)\s+\d+\.?\d*\s+sec\s+[\d.]+\s+\w+\s+(\d+\.?\d*)\s+Mbits/sec",
+            r"(\d+\.?\d*)\s+\d+\.?\d*\s+sec\s+[\d.]+\s+\w+\s+(\d+\.?\d*)\s+([MK])bits/sec",
             line,
         )
         if m2:
-            bandwidth_mbps = float(m2.group(2))
+            bandwidth_mbps = _to_mbps(float(m2.group(2)), m2.group(3) + "bits/sec")
 
     # If no server report and we have bandwidth + expected BW, compute approximate loss
     if not has_server_report and bandwidth_mbps > 0 and expected_bw_mbps:
@@ -138,19 +151,46 @@ def parse_iperf_udp_output(output, expected_bw_mbps=None):
     return loss_pct, jitter_ms, bandwidth_mbps
 
 
+def _collect_flow_result(client_log, server_log, expected_bw):
+    """Collect iperf results from client and server logs."""
+    loss, jitter, bw = 0.0, 0.0, 0.0
+    source = "none"
+
+    if os.path.exists(client_log):
+        with open(client_log) as f:
+            output = f.read()
+        loss, jitter, bw = parse_iperf_udp_output(output, expected_bw_mbps=expected_bw)
+        source = "client"
+
+    if os.path.exists(server_log):
+        with open(server_log) as f:
+            output = f.read()
+        s_loss, s_jitter, s_bw = parse_iperf_udp_output(output)
+        if s_bw > 0 and (bw == 0 or source == "none"):
+            loss, jitter, bw = s_loss, s_jitter, s_bw
+            source = "server"
+
+    return loss, jitter, bw
+
+
 def run_experiment_group(group_name, controller_script):
-    """Run a single experiment group with pigeonhole collision guarantee."""
+    """Run a single experiment group with probabilistic hash collision."""
+    n_bg = len(BACKGROUND_FLOWS)
+    n_burst = len(BURST_SUBFLOWS)
+    total_bw = n_bg * UDP_BANDWIDTH + n_burst * BURST_SUB_BW
     print(f"\n{'='*60}")
     print(f"Experiment: {group_name}")
     print(f"Controller: {controller_script}")
     print(f"Background flows (t=0s):")
     for i, (s, d) in enumerate(BACKGROUND_FLOWS):
         print(f"  Flow {i+1}: {s}->{d} @ {UDP_BANDWIDTH}Mbps")
-    print(f"Burst flow (t={BURST_DELAY}s):")
-    print(f"  Flow 5: {BURST_FLOW[0]}->{BURST_FLOW[1]} @ {UDP_BANDWIDTH}Mbps")
+    print(f"Burst sub-flows (ramp-up, {BURST_SUB_BW}Mbps each):")
+    for i, (s, d) in enumerate(BURST_SUBFLOWS):
+        t = BURST_DELAY + i * BURST_STAGGER
+        print(f"  Sub-flow {chr(65+i)}: {s}->{d} @ t={t}s")
     print(
-        f"Total injection: 5 x {UDP_BANDWIDTH} = {5 * UDP_BANDWIDTH}Mbps "
-        f"on {4 * CORE_LINK_BW}Mbps capacity"
+        f"Total at full ramp: {n_bg}x{UDP_BANDWIDTH} + {n_burst}x{BURST_SUB_BW} "
+        f"= {total_bw}Mbps on {4 * CORE_LINK_BW}Mbps capacity"
     )
     print(f"{'='*60}")
 
@@ -169,6 +209,37 @@ def run_experiment_group(group_name, controller_script):
         c0.start()
         net.start()
         configure_select_hash()
+        # Do NOT call staticArp() — the threshold/predictive controllers
+        # need ARP packets to learn host locations in their host_table.
+
+        # Ryu's event loop (eventlet) sometimes drops EventOFPSwitchFeatures
+        # for a few switches even though OVS reports is_connected=true.
+        # Fix: install table-miss rules via ovs-ofctl for any switch that
+        # Ryu failed to handle, so those switches can still forward packets.
+        print("  Checking Ryu switch coverage and patching missing table-miss rules...")
+        time.sleep(5)
+        expected_dpids = set(range(1, 21))
+        log_path = os.path.join(PROJECT_ROOT, "data", f"ryu_{group_name}.log")
+        connected = set()
+        if os.path.exists(log_path):
+            with open(log_path) as lf:
+                for line in lf:
+                    if "table-miss installed" in line:
+                        parts = line.split()
+                        for p in parts:
+                            if p.isdigit() and int(p) <= 20:
+                                connected.add(int(p))
+        missing = expected_dpids - connected
+        if missing:
+            for dpid in missing:
+                os.system(
+                    f"ovs-ofctl add-flow s{dpid} "
+                    f'"actions=controller" -O OpenFlow13 2>/dev/null'
+                )
+            print(f"  Patched {len(missing)} switches with table-miss rules: {sorted(missing)}")
+        else:
+            print(f"  All 20 switches handled by Ryu.")
+
         print("  Waiting for active topology convergence (LLDP Discovery)...")
         converged = False
         for attempt in range(60):
@@ -178,109 +249,195 @@ def run_experiment_group(group_name, controller_script):
                 break
         print("  Topology core networks stabilized.")
 
+        print("  Priming network for host location learning...")
+        target_host = net.get("h0_0")
+        for host in net.hosts:
+            if host.name != "h0_0":
+                # 使用后台运行标记（&）与严格超时限制（-w 1），确保命令立即返回，绝不阻塞
+                host.cmd(f"ping -c 1 -w 1 {target_host.IP()} > /dev/null 2>&1 &")
+
+        time.sleep(3)  # 留出 3 秒宽裕时间供并发的探测报文流经网络并完成 MAC 位置学习
+        print("  All host locations recognized by the SDN controller.")
+
         # Start iperf servers on all destination hosts (each flow uses unique port)
-        all_flows = BACKGROUND_FLOWS + [BURST_FLOW]
+        all_flows = BACKGROUND_FLOWS + BURST_SUBFLOWS
+        server_procs = []
         for i, (_, dst_name) in enumerate(all_flows):
             dst = net.get(dst_name)
             if dst:
                 port = BASE_PORT + i + 1
-                dst.cmd(
-                    f"iperf -s -u -p {port} -i 1 "
-                    f"> /tmp/iperf_server_flow{i+1}.log 2>&1 &"
+                log_path = f"/tmp/iperf_server_flow{i+1}.log"
+                if os.path.exists(log_path):
+                    os.remove(log_path)
+                srv_f = open(log_path, "w")
+                srv_proc = dst.popen(
+                    f"iperf -s -u -p {port} -i 1",
+                    stdout=srv_f,
+                    stderr=subprocess.STDOUT,
                 )
+                server_procs.append((srv_proc, srv_f))
+                time.sleep(0.1)
         time.sleep(1)
 
-        # ARP warm-up: actively build host table via repeated probes
-        # Forces Packet-In on every switch, letting Ryu complete host mapping
-        print("  ARP warm-up: actively building host table...")
-        for src_name, dst_name in all_flows:
-            src = net.get(src_name)
-            dst = net.get(dst_name)
-            if src and dst:
-                for _ in range(3):
-                    src.cmd(f"ping -c 1 -W 2 {dst.IP()}")
-                check = src.cmd(f"ping -c 1 -W 2 {dst.IP()}")
-                status = "OK" if "64 bytes from" in check else "FAILED"
-                print(f"    {src_name} -> {dst_name} ({dst.IP()}): {status}")
-        time.sleep(2)
-
-        # === Phase 1: Start 4 background flows at t=0 ===
+        # === Phase 1: Start 3 background flows at t=0 ===
         print(f"  Phase 1: Starting {len(BACKGROUND_FLOWS)} background flows...")
+        client_procs = []
         for i, (src_name, dst_name) in enumerate(BACKGROUND_FLOWS):
             src = net.get(src_name)
             dst = net.get(dst_name)
             if src and dst:
                 port = BASE_PORT + i + 1
-                src.cmd(
+                log_path = f"/tmp/iperf_flow{i+1}.log"
+                if os.path.exists(log_path):
+                    os.remove(log_path)
+                f = open(log_path, "w")
+                proc = src.popen(
                     f"iperf -c {dst.IP()} -u -b {UDP_BANDWIDTH}M -p {port} "
-                    f"-t {TEST_DURATION} -i 5 "
-                    f"> /tmp/iperf_flow{i+1}.log 2>&1 &"
+                    f"-t {TEST_DURATION} -i 5",
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
                 )
-                print(f"    Flow {i+1}: {src_name}->{dst_name} started")
+                client_procs.append((proc, f))
+                time.sleep(1)  # Stagger starts to avoid PTY race
+                print(f"    Flow {i+1}: {src_name}->{dst_name} started (pid={proc.pid})")
 
-        # Wait, then start burst flow
-        print(f"  Waiting {BURST_DELAY}s before burst...")
+        # Wait before burst ramp-up
+        print(f"  Waiting {BURST_DELAY}s before burst ramp-up...")
         time.sleep(BURST_DELAY)
 
-        # === Phase 2: Start 5th burst flow at t=BURST_DELAY ===
-        remaining = TEST_DURATION - BURST_DELAY
-        src_b = net.get(BURST_FLOW[0])
-        dst_b = net.get(BURST_FLOW[1])
-        if src_b and dst_b:
-            port = BASE_PORT + 5
-            src_b.cmd(
-                f"iperf -c {dst_b.IP()} -u -b {UDP_BANDWIDTH}M -p {port} "
-                f"-t {remaining} -i 5 "
-                f"> /tmp/iperf_flow5.log 2>&1 &"
-            )
-            print(f"  Flow 5 (burst): {BURST_FLOW[0]}->{BURST_FLOW[1]} started")
+        # === Phase 2: Ramp-up burst — 3 sub-flows staggered by BURST_STAGGER ===
+        n_bg = len(BACKGROUND_FLOWS)
+        for j, (src_name, dst_name) in enumerate(BURST_SUBFLOWS):
+            if j > 0:
+                time.sleep(BURST_STAGGER)
+            remaining = TEST_DURATION - BURST_DELAY - j * BURST_STAGGER
+            if remaining <= 0:
+                continue
+            src = net.get(src_name)
+            dst = net.get(dst_name)
+            if src and dst:
+                port = BASE_PORT + n_bg + j + 1
+                log_path = f"/tmp/iperf_burst{j}.log"
+                if os.path.exists(log_path):
+                    os.remove(log_path)
+                f = open(log_path, "w")
+                proc = src.popen(
+                    f"iperf -c {dst.IP()} -u -b {BURST_SUB_BW}M -p {port} "
+                    f"-t {remaining} -i 5",
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                )
+                client_procs.append((proc, f))
+                time.sleep(1)
+                print(
+                    f"  Sub-flow {chr(65+j)}: {src_name}->{dst_name} "
+                    f"@ {BURST_SUB_BW}Mbps started (pid={proc.pid})"
+                )
 
-        print(f"  Running test for remaining {remaining + 5}s...")
-        time.sleep(remaining + 5)
+        # Wait for all flows to complete and flush logs
+        last_burst_start = BURST_DELAY + (len(BURST_SUBFLOWS) - 1) * BURST_STAGGER
+        wait_time = TEST_DURATION - last_burst_start + 5
+        print(f"  Running test for remaining {wait_time}s...")
+        time.sleep(wait_time)
+
+        # Terminate and wait for all iperf processes to flush output
+        for proc, f in client_procs:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            f.close()
+        for proc, f in server_procs:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            f.close()
+
+        # Debug: dump flow rules on key switches
+        for dpid in [1, 9, 10, 15, 16, 7, 17, 19]:
+            flows = os.popen(f"ovs-ofctl dump-flows s{dpid} -O OpenFlow13 2>/dev/null").read()
+            flow_lines = [l.strip() for l in flows.split('\n') if 'cookie' in l and 'actions' in l]
+            print(f"    [DBG flows] s{dpid}: {len(flow_lines)} rules")
+            for fl in flow_lines[:5]:
+                print(f"      {fl[:150]}")
+        for i in range(len(BACKGROUND_FLOWS)):
+            path = f"/tmp/iperf_flow{i+1}.log"
+            exists = os.path.exists(path)
+            sz = os.path.getsize(path) if exists else -1
+            print(f"    [DBG] {path}: exists={exists}, size={sz}")
+            spath = f"/tmp/iperf_server_flow{i+1}.log"
+            if os.path.exists(spath):
+                with open(spath) as df:
+                    content = df.read()
+                    print(f"    [DBG server] {spath}: {content[:300]}")
+        for j in range(len(BURST_SUBFLOWS)):
+            path = f"/tmp/iperf_burst{j}.log"
+            exists = os.path.exists(path)
+            sz = os.path.getsize(path) if exists else -1
+            print(f"    [DBG] {path}: exists={exists}, size={sz}")
 
         # Collect results from client logs + server logs
-        flow_labels = [f"Flow {i+1}" for i in range(len(BACKGROUND_FLOWS))] + ["Flow 5"]
-        for flow_label, (src_name, dst_name) in zip(flow_labels, all_flows):
-            flow_num = flow_label.replace("Flow ", "")
-            client_log = f"/tmp/iperf_flow{flow_num}.log"
-            server_log = f"/tmp/iperf_server_flow{flow_num}.log"
+        n_bg = len(BACKGROUND_FLOWS)
 
-            loss, jitter, bw = 0.0, 0.0, 0.0
-            source = "none"
-
-            # Try client log first (has send-side data + server report if received)
-            if os.path.exists(client_log):
-                with open(client_log) as f:
-                    client_output = f.read()
-                loss, jitter, bw = parse_iperf_udp_output(
-                    client_output, expected_bw_mbps=UDP_BANDWIDTH
-                )
-                source = "client"
-
-            # If client shows 0% loss but 0 bandwidth, try server log
-            # (server log has the authoritative received-side statistics)
-            if os.path.exists(server_log):
-                with open(server_log) as f:
-                    server_output = f.read()
-                s_loss, s_jitter, s_bw = parse_iperf_udp_output(server_output)
-                # Use server data if it has more info
-                if s_bw > 0 and (bw == 0 or source == "none"):
-                    loss, jitter, bw = s_loss, s_jitter, s_bw
-                    source = "server"
-
+        # Background flows: one log each
+        for i, (src_name, dst_name) in enumerate(BACKGROUND_FLOWS):
+            flow_label = f"Flow {i+1}"
+            loss, jitter, bw = _collect_flow_result(
+                f"/tmp/iperf_flow{i+1}.log",
+                f"/tmp/iperf_server_flow{i+1}.log",
+                UDP_BANDWIDTH,
+            )
             results[flow_label] = {
                 "loss_pct": loss,
                 "jitter_ms": jitter,
                 "bandwidth_mbps": bw,
             }
-
             if bw > 0:
                 print(
                     f"    {flow_label} ({src_name}->{dst_name}): "
-                    f"loss={loss:.1f}%, jitter={jitter:.3f}ms, bw={bw:.1f}Mbps [{source}]"
+                    f"loss={loss:.1f}%, jitter={jitter:.3f}ms, bw={bw:.1f}Mbps"
                 )
             else:
                 print(f"    {flow_label} ({src_name}->{dst_name}): no data")
+
+        # Burst sub-flows: aggregate into "Flow 4 (burst)"
+        burst_losses, burst_jitters, burst_bws = [], [], []
+        for j, (src_name, dst_name) in enumerate(BURST_SUBFLOWS):
+            loss, jitter, bw = _collect_flow_result(
+                f"/tmp/iperf_burst{j}.log",
+                f"/tmp/iperf_server_flow{n_bg + j + 1}.log",
+                BURST_SUB_BW,
+            )
+            if bw > 0:
+                burst_losses.append(loss)
+                burst_jitters.append(jitter)
+                burst_bws.append(bw)
+            print(
+                f"    Sub-flow {chr(65+j)} ({src_name}->{dst_name}): "
+                f"loss={loss:.1f}%, jitter={jitter:.3f}ms, bw={bw:.1f}Mbps"
+            )
+
+        if burst_bws:
+            results["Flow 4 (burst)"] = {
+                "loss_pct": sum(burst_losses) / len(burst_losses),
+                "jitter_ms": sum(burst_jitters) / len(burst_jitters),
+                "bandwidth_mbps": sum(burst_bws),
+            }
+        else:
+            results["Flow 4 (burst)"] = {
+                "loss_pct": 0,
+                "jitter_ms": 0,
+                "bandwidth_mbps": 0,
+            }
 
     finally:
         if net is not None:
@@ -301,33 +458,41 @@ def run_experiment_group(group_name, controller_script):
 
 def print_summary(all_results):
     """Print comparative summary of all experiment groups."""
+    n_bg = len(BACKGROUND_FLOWS)
+    n_burst = len(BURST_SUBFLOWS)
+    total_bw = n_bg * UDP_BANDWIDTH + n_burst * BURST_SUB_BW
     print(f"\n{'='*60}")
-    print(f"EXPERIMENT SUMMARY: Pigeonhole Collision")
+    print(f"EXPERIMENT SUMMARY: Probabilistic Hash Collision + Ramp-up")
     print(f"{'='*60}")
     print(f"Topology: Fat-Tree k=4, 4 equal-cost Core paths (Pod 0 <-> Pod 3)")
-    print(f"Link capacity: {CORE_LINK_BW}Mbps per link, {4 * CORE_LINK_BW}Mbps total cross-section")
-    print(f"Background: 4 x {UDP_BANDWIDTH}Mbps = {4 * UDP_BANDWIDTH}Mbps (Phase 1)")
     print(
-        f"Burst:      1 x {UDP_BANDWIDTH}Mbps = {UDP_BANDWIDTH}Mbps (Phase 2, t={BURST_DELAY}s)"
+        f"Link capacity: {CORE_LINK_BW}Mbps per link, {4 * CORE_LINK_BW}Mbps total cross-section"
     )
     print(
-        f"Total:      5 x {UDP_BANDWIDTH}Mbps = {5 * UDP_BANDWIDTH}Mbps > {4 * CORE_LINK_BW}Mbps capacity"
+        f"Background: {n_bg} x {UDP_BANDWIDTH}Mbps = {n_bg * UDP_BANDWIDTH}Mbps (Phase 1)"
     )
     print(
-        f"Guarantee:  Pigeonhole principle -> at least 1 link carries 2 flows ({2 * UDP_BANDWIDTH}Mbps > {CORE_LINK_BW}Mbps)"
+        f"Burst:      {n_burst} x {BURST_SUB_BW}Mbps = {n_burst * BURST_SUB_BW}Mbps "
+        f"(ramp-up, t={BURST_DELAY}s, stagger={BURST_STAGGER}s)"
+    )
+    print(f"Total:      {total_bw}Mbps on {4 * CORE_LINK_BW}Mbps capacity")
+    print(
+        f"Collision:  25% probability hash collision -> "
+        f"2 flows on 1 link ({UDP_BANDWIDTH + BURST_SUB_BW:.1f}Mbps > {CORE_LINK_BW}Mbps)"
     )
     print()
 
-    header = f"{'Group':<15} {'Flow':<8} {'Loss%':>8} {'Jitter':>10} {'BW':>10}"
+    flow_names = [f"Flow {i+1}" for i in range(n_bg)] + ["Flow 4 (burst)"]
+    header = f"{'Group':<15} {'Flow':<16} {'Loss%':>8} {'Jitter':>10} {'BW':>10}"
     print(header)
     print("-" * len(header))
 
     for group, results in all_results.items():
         if not results:
-            print(f"{group:<15} {'':8} {'N/A':>8} {'N/A':>10} {'N/A':>10}")
+            print(f"{group:<15} {'':16} {'N/A':>8} {'N/A':>10} {'N/A':>10}")
             continue
 
-        for flow_name in [f"Flow {i+1}" for i in range(4)] + ["Flow 5"]:
+        for flow_name in flow_names:
             if flow_name in results:
                 r = results[flow_name]
                 loss_str = f"{r['loss_pct']:.1f}%" if r["loss_pct"] >= 0 else "N/A"
@@ -337,9 +502,8 @@ def print_summary(all_results):
                     if r["bandwidth_mbps"] >= 0
                     else "N/A"
                 )
-                tag = " (burst)" if flow_name == "Flow 5" else ""
                 print(
-                    f"{group:<15} {flow_name + tag:<16} {loss_str:>8} {jitter_str:>10} {bw_str:>10}"
+                    f"{group:<15} {flow_name:<16} {loss_str:>8} {jitter_str:>10} {bw_str:>10}"
                 )
         print()
 
@@ -359,7 +523,7 @@ def main():
         help="Which group to test",
     )
     parser.add_argument("--duration", type=int, default=TEST_DURATION)
-    parser.add_argument("--bw", type=int, default=UDP_BANDWIDTH)
+    parser.add_argument("--bw", type=float, default=UDP_BANDWIDTH)
     parser.add_argument("--burst-delay", type=int, default=BURST_DELAY)
     args = parser.parse_args()
 
@@ -367,12 +531,12 @@ def main():
     UDP_BANDWIDTH = args.bw
     BURST_DELAY = args.burst_delay
 
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.join(PROJECT_ROOT, "data"), exist_ok=True)
 
     # Thorough cleanup before starting
-    os.system("mn -c 2>/dev/null")
-    os.system("killall -9 iperf 2>/dev/null")
     os.system("pkill -f ryu-manager 2>/dev/null")
+    time.sleep(1)
+    cleanup()
     time.sleep(2)
 
     if args.group == "all":

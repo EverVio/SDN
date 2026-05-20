@@ -117,14 +117,13 @@ def configure_select_hash():
 
 
 def cleanup():
-    """Remove all Fat-Tree OVS bridges, namespaces, and veth pairs."""
+    """Remove all OVS bridges, namespaces, and veth pairs."""
     os.system("mn -c 2>/dev/null")
     os.system("killall -9 iperf 2>/dev/null")
-    for pod in range(PODS):
-        for i in range(EDGE_PER_POD):
-            os.system(f"ovs-vsctl --if-exists del-br s{_edge_dpid(pod, i)} 2>/dev/null")
-        for i in range(AGG_PER_POD):
-            os.system(f"ovs-vsctl --if-exists del-br s{_agg_dpid(pod, i)} 2>/dev/null")
-    for i in range((K // 2) ** 2):
-        os.system(f"ovs-vsctl --if-exists del-br s{_core_dpid(i)} 2>/dev/null")
+    # Remove ALL OVS bridges (including leftovers from previous experiments)
+    output = os.popen("ovs-vsctl list-br 2>/dev/null").read()
+    for br in output.strip().split("\n"):
+        br = br.strip()
+        if br:
+            os.system(f"ovs-vsctl --if-exists del-br {br} 2>/dev/null")
     print("Fat-Tree cleanup completed.")

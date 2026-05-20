@@ -47,19 +47,40 @@ class ThresholdBalancer(BaseBalancer):
         self.decision_thread = hub.spawn(self._decision_loop)
 
     def _safe_flood(self, datapath, in_port, msg):
-        """安全无环洪泛：生成树骨干端口（防环）+ 边缘端口（达主机）"""
+        """
+        安全无环泛洪机制
+        修复：将所有合法出端口组合进单个 actions 列表发送，避免 OpenFlow 缓冲区被首次 PacketOut 提前消耗导致后续泛洪失败。
+        """
         dpid = datapath.id
         st_ports = self.topo.compute_spanning_tree_ports().get(dpid, set())
-
-        # 使用 list() 获取当前端口键的静态快照
-        # 避免 Ryu 拓扑发现模块在其他协程中异步增删端口导致字典大小改变引发崩溃
         active_ports = list(datapath.ports.keys())
 
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        actions = []
+
+        # 收集所有允许转发的端口（生成树骨干端口 + 边缘接入端口）
         for port_no in active_ports:
-            if port_no >= datapath.ofproto.OFPP_MAX or port_no == in_port:
+            if port_no >= ofproto.OFPP_MAX or port_no == in_port:
                 continue
             if self.topo.is_edge_port(dpid, port_no) or port_no in st_ports:
-                self._send_packet(datapath, in_port, port_no, msg)
+                actions.append(parser.OFPActionOutput(port_no))
+
+        if not actions:
+            return
+
+        # 仅当 buffer_id 无效时携带完整 packet data，减轻控制通道负载
+        data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+
+        # 使用单个 PacketOut 聚合所有输出动作
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data,
+        )
+        datapath.send_msg(out)
 
     # ──────────────────────────────────────────────
     # BaseBalancer 抽象方法实现
@@ -125,9 +146,12 @@ class ThresholdBalancer(BaseBalancer):
                     return
             self.broadcast_cache[cache_key] = now
 
-        self.topo.learn_host(src, dpid, in_port)
+        # 仅从边缘接入端口学习主机位置，防止骨干网交换机在泛洪期间错误覆写主机拓扑位置
+        if self.topo.is_edge_port(dpid, in_port):
+            self.topo.learn_host(src, dpid, in_port)
 
         self.mac_to_port.setdefault(dpid, {})
+
         if src not in self.mac_to_port[dpid]:
             self.mac_to_port[dpid][src] = in_port
 
@@ -150,47 +174,33 @@ class ThresholdBalancer(BaseBalancer):
         # Data packet handling
         self._install_reverse_rule(datapath, src, in_port)
 
-        if dst in self.topo.host_table and src in self.topo.host_table:
-            session_key = (src, dst)
-            if session_key not in self.active_sessions:
-                self._compute_and_install_path(src, dst)
+        session_key = (src, dst)
+        if session_key not in self.active_sessions:
+            self._compute_and_install_path(src, dst)
 
-            if session_key in self.active_sessions:
-                session = self.active_sessions[session_key]
-                session["last_seen"] = time.time()
-                fwd_ports = (
-                    session["alt_fwd_ports"]
-                    if session.get("using_alt")
-                    else session["fwd_ports"]
-                )
-                out_port = fwd_ports.get(dpid)
-                if out_port is not None:
-                    buf_id = (
-                        msg.buffer_id
-                        if msg.buffer_id != ofproto.OFP_NO_BUFFER
-                        else None
-                    )
-                    match = parser.OFPMatch(eth_src=src, eth_dst=dst)
-                    actions = [parser.OFPActionOutput(out_port)]
-                    if buf_id is not None:
-                        self.add_flow(
-                            datapath,
-                            PRIORITY_ACTIVE_PATH,
-                            match,
-                            actions,
-                            buf_id,
-                            idle_timeout=FLOW_IDLE_TIMEOUT,
-                        )
-                    else:
-                        self.add_flow(
-                            datapath,
-                            PRIORITY_ACTIVE_PATH,
-                            match,
-                            actions,
-                            idle_timeout=FLOW_IDLE_TIMEOUT,
-                        )
-                        self._send_packet(datapath, in_port, out_port, msg)
-                    return
+        if session_key in self.active_sessions:
+            session = self.active_sessions[session_key]
+            session["last_seen"] = time.time()
+
+            # Reinstall flow rules if they have likely expired
+            now = time.time()
+            if now - session.get("last_install", 0) > FLOW_IDLE_TIMEOUT + 5:
+                fwd = session["alt_fwd_ports"] if session.get("using_alt") else session["fwd_ports"]
+                rev = session["alt_rev_ports"] if session.get("using_alt") else session["rev_ports"]
+                self._install_path_rules(src, dst, fwd)
+                self._install_path_rules(dst, src, rev)
+                session["last_install"] = now
+
+            fwd_ports = (
+                session["alt_fwd_ports"]
+                if session.get("using_alt")
+                else session["fwd_ports"]
+            )
+            out_port = fwd_ports.get(dpid)
+
+            if out_port is not None:
+                self._send_packet(datapath, in_port, out_port, msg)
+                return
 
         # Destination unknown or path not available: safe flood
         self._safe_flood(datapath, in_port, msg)
@@ -276,22 +286,43 @@ class ThresholdBalancer(BaseBalancer):
                 self.add_flow(
                     dp, priority, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT
                 )
+                self.logger.info("Flow installed (OF): s%d %s->%s out=%d", dpid, src_mac, dst_mac, out_port)
+            else:
+                self.add_flow_ovs(
+                    dpid, priority,
+                    f"dl_src={src_mac},dl_dst={dst_mac}",
+                    f"output={out_port}",
+                    idle_timeout=FLOW_IDLE_TIMEOUT,
+                )
+                self.logger.info("Flow installed (OVS): s%d %s->%s out=%d", dpid, src_mac, dst_mac, out_port)
 
     def _compute_and_install_path(self, src_mac, dst_mac):
         src_loc = self.topo.get_host_location(src_mac)
         dst_loc = self.topo.get_host_location(dst_mac)
         if not src_loc or not dst_loc:
+            self.logger.warning("Path compute failed: src_loc=%s, dst_loc=%s for %s->%s",
+                                src_loc, dst_loc, src_mac, dst_mac)
             return
 
         src_dpid, dst_dpid = src_loc[0], dst_loc[0]
+        src_port, dst_port = src_loc[1], dst_loc[1]
 
         # Compute primary path (shortest)
         result = self.topo.compute_optimal_path(src_dpid, dst_dpid)
         if not result:
+            self.logger.warning("No path found: s%d -> s%d", src_dpid, dst_dpid)
             return
 
         path_nodes, cost = result
         fwd, rev = self.topo.path_to_ports(path_nodes)
+
+        # 修复：补全最后一跳交换机到主机的边界接入端口
+        fwd[dst_dpid] = dst_port
+        rev[src_dpid] = src_port
+
+        self.logger.info("Path computed: %s->%s path=%s fwd=%s rev=%s",
+                         src_mac, dst_mac, path_nodes, dict(fwd), dict(rev))
+
         util_keys = self.topo.get_path_util_keys(fwd, rev)
 
         # Compute alternative path (edge-disjoint)
@@ -299,6 +330,9 @@ class ThresholdBalancer(BaseBalancer):
         if alt_result:
             alt_path, alt_cost = alt_result
             alt_fwd, alt_rev = self.topo.path_to_ports(alt_path)
+            # 修复：备选路径同样需要补全最后一跳交换机到主机的边界接入端口
+            alt_fwd[dst_dpid] = dst_port
+            alt_rev[src_dpid] = src_port
             alt_util_keys = self.topo.get_path_util_keys(alt_fwd, alt_rev)
         else:
             alt_path, alt_fwd, alt_rev, alt_util_keys = path_nodes, fwd, rev, util_keys
@@ -315,19 +349,12 @@ class ThresholdBalancer(BaseBalancer):
             "alt_util_keys": alt_util_keys,
             "using_alt": False,
             "last_seen": time.time(),
+            "last_install": time.time(),
         }
 
-        # Install primary path rules
+        # Install rules across the complete host-to-host path
         self._install_path_rules(src_mac, dst_mac, fwd)
         self._install_path_rules(dst_mac, src_mac, rev)
-
-        self.logger.info(
-            "Path installed: %s -> %s, nodes=%s, alt=%s",
-            src_mac,
-            dst_mac,
-            path_nodes,
-            alt_path,
-        )
 
     # ──────────────────────────────────────────────
     # 阈值决策循环
@@ -376,6 +403,7 @@ class ThresholdBalancer(BaseBalancer):
                     self._install_path_rules(src_mac, dst_mac, session["alt_fwd_ports"])
                     self._install_path_rules(dst_mac, src_mac, session["alt_rev_ports"])
                     session["using_alt"] = True
+                    session["last_install"] = now
 
                 # Threshold switching back: alt congested AND primary is better
                 elif using_alt and alt_util > 0.70 and primary_util < 0.50:
@@ -390,6 +418,7 @@ class ThresholdBalancer(BaseBalancer):
                     self._install_path_rules(src_mac, dst_mac, session["fwd_ports"])
                     self._install_path_rules(dst_mac, src_mac, session["rev_ports"])
                     session["using_alt"] = False
+                    session["last_install"] = now
 
             # Clean up stale sessions
             now = time.time()

@@ -9,7 +9,7 @@ class StatsMixin:
     """端口统计采集模块，可被任何 RyuApp 多重继承"""
 
     # 轮询参数
-    LINK_BW = 10_000_000  # 10 Mbps
+    LINK_BW = 2_000_000  # 10 Mbps
     POLL_NORMAL = 3  # 正常轮询间隔（秒）
     POLL_IDLE = 5  # 空闲时轮询间隔
     POLL_WARNING = 3  # 高负载时轮询间隔

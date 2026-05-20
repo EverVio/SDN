@@ -15,8 +15,8 @@ class TopologyManager:
 
     def __init__(self):
         self.G = nx.DiGraph()
-        self.host_table = {}          # MAC -> (dpid, port)
-        self.link_ports = {}          # (src_dpid, dst_dpid) -> out_port
+        self.host_table = {}  # MAC -> (dpid, port)
+        self.link_ports = {}  # (src_dpid, dst_dpid) -> out_port
         self._st_ports_cache = None
 
     # ──────────────────────────────────────────────
@@ -32,12 +32,10 @@ class TopologyManager:
         if self.G.has_node(dpid):
             self.G.remove_node(dpid)
             self.link_ports = {
-                k: v for k, v in self.link_ports.items()
-                if dpid not in k
+                k: v for k, v in self.link_ports.items() if dpid not in k
             }
             self.host_table = {
-                mac: loc for mac, loc in self.host_table.items()
-                if loc[0] != dpid
+                mac: loc for mac, loc in self.host_table.items() if loc[0] != dpid
             }
             self._recompute_spanning_tree()
 
@@ -97,17 +95,17 @@ class TopologyManager:
     def set_edge_weight(self, src_dpid, dst_dpid, weight):
         """Set weight on a directed edge (both directions)."""
         if self.G.has_edge(src_dpid, dst_dpid):
-            self.G[src_dpid][dst_dpid]['weight'] = weight
+            self.G[src_dpid][dst_dpid]["weight"] = weight
         if self.G.has_edge(dst_dpid, src_dpid):
-            self.G[dst_dpid][src_dpid]['weight'] = weight
+            self.G[dst_dpid][src_dpid]["weight"] = weight
 
     def get_edge_weight(self, src_dpid, dst_dpid):
         """Get weight of a directed edge, default 1.0."""
         if self.G.has_edge(src_dpid, dst_dpid):
-            return self.G[src_dpid][dst_dpid].get('weight', 1.0)
-        return float('inf')
+            return self.G[src_dpid][dst_dpid].get("weight", 1.0)
+        return float("inf")
 
-    def _path_cost(self, path, weight='weight'):
+    def _path_cost(self, path, weight="weight"):
         """Compute total weight of a path (list of nodes)."""
         cost = 0.0
         for i in range(len(path) - 1):
@@ -115,7 +113,7 @@ class TopologyManager:
             cost += edge_data.get(weight, 1.0)
         return cost
 
-    def compute_optimal_path(self, src_dpid, dst_dpid, weight='weight'):
+    def compute_optimal_path(self, src_dpid, dst_dpid, weight="weight"):
         """Compute the single optimal (shortest) path using Dijkstra.
 
         Returns:
@@ -131,7 +129,7 @@ class TopologyManager:
         cost = self._path_cost(path_nodes, weight)
         return path_nodes, cost
 
-    def compute_ecmp_path(self, src_dpid, dst_dpid, src_mac, dst_mac, weight='weight'):
+    def compute_ecmp_path(self, src_dpid, dst_dpid, src_mac, dst_mac, weight="weight"):
         """Compute shortest path with ECMP-aware selection for Fat-Tree.
 
         When multiple equal-cost shortest paths exist, selects one based on
@@ -146,7 +144,9 @@ class TopologyManager:
         if not nx.has_path(self.G, src_dpid, dst_dpid):
             return None
 
-        all_paths = list(nx.all_shortest_paths(self.G, src_dpid, dst_dpid, weight=weight))
+        all_paths = list(
+            nx.all_shortest_paths(self.G, src_dpid, dst_dpid, weight=weight)
+        )
 
         if not all_paths:
             return None
@@ -161,7 +161,9 @@ class TopologyManager:
         cost = self._path_cost(path_nodes, weight)
         return path_nodes, cost
 
-    def compute_alternative_path(self, src_dpid, dst_dpid, primary_path, weight='weight'):
+    def compute_alternative_path(
+        self, src_dpid, dst_dpid, primary_path, weight="weight"
+    ):
         """Compute an alternative shortest path by temporarily removing primary path edges.
 
         Returns:
@@ -174,11 +176,11 @@ class TopologyManager:
         for i in range(len(primary_path) - 1):
             u, v = primary_path[i], primary_path[i + 1]
             if self.G.has_edge(u, v):
-                w = self.G[u][v].get('weight', 1.0)
+                w = self.G[u][v].get("weight", 1.0)
                 self.G.remove_edge(u, v)
                 removed.append((u, v, w))
             if self.G.has_edge(v, u):
-                w = self.G[v][u].get('weight', 1.0)
+                w = self.G[v][u].get("weight", 1.0)
                 self.G.remove_edge(v, u)
                 removed.append((v, u, w))
 
@@ -193,7 +195,7 @@ class TopologyManager:
 
         return result
 
-    def enumerate_all_shortest_paths(self, src_dpid, dst_dpid, weight='weight'):
+    def enumerate_all_shortest_paths(self, src_dpid, dst_dpid, weight="weight"):
         """Enumerate all equal-cost shortest paths between two switches.
 
         Returns:
@@ -206,15 +208,9 @@ class TopologyManager:
         return list(nx.all_shortest_paths(self.G, src_dpid, dst_dpid, weight=weight))
 
     def get_core_facing_ports(self, dpid):
-        """Return [(port_no, core_dpid), ...] for an aggregation switch's core-facing ports.
-
-        DPID ranges (Mininet passes dpid as hex to OVS):
-          Edge switches:  0x01-0x08 → decimal 1-8
-          Agg switches:   0x09-0x16 → decimal 9-22
-          Core switches:  0x17-0x20 → decimal 23-32
-        """
-        CORE_DPID_MIN = 23   # 0x17
-        CORE_DPID_MAX = 32   # 0x20
+        """Return [(port_no, core_dpid), ...] for an aggregation switch's core-facing ports."""
+        CORE_DPID_MIN = 17  # Fat-Tree k=4 核心交换机真实十进制 DPID 起始为 17
+        CORE_DPID_MAX = 20  # 核心交换机真实十进制 DPID 结束为 20
         ports = []
         if not self.G.has_node(dpid):
             return ports
