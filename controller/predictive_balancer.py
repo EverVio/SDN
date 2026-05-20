@@ -14,6 +14,7 @@ from controller.weight_engine import DynamicWeightEngine
 class PredictiveBalancer(BaseBalancer):
     def __init__(self, *args, **kwargs):
         super(PredictiveBalancer, self).__init__(*args, **kwargs)
+        self.override_installed = False
         self.init_stats()
         model_path = os.path.join(
             os.path.dirname(__file__), "..", "models", "global_mlp_model.pkl"
@@ -80,39 +81,47 @@ class PredictiveBalancer(BaseBalancer):
         self.configured_switches.add(dpid)
 
     def _decision_loop(self):
-        WEIGHT_DEADBAND = 0.15
-        last_ratios = {}
-
         while True:
             hub.sleep(self.POLL_INTERVAL)
             if not self.datapaths:
                 continue
 
+            # 1. 喂入当前全网链路利用率快照并执行全局矩阵预测
             self.weight_engine.update_all_utilizations(self.link_utilization)
             self.weight_engine.predict_all()
 
-            # 完美兼容原 weight_engine 的矩阵数学预测决策，直接映射回 Group Table Bucket 调权
+            # 2. 获取动态计算出的汇聚层交换机组表整数权重（内部已包含 10% 变化死区控制）
             group_weights = self.weight_engine.get_group_weights(self.topo)
-            for agg_dpid, port_weight_pairs in group_weights.items():
-                if agg_dpid not in self.datapaths:
-                    continue
-                dp = self.datapaths[agg_dpid]
-                buckets = []
-                for port_no, weight in port_weight_pairs:
-                    buckets.append(
-                        dp.ofproto_parser.OFPBucket(
-                            weight=weight,
-                            watch_port=port_no,
-                            watch_group=dp.ofproto.OFPG_ANY,
-                            actions=[dp.ofproto_parser.OFPActionOutput(port_no)],
-                        )
+
+            # 3. 遍历所有发生权重显著变化的汇聚交换机，在线修正组表 Bucket 比例
+            for dpid, weights in group_weights.items():
+                if dpid in self.datapaths:
+                    self._modify_group_weights(
+                        self.datapaths[dpid], group_id=1, weights=weights
                     )
-                dp.send_msg(
-                    dp.ofproto_parser.OFPGroupMod(
-                        datapath=dp,
-                        command=dp.ofproto.OFPGC_MODIFY,
-                        type_=dp.ofproto.OFPGT_SELECT,
-                        group_id=1,
-                        buckets=buckets,
-                    )
+
+    def _modify_group_weights(self, datapath, group_id, weights):
+        """动态修改指定汇聚交换机组表的 Bucket 权重，实现全网流无损平滑负载均衡"""
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        buckets = []
+        for port, weight in weights:
+            buckets.append(
+                parser.OFPBucket(
+                    weight=weight,  # 动态预测空闲带宽占比
+                    watch_port=port,
+                    watch_group=ofproto.OFPG_ANY,
+                    actions=[parser.OFPActionOutput(port)],
                 )
+            )
+
+        # 使用 OFPGC_MODIFY 核心命令在线更新组表，无路由震荡和断流风险
+        msg = parser.OFPGroupMod(
+            datapath=datapath,
+            command=ofproto.OFPGC_MODIFY,
+            type_=ofproto.OFPGT_SELECT,
+            group_id=group_id,
+            buckets=buckets,
+        )
+        datapath.send_msg(msg)

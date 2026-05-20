@@ -13,8 +13,11 @@ from controller.base_balancer import BaseBalancer
 class ThresholdBalancer(BaseBalancer):
     def __init__(self, *args, **kwargs):
         super(ThresholdBalancer, self).__init__(*args, **kwargs)
-        self.override_installed = False
         self.init_stats()
+        # 不传入 model_path， weight_engine 内部自动退化为基于当前实测利用率计算权重
+        from controller.weight_engine import DynamicWeightEngine
+
+        self.weight_engine = DynamicWeightEngine(model_path=None)
         self.decision_thread = hub.spawn(self._decision_loop)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -39,7 +42,7 @@ class ThresholdBalancer(BaseBalancer):
             for port in [3, 4]:
                 buckets.append(
                     parser.OFPBucket(
-                        weight=1,
+                        weight=50,
                         watch_port=port,
                         watch_group=ofproto.OFPG_ANY,
                         actions=[parser.OFPActionOutput(port)],
@@ -78,44 +81,34 @@ class ThresholdBalancer(BaseBalancer):
     def _decision_loop(self):
         while True:
             hub.sleep(self.POLL_INTERVAL)
-            if 9 not in self.datapaths:
+            if not self.datapaths:
                 continue
-                
-            util_p3 = self.link_utilization.get((9, 3), 0.0)
-            
-            dp = self.datapaths[9]
-            # 当检测到端口 3 拥塞超过 70%，反应式地将权重大幅拉向端口 4
-            if not self.override_installed and util_p3 > 0.70:
-                buckets = [
-                    dp.ofproto_parser.OFPBucket(
-                        weight=20, watch_port=3, watch_group=dp.ofproto.OFPG_ANY,
-                        actions=[dp.ofproto_parser.OFPActionOutput(3)]
-                    ),
-                    dp.ofproto_parser.OFPBucket(
-                        weight=80, watch_port=4, watch_group=dp.ofproto.OFPG_ANY,
-                        actions=[dp.ofproto_parser.OFPActionOutput(4)]
+
+            # 仅更新当前利用率，不执行 predict_all() 预测
+            self.weight_engine.update_all_utilizations(self.link_utilization)
+
+            # 直接基于当前实测的剩余带宽计算组表权重
+            group_weights = self.weight_engine.get_group_weights(self.topo)
+
+            # 协同修正全网汇聚层组表
+            for dpid, weights in group_weights.items():
+                if dpid in self.datapaths:
+                    ofproto = self.datapaths[dpid].ofproto
+                    parser = self.datapaths[dpid].ofproto_parser
+                    buckets = [
+                        parser.OFPBucket(
+                            weight=w,
+                            watch_port=p,
+                            watch_group=ofproto.OFPG_ANY,
+                            actions=[parser.OFPActionOutput(p)],
+                        )
+                        for p, w in weights
+                    ]
+                    msg = parser.OFPGroupMod(
+                        datapath=self.datapaths[dpid],
+                        command=ofproto.OFPGC_MODIFY,
+                        type_=ofproto.OFPGT_SELECT,
+                        group_id=1,
+                        buckets=buckets,
                     )
-                ]
-                dp.send_msg(dp.ofproto_parser.OFPGroupMod(
-                    datapath=dp, command=dp.ofproto.OFPGC_MODIFY,
-                    type_=dp.ofproto.OFPGT_SELECT, group_id=1, buckets=buckets
-                ))
-                self.override_installed = True
-                
-            # 流量下降后恢复 50:50 均衡配置
-            elif self.override_installed and util_p3 < 0.40:
-                buckets = [
-                    dp.ofproto_parser.OFPBucket(
-                        weight=50, watch_port=3, watch_group=dp.ofproto.OFPG_ANY,
-                        actions=[dp.ofproto_parser.OFPActionOutput(3)]
-                    ),
-                    dp.ofproto_parser.OFPBucket(
-                        weight=50, watch_port=4, watch_group=dp.ofproto.OFPG_ANY,
-                        actions=[dp.ofproto_parser.OFPActionOutput(4)]
-                    )
-                ]
-                dp.send_msg(dp.ofproto_parser.OFPGroupMod(
-                    datapath=dp, command=dp.ofproto.OFPGC_MODIFY,
-                    type_=dp.ofproto.OFPGT_SELECT, group_id=1, buckets=buckets
-                ))
-                self.override_installed = False
+                    self.datapaths[dpid].send_msg(msg)
