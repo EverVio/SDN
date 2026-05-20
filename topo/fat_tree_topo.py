@@ -5,9 +5,9 @@ from mininet.link import TCLink
 
 K = 4
 PODS = K
-EDGE_PER_POD = K // 2   # 2
-AGG_PER_POD = K // 2     # 2
-HOST_PER_EDGE = K // 2   # 2
+EDGE_PER_POD = K // 2
+AGG_PER_POD = K // 2
+HOST_PER_EDGE = K // 2
 
 BW_ACCESS = 100
 BW_EDGE_AGG = 100
@@ -15,79 +15,60 @@ BW_AGG_CORE = 2
 
 
 def _edge_dpid(pod, idx):
-    """Edge switch DPID: 1..8"""
     return pod * EDGE_PER_POD + idx + 1
 
 
 def _agg_dpid(pod, idx):
-    """Aggregation switch DPID: 9..16"""
     return PODS * EDGE_PER_POD + pod * AGG_PER_POD + idx + 1
 
 
 def _core_dpid(idx):
-    """Core switch DPID: 17..20"""
     return PODS * EDGE_PER_POD + PODS * AGG_PER_POD + idx + 1
 
 
 def create_topology(controller_ip="127.0.0.1", controller_port=6633):
-    """Create Fat-Tree k=4 topology.
-
-    Returns (net, controller) — caller is responsible for build/start/stop.
-    """
-    net = Mininet(
-        controller=None,
-        switch=OVSSwitch,
-        link=TCLink,
-        autoSetMacs=True,
-    )
-
+    net = Mininet(controller=None, switch=OVSSwitch, link=TCLink, autoSetMacs=True)
     c0 = net.addController(
-        "c0", controller=RemoteController,
-        ip=controller_ip, port=controller_port,
+        "c0", controller=RemoteController, ip=controller_ip, port=controller_port
     )
 
-    # Add switches
     for pod in range(PODS):
         for i in range(EDGE_PER_POD):
             dpid = _edge_dpid(pod, i)
-            net.addSwitch(f"s{dpid}", dpid=str(dpid), protocols="OpenFlow13")
+            net.addSwitch(f"s{dpid}", dpid=f"{dpid:016x}", protocols="OpenFlow13")
         for i in range(AGG_PER_POD):
             dpid = _agg_dpid(pod, i)
-            net.addSwitch(f"s{dpid}", dpid=str(dpid), protocols="OpenFlow13")
+            net.addSwitch(f"s{dpid}", dpid=f"{dpid:016x}", protocols="OpenFlow13")
 
     for i in range((K // 2) ** 2):
         dpid = _core_dpid(i)
-        net.addSwitch(f"s{dpid}", dpid=str(dpid), protocols="OpenFlow13")
+        net.addSwitch(f"s{dpid}", dpid=f"{dpid:016x}", protocols="OpenFlow13")
 
-    # Add hosts and access links
     for pod in range(PODS):
         for e_idx in range(EDGE_PER_POD):
             edge_dpid = _edge_dpid(pod, e_idx)
             for h_idx in range(HOST_PER_EDGE):
-                host_name = f"h{pod}_{e_idx * HOST_PER_EDGE + h_idx}"
-                host = net.addHost(host_name)
+                host = net.addHost(f"h{pod}_{e_idx * HOST_PER_EDGE + h_idx}")
                 net.addLink(host, net.get(f"s{edge_dpid}"), bw=BW_ACCESS)
 
-    # Edge <-> Aggregation links (within each pod)
     for pod in range(PODS):
         for e_idx in range(EDGE_PER_POD):
             edge_dpid = _edge_dpid(pod, e_idx)
             for a_idx in range(AGG_PER_POD):
-                agg_dpid = _agg_dpid(pod, a_idx)
                 net.addLink(
-                    net.get(f"s{edge_dpid}"), net.get(f"s{agg_dpid}"),
+                    net.get(f"s{edge_dpid}"),
+                    net.get(f"s{_agg_dpid(pod, a_idx)}"),
                     bw=BW_EDGE_AGG,
                 )
 
-    # Aggregation <-> Core links
     for pod in range(PODS):
         for a_idx in range(AGG_PER_POD):
             agg_dpid = _agg_dpid(pod, a_idx)
             for c_local in range(K // 2):
-                core_idx = a_idx * (K // 2) + c_local
-                core_dpid = _core_dpid(core_idx)
+                core_dpid = _core_dpid(a_idx * (K // 2) + c_local)
                 net.addLink(
-                    net.get(f"s{agg_dpid}"), net.get(f"s{core_dpid}"),
+                    net.get(f"s{agg_dpid}"),
+                    net.get(f"s{core_dpid}"),
                     bw=BW_AGG_CORE,
                     max_queue_size=30,
                 )
@@ -96,34 +77,22 @@ def create_topology(controller_ip="127.0.0.1", controller_port=6633):
 
 
 def configure_select_hash():
-    """Configure OVS Group Table hash method (dp_hash) on agg/core switches.
-
-    Must be called AFTER net.start() — bridges only exist at that point.
-    dp_hash ensures same 5-tuple → same bucket (同流同径).
-    """
     for pod in range(PODS):
         for i in range(AGG_PER_POD):
-            dpid = _agg_dpid(pod, i)
             os.system(
-                f"ovs-vsctl set bridge s{dpid} "
-                f"other_config:group-table-selection-method=dp_hash"
+                f"ovs-vsctl set bridge s{_agg_dpid(pod, i)} other_config:group-table-selection-method=dp_hash"
             )
     for i in range((K // 2) ** 2):
-        dpid = _core_dpid(i)
         os.system(
-            f"ovs-vsctl set bridge s{dpid} "
-            f"other_config:group-table-selection-method=dp_hash"
+            f"ovs-vsctl set bridge s{_core_dpid(i)} other_config:group-table-selection-method=dp_hash"
         )
 
 
 def cleanup():
-    """Remove all OVS bridges, namespaces, and veth pairs."""
     os.system("mn -c 2>/dev/null")
     os.system("killall -9 iperf 2>/dev/null")
-    # Remove ALL OVS bridges (including leftovers from previous experiments)
     output = os.popen("ovs-vsctl list-br 2>/dev/null").read()
     for br in output.strip().split("\n"):
-        br = br.strip()
-        if br:
-            os.system(f"ovs-vsctl --if-exists del-br {br} 2>/dev/null")
+        if br.strip():
+            os.system(f"ovs-vsctl --if-exists del-br {br.strip()} 2>/dev/null")
     print("Fat-Tree cleanup completed.")

@@ -1,441 +1,121 @@
-"""
-阈值响应式负载均衡控制器（对照组）
-- ARP 代理 + 单播转发
-- 每 (src_mac, dst_mac) 会话独立路径管理
-- 阈值决策：路径瓶颈 util > 70% → 切换到替代路径
-"""
-
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ryu.controller.handler import set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from ryu.controller import ofp_event
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
-from ryu.lib.packet import packet, ethernet, ether_types, arp
-from ryu.controller import ofp_event
-from ryu.controller.handler import MAIN_DISPATCHER
-
 from controller.base_balancer import BaseBalancer
-
-PRIORITY_ACTIVE_PATH = 20
-PRIORITY_STANDBY_PATH = 10
-FLOW_IDLE_TIMEOUT = 30
-SESSION_TIMEOUT = 60
 
 
 class ThresholdBalancer(BaseBalancer):
-    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
-
     def __init__(self, *args, **kwargs):
         super(ThresholdBalancer, self).__init__(*args, **kwargs)
-        # session_key (src_mac, dst_mac) -> {
-        #   'path_nodes', 'fwd_ports', 'rev_ports', 'util_keys',
-        #   'alt_path_nodes', 'alt_fwd_ports', 'alt_rev_ports', 'alt_util_keys',
-        #   'using_alt', 'last_seen'
-        # }
-        self.active_sessions = {}
-        # Broadcast storm cache: (dpid, src_mac, eth_type) -> timestamp
-        self.broadcast_cache = {}
-        # Path switch cooldown
-        self.last_switch_time = {}  # (src_mac, dst_mac) -> timestamp
-        self.SWITCH_COOLDOWN = 10.0  # seconds between path switches
-
-        self.init_stats(topo_manager=self.topo)
+        self.override_installed = False
+        self.init_stats()
         self.decision_thread = hub.spawn(self._decision_loop)
 
-    def _safe_flood(self, datapath, in_port, msg):
-        """
-        安全无环泛洪机制
-        修复：将所有合法出端口组合进单个 actions 列表发送，避免 OpenFlow 缓冲区被首次 PacketOut 提前消耗导致后续泛洪失败。
-        """
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        self._setup_rules(ev.msg.datapath)
+
+    @set_ev_cls(ofp_event.EventOFPStateChange, MAIN_DISPATCHER)
+    def state_change_handler(self, ev):
+        if ev.state == MAIN_DISPATCHER:
+            self._setup_rules(ev.datapath)
+
+    def _setup_rules(self, datapath):
         dpid = datapath.id
-        st_ports = self.topo.compute_spanning_tree_ports().get(dpid, set())
-        active_ports = list(datapath.ports.keys())
-
+        if dpid in self.configured_switches:
+            return
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        actions = []
+        self.datapaths[dpid] = datapath
 
-        # 收集所有允许转发的端口（生成树骨干端口 + 边缘接入端口）
-        for port_no in active_ports:
-            if port_no >= ofproto.OFPP_MAX or port_no == in_port:
-                continue
-            if self.topo.is_edge_port(dpid, port_no) or port_no in st_ports:
-                actions.append(parser.OFPActionOutput(port_no))
-
-        if not actions:
-            return
-
-        # 仅当 buffer_id 无效时携带完整 packet data，减轻控制通道负载
-        data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-
-        # 使用单个 PacketOut 聚合所有输出动作
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=data,
-        )
-        datapath.send_msg(out)
-
-    # ──────────────────────────────────────────────
-    # BaseBalancer 抽象方法实现
-    # ──────────────────────────────────────────────
-    def _get_active_fwd_ports(self):
-        if self.active_sessions:
-            first = next(iter(self.active_sessions.values()))
-            key = "alt_fwd_ports" if first.get("using_alt") else "fwd_ports"
-            return first.get(key)
-        return None
-
-    def _get_active_rev_ports(self):
-        if self.active_sessions:
-            first = next(iter(self.active_sessions.values()))
-            key = "alt_rev_ports" if first.get("using_alt") else "rev_ports"
-            return first.get(key)
-        return None
-
-    def _invalidate_paths(self):
-        self.active_sessions.clear()
-        self.logger.info("Paths invalidated due to topology change")
-
-    def _get_out_port(self, from_dpid, to_dpid):
-        """Compute output port via Dijkstra."""
-        result = self.topo.compute_optimal_path(from_dpid, to_dpid, weight=None)
-        if result:
-            path_nodes, _ = result
-            if len(path_nodes) >= 2:
-                fwd, _ = self.topo.path_to_ports(path_nodes)
-                return fwd.get(from_dpid)
-        return None
-
-    # ──────────────────────────────────────────────
-    # Packet-In 处理
-    # ──────────────────────────────────────────────
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, ev):
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        in_port = msg.match["in_port"]
-        dpid = datapath.id
-
-        pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocol(ethernet.ethernet)
-        if eth.ethertype in (ether_types.ETH_TYPE_LLDP, ether_types.ETH_TYPE_IPV6):
-            return
-
-        src = eth.src
-        dst = eth.dst
-
-        # Broadcast storm suppression (same as L2 controller)
-        if dst == "ff:ff:ff:ff:ff:ff":
-            import time as _time
-
-            cache_key = (dpid, src, eth.ethertype)
-            now = _time.time()
-            if len(self.broadcast_cache) > 1000:
-                self.broadcast_cache.clear()
-            if cache_key in self.broadcast_cache:
-                if now - self.broadcast_cache[cache_key] < 0.5:
-                    return
-            self.broadcast_cache[cache_key] = now
-
-        # 仅从边缘接入端口学习主机位置，防止骨干网交换机在泛洪期间错误覆写主机拓扑位置
-        if self.topo.is_edge_port(dpid, in_port):
-            self.topo.learn_host(src, dpid, in_port)
-
-        self.mac_to_port.setdefault(dpid, {})
-
-        if src not in self.mac_to_port[dpid]:
-            self.mac_to_port[dpid][src] = in_port
-
-        # ARP proxy + loop-free flooding
-        if eth.ethertype == ether_types.ETH_TYPE_ARP:
-            # ====== Cold-start: safe flood (spanning tree + edge ports) ======
-            if len(self.topo.G.nodes) < 20:
-                self._safe_flood(datapath, in_port, msg)
-                return
-            # ============================================================================
-
-            arp_pkt = pkt.get_protocol(arp.arp)
-            if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
-                self._handle_arp_request(datapath, in_port, dpid, arp_pkt, src, msg)
-                return
-            if arp_pkt and arp_pkt.opcode == arp.ARP_REPLY:
-                self._handle_arp_reply(datapath, in_port, dpid, dst, arp_pkt, src, msg)
-                return
-
-        # Data packet handling
-        self._install_reverse_rule(datapath, src, in_port)
-
-        session_key = (src, dst)
-        if session_key not in self.active_sessions:
-            self._compute_and_install_path(src, dst)
-
-        if session_key in self.active_sessions:
-            session = self.active_sessions[session_key]
-            session["last_seen"] = time.time()
-
-            # Reinstall flow rules if they have likely expired
-            now = time.time()
-            if now - session.get("last_install", 0) > FLOW_IDLE_TIMEOUT + 5:
-                fwd = session["alt_fwd_ports"] if session.get("using_alt") else session["fwd_ports"]
-                rev = session["alt_rev_ports"] if session.get("using_alt") else session["rev_ports"]
-                self._install_path_rules(src, dst, fwd)
-                self._install_path_rules(dst, src, rev)
-                session["last_install"] = now
-
-            fwd_ports = (
-                session["alt_fwd_ports"]
-                if session.get("using_alt")
-                else session["fwd_ports"]
-            )
-            out_port = fwd_ports.get(dpid)
-
-            if out_port is not None:
-                self._send_packet(datapath, in_port, out_port, msg)
-                return
-
-        # Destination unknown or path not available: safe flood
-        self._safe_flood(datapath, in_port, msg)
-
-    # ──────────────────────────────────────────────
-    # ARP proxy handling
-    # ──────────────────────────────────────────────
-    def _handle_arp_request(self, datapath, in_port, dpid, arp_pkt, src_mac, msg):
-        self._learn_arp_binding(arp_pkt, src_mac)
-        target_ip = arp_pkt.dst_ip
-        target_mac = self._arp_lookup(target_ip)
-        if target_mac:
-            target_loc = self.topo.get_host_location(target_mac)
-            if target_loc:
-                self._send_arp_reply(datapath, in_port, arp_pkt, target_mac)
-                return
-        # Flood ARP request via safe flood (spanning tree + edge ports)
-        self._safe_flood(datapath, in_port, msg)
-
-    def _handle_arp_reply(
-        self, datapath, in_port, dpid, dst_mac, arp_pkt, src_mac, msg
-    ):
-        self._learn_arp_binding(arp_pkt, src_mac)
-        self._install_reverse_rule(datapath, src_mac, in_port)
-        target_loc = self.topo.get_host_location(dst_mac)
-        if target_loc:
-            target_dpid, target_port = target_loc
-            if target_dpid == dpid:
-                out_port = target_port
-            else:
-                out_port = self._get_out_port(dpid, target_dpid)
-                if out_port is None:
-                    self._safe_flood(datapath, in_port, msg)
-                    return
-        else:
-            self._safe_flood(datapath, in_port, msg)
-            return
-        self._send_packet(datapath, in_port, out_port, msg)
-
-    def _send_arp_reply(self, datapath, in_port, req_arp_pkt, target_mac):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        eth_pkt = packet.Packet()
-        eth_pkt.add_protocol(
-            ethernet.ethernet(
-                ethertype=ether_types.ETH_TYPE_ARP,
-                dst=req_arp_pkt.src_mac,
-                src=target_mac,
-            )
-        )
-        eth_pkt.add_protocol(
-            arp.arp(
-                opcode=arp.ARP_REPLY,
-                src_mac=target_mac,
-                src_ip=req_arp_pkt.dst_ip,
-                dst_mac=req_arp_pkt.src_mac,
-                dst_ip=req_arp_pkt.src_ip,
-            )
-        )
-        eth_pkt.serialize()
-        actions = [parser.OFPActionOutput(in_port)]
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=ofproto.OFPP_CONTROLLER,
-            actions=actions,
-            data=eth_pkt.data,
-        )
-        datapath.send_msg(out)
-
-    # ──────────────────────────────────────────────
-    # 路径计算与安装（per-session）
-    # ──────────────────────────────────────────────
-    def _install_path_rules(
-        self, src_mac, dst_mac, fwd_ports, priority=PRIORITY_ACTIVE_PATH
-    ):
-        for dpid, out_port in fwd_ports.items():
-            if dpid in self.datapaths:
-                dp = self.datapaths[dpid]
-                parser = dp.ofproto_parser
-                match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
-                actions = [parser.OFPActionOutput(out_port)]
-                self.add_flow(
-                    dp, priority, match, actions, idle_timeout=FLOW_IDLE_TIMEOUT
+        if dpid <= 16:
+            buckets = []
+            for port in [3, 4]:
+                buckets.append(
+                    parser.OFPBucket(
+                        weight=1,
+                        watch_port=port,
+                        watch_group=ofproto.OFPG_ANY,
+                        actions=[parser.OFPActionOutput(port)],
+                    )
                 )
-                self.logger.info("Flow installed (OF): s%d %s->%s out=%d", dpid, src_mac, dst_mac, out_port)
-            else:
-                self.add_flow_ovs(
-                    dpid, priority,
-                    f"dl_src={src_mac},dl_dst={dst_mac}",
-                    f"output={out_port}",
-                    idle_timeout=FLOW_IDLE_TIMEOUT,
+            datapath.send_msg(
+                parser.OFPGroupMod(
+                    datapath=datapath,
+                    command=ofproto.OFPGC_ADD,
+                    type_=ofproto.OFPGT_SELECT,
+                    group_id=1,
+                    buckets=buckets,
                 )
-                self.logger.info("Flow installed (OVS): s%d %s->%s out=%d", dpid, src_mac, dst_mac, out_port)
+            )
 
-    def _compute_and_install_path(self, src_mac, dst_mac):
-        src_loc = self.topo.get_host_location(src_mac)
-        dst_loc = self.topo.get_host_location(dst_mac)
-        if not src_loc or not dst_loc:
-            self.logger.warning("Path compute failed: src_loc=%s, dst_loc=%s for %s->%s",
-                                src_loc, dst_loc, src_mac, dst_mac)
-            return
+        for i in range(16):
+            match = parser.OFPMatch(eth_dst=f"00:00:00:00:00:{i+1:02x}")
+            pod, e_idx = i // 4, (i % 4) // 2
+            if dpid <= 8:
+                actions = (
+                    [parser.OFPActionOutput((i % 2) + 1)]
+                    if (dpid - 1) // 2 == pod and (dpid - 1) % 2 == e_idx
+                    else [parser.OFPActionGroup(group_id=1)]
+                )
+            elif dpid <= 16:
+                actions = (
+                    [parser.OFPActionOutput(e_idx + 1)]
+                    if (dpid - 9) // 2 == pod
+                    else [parser.OFPActionGroup(group_id=1)]
+                )
+            else:
+                actions = [parser.OFPActionOutput(pod + 1)]
+            self.add_flow(datapath, 10, match, actions)
+        self.configured_switches.add(dpid)
 
-        src_dpid, dst_dpid = src_loc[0], dst_loc[0]
-        src_port, dst_port = src_loc[1], dst_loc[1]
-
-        # Compute primary path (shortest)
-        result = self.topo.compute_optimal_path(src_dpid, dst_dpid)
-        if not result:
-            self.logger.warning("No path found: s%d -> s%d", src_dpid, dst_dpid)
-            return
-
-        path_nodes, cost = result
-        fwd, rev = self.topo.path_to_ports(path_nodes)
-
-        # 修复：补全最后一跳交换机到主机的边界接入端口
-        fwd[dst_dpid] = dst_port
-        rev[src_dpid] = src_port
-
-        self.logger.info("Path computed: %s->%s path=%s fwd=%s rev=%s",
-                         src_mac, dst_mac, path_nodes, dict(fwd), dict(rev))
-
-        util_keys = self.topo.get_path_util_keys(fwd, rev)
-
-        # Compute alternative path (edge-disjoint)
-        alt_result = self.topo.compute_alternative_path(src_dpid, dst_dpid, path_nodes)
-        if alt_result:
-            alt_path, alt_cost = alt_result
-            alt_fwd, alt_rev = self.topo.path_to_ports(alt_path)
-            # 修复：备选路径同样需要补全最后一跳交换机到主机的边界接入端口
-            alt_fwd[dst_dpid] = dst_port
-            alt_rev[src_dpid] = src_port
-            alt_util_keys = self.topo.get_path_util_keys(alt_fwd, alt_rev)
-        else:
-            alt_path, alt_fwd, alt_rev, alt_util_keys = path_nodes, fwd, rev, util_keys
-
-        session_key = (src_mac, dst_mac)
-        self.active_sessions[session_key] = {
-            "path_nodes": path_nodes,
-            "fwd_ports": fwd,
-            "rev_ports": rev,
-            "util_keys": util_keys,
-            "alt_path_nodes": alt_path,
-            "alt_fwd_ports": alt_fwd,
-            "alt_rev_ports": alt_rev,
-            "alt_util_keys": alt_util_keys,
-            "using_alt": False,
-            "last_seen": time.time(),
-            "last_install": time.time(),
-        }
-
-        # Install rules across the complete host-to-host path
-        self._install_path_rules(src_mac, dst_mac, fwd)
-        self._install_path_rules(dst_mac, src_mac, rev)
-
-    # ──────────────────────────────────────────────
-    # 阈值决策循环
-    # ──────────────────────────────────────────────
     def _decision_loop(self):
         while True:
-            hub.sleep(self.curr_poll_interval)
-            if not self.datapaths or not self.active_sessions:
+            hub.sleep(self.POLL_INTERVAL)
+            if 9 not in self.datapaths:
                 continue
-
-            now = time.time()
-            for (src_mac, dst_mac), session in list(self.active_sessions.items()):
-                util_keys = session["util_keys"]
-                alt_util_keys = session["alt_util_keys"]
-
-                if not util_keys:
-                    continue
-
-                # Cooldown check
-                time_since_last = now - self.last_switch_time.get((src_mac, dst_mac), 0)
-                if time_since_last < self.SWITCH_COOLDOWN:
-                    continue
-
-                # Get bottleneck utilization for primary and alternative paths
-                primary_util = max(
-                    (self.link_utilization.get(k, 0) for k in util_keys),
-                    default=0,
-                )
-                alt_util = max(
-                    (self.link_utilization.get(k, 0) for k in alt_util_keys),
-                    default=0,
-                )
-
-                using_alt = session.get("using_alt", False)
-
-                # Threshold switching: primary congested AND alternative is better
-                if not using_alt and primary_util > 0.70 and alt_util < 0.50:
-                    self.last_switch_time[(src_mac, dst_mac)] = now
-                    self.logger.info(
-                        "Threshold: %s -> %s primary congested (%.1f%%), switching to alt (%.1f%%)",
-                        src_mac,
-                        dst_mac,
-                        primary_util * 100,
-                        alt_util * 100,
+                
+            util_p3 = self.link_utilization.get((9, 3), 0.0)
+            
+            dp = self.datapaths[9]
+            # 当检测到端口 3 拥塞超过 70%，反应式地将权重大幅拉向端口 4
+            if not self.override_installed and util_p3 > 0.70:
+                buckets = [
+                    dp.ofproto_parser.OFPBucket(
+                        weight=20, watch_port=3, watch_group=dp.ofproto.OFPG_ANY,
+                        actions=[dp.ofproto_parser.OFPActionOutput(3)]
+                    ),
+                    dp.ofproto_parser.OFPBucket(
+                        weight=80, watch_port=4, watch_group=dp.ofproto.OFPG_ANY,
+                        actions=[dp.ofproto_parser.OFPActionOutput(4)]
                     )
-                    self._install_path_rules(src_mac, dst_mac, session["alt_fwd_ports"])
-                    self._install_path_rules(dst_mac, src_mac, session["alt_rev_ports"])
-                    session["using_alt"] = True
-                    session["last_install"] = now
-
-                # Threshold switching back: alt congested AND primary is better
-                elif using_alt and alt_util > 0.70 and primary_util < 0.50:
-                    self.last_switch_time[(src_mac, dst_mac)] = now
-                    self.logger.info(
-                        "Threshold: %s -> %s alt congested (%.1f%%), switching back to primary (%.1f%%)",
-                        src_mac,
-                        dst_mac,
-                        alt_util * 100,
-                        primary_util * 100,
+                ]
+                dp.send_msg(dp.ofproto_parser.OFPGroupMod(
+                    datapath=dp, command=dp.ofproto.OFPGC_MODIFY,
+                    type_=dp.ofproto.OFPGT_SELECT, group_id=1, buckets=buckets
+                ))
+                self.override_installed = True
+                
+            # 流量下降后恢复 50:50 均衡配置
+            elif self.override_installed and util_p3 < 0.40:
+                buckets = [
+                    dp.ofproto_parser.OFPBucket(
+                        weight=50, watch_port=3, watch_group=dp.ofproto.OFPG_ANY,
+                        actions=[dp.ofproto_parser.OFPActionOutput(3)]
+                    ),
+                    dp.ofproto_parser.OFPBucket(
+                        weight=50, watch_port=4, watch_group=dp.ofproto.OFPG_ANY,
+                        actions=[dp.ofproto_parser.OFPActionOutput(4)]
                     )
-                    self._install_path_rules(src_mac, dst_mac, session["fwd_ports"])
-                    self._install_path_rules(dst_mac, src_mac, session["rev_ports"])
-                    session["using_alt"] = False
-                    session["last_install"] = now
-
-            # Clean up stale sessions
-            now = time.time()
-            stale = [
-                k
-                for k, v in self.active_sessions.items()
-                if now - v.get("last_seen", 0) > SESSION_TIMEOUT
-            ]
-            for k in stale:
-                session = self.active_sessions.pop(k)
-                self.logger.info("Session expired: %s -> %s", k[0], k[1])
-
-            max_util = (
-                max(self.link_utilization.values()) if self.link_utilization else 0
-            )
-            self.logger.info(
-                "Threshold: max_util=%.1f%%, active sessions=%d",
-                max_util * 100,
-                len(self.active_sessions),
-            )
+                ]
+                dp.send_msg(dp.ofproto_parser.OFPGroupMod(
+                    datapath=dp, command=dp.ofproto.OFPGC_MODIFY,
+                    type_=dp.ofproto.OFPGT_SELECT, group_id=1, buckets=buckets
+                ))
+                self.override_installed = False
