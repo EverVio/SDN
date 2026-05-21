@@ -23,7 +23,7 @@ class DynamicWeightEngine:
         self.scaler_X = None
         self.scaler_Y = None
         self.link_keys = []
-        self.window_size = 3
+        self.window_size = 6
 
         self.feature_history = []
         self.current_utils = {}
@@ -105,39 +105,37 @@ class DynamicWeightEngine:
 
     def get_group_weights(self, topo_manager):
         WEIGHT_DEADBAND = 0.10
-        AGG_DPID_MIN, AGG_DPID_MAX = 9, 16  # 聚合交换机真实十进制 DPID 范围是 9-16
+        # 扩展遍历范围：包含边缘交换机 (1-8) 和汇聚交换机 (9-16)
+        SWITCH_MIN, SWITCH_MAX = 1, 16
         result = {}
 
-        for dpid in range(AGG_DPID_MIN, AGG_DPID_MAX + 1):
-            core_ports = topo_manager.get_core_facing_ports(dpid)
-            if len(core_ports) < 2:
-                continue
-
+        for dpid in range(SWITCH_MIN, SWITCH_MAX + 1):
+            uplink_ports = [3, 4]
             available_list = []
-            for port_no, _ in core_ports:
+            for port_no in uplink_ports:
                 key = (dpid, port_no)
                 util = self.predicted_utils.get(key)
                 if util is None:
                     util = self.current_utils.get(key, 0.0)
-                available_list.append(max(0.0, 1.0 - util))
+                    
+                available_list.append(np.exp(-3.0 * util))
 
             total = sum(available_list)
-            # 计算各端口的空闲带宽比例
             if total > 0:
                 ratios = [a / total for a in available_list]
             else:
-                ratios = [1.0 / len(core_ports)] * len(core_ports)
+                ratios = [1.0 / len(uplink_ports)] * len(uplink_ports)
 
-            # 死区检查：与上次下发的比例对比，变化不超过阈值则跳过
+            # 死区检查：防止边缘/汇聚层流表频繁下发导致全网路由震荡
             last_ratios = self._last_group_ratios.get(dpid)
             if last_ratios is not None and len(last_ratios) == len(ratios):
                 max_delta = max(abs(r - lr) for r, lr in zip(ratios, last_ratios))
                 if max_delta < WEIGHT_DEADBAND:
                     continue
 
-            # 计算整数权重
+            # 计算整数权重值
             weights = []
-            for i, (port_no, _) in enumerate(core_ports):
+            for i, port_no in enumerate(uplink_ports):
                 if total > 0:
                     w = max(1, int(available_list[i] / total * 100))
                 else:

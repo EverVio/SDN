@@ -31,7 +31,8 @@ class BaseBalancer(app_manager.RyuApp, StatsMixin):
                 e_dpid = pod * 2 + e + 1
                 for a in range(2):
                     a_dpid = 8 + pod * 2 + a + 1
-                    self.topo.add_link(e_dpid, a, a_dpid, e)
+                    # 修正：Edge 的上行端口为 a + 3 (即 3, 4)，Agg 的下行端口为 e + 1 (即 1, 2)
+                    self.topo.add_link(e_dpid, a + 3, a_dpid, e + 1)
         # 建立 Agg (9-16) 与 Core (17-20) 的静态边关联
         for pod in range(4):
             for a in range(2):

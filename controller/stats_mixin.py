@@ -6,7 +6,7 @@ from ryu.lib import hub
 
 class StatsMixin:
     LINK_BW = 2_000_000
-    POLL_INTERVAL = 1
+    POLL_INTERVAL = 0.5
 
     def init_stats(self, topo_manager=None):
         self.datapaths = {}

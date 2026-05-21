@@ -16,7 +16,6 @@ import subprocess
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
-# Mininet 仅安装在系统 Python 中，conda 环境需要手动添加路径（追加到末尾，避免覆盖 conda 的 numpy）
 sys.path.append("/usr/lib/python3/dist-packages")
 
 from mininet.log import setLogLevel
@@ -26,14 +25,14 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 SRC_CSV = os.path.join(DATA_DIR, "traffic_data.csv")
 RYU_PORT = 6633
 DURATION = 120
-STP_WAIT = 30  # STP 收敛等待时间（秒）
+STP_WAIT = 5  # STP 收敛等待时间（秒）
 
 # Fat-Tree k=4: 16 hosts across 4 pods
 ALL_HOSTS = [f"h{pod}_{idx}" for pod in range(4) for idx in range(4)]
 
 # Traffic permutation parameters
 PERMUTATION_INTERVAL = 15  # seconds between reshuffles
-NUM_PAIRS = 8              # concurrent communication pairs per round
+NUM_PAIRS = 8  # concurrent communication pairs per round
 
 
 def wait_for_port(port, timeout=30):
@@ -72,15 +71,6 @@ def start_ryu():
 
 
 def run_single_experiment(net, duration):
-    """Run dynamic random traffic permutation to exercise all ECMP paths.
-
-    Every PERMUTATION_INTERVAL seconds, shuffle all 16 hosts into 8 random
-    pairs and start new iperf UDP flows with random bandwidth (2-8 Mbps).
-    This breaks deterministic hashing: different (src, dst) pairs map to
-    different ECMP paths, forcing traffic across all aggregation and core
-    switches within a single batch.
-    """
-    # Start iperf servers on all hosts (idempotent)
     for host_name in ALL_HOSTS:
         h = net.get(host_name)
         if h is not None:
@@ -89,26 +79,25 @@ def run_single_experiment(net, duration):
 
     num_rounds = duration // PERMUTATION_INTERVAL
     for round_idx in range(num_rounds):
-        # Shuffle and pair
         shuffled = ALL_HOSTS[:]
         random.shuffle(shuffled)
         pairs = [(shuffled[i], shuffled[i + 1]) for i in range(0, len(shuffled), 2)]
 
-        # Random bandwidth per pair: 2-8 Mbps
         for src_name, dst_name in pairs:
             src = net.get(src_name)
             dst = net.get(dst_name)
             if src is None or dst is None:
                 continue
-            bw = round(random.uniform(2.0, 8.0), 1)
-            # iperf -t PERMUTATION_INTERVAL: flow lives for the full round
+            # 修改：将单条流的带宽由 2-8M 降低至 0.2M - 1.6M
+            # 物理依据：核心链路为 2M。单流通信时利用率为 10%~80%；两流碰撞时叠加为 40%~100%，从而产生完美的回归梯度
+            bw = round(random.uniform(0.2, 1.6), 2)
             src.cmd(
-                f"iperf -c {dst.IP()} -u -b {bw}M "
-                f"-t {PERMUTATION_INTERVAL} -i 1 &"
+                f"iperf -c {dst.IP()} -u -b {bw}M " f"-t {PERMUTATION_INTERVAL} -i 1 &"
             )
 
-        print(f"    Round {round_idx + 1}/{num_rounds}: "
-              f"{len(pairs)} pairs, bandwidth 2-8 Mbps")
+        print(
+            f"    Round {round_idx + 1}/{num_rounds}: {len(pairs)} pairs, bandwidth 0.2-1.6 Mbps"
+        )
         time.sleep(PERMUTATION_INTERVAL)
 
     # Cleanup all iperf processes
@@ -144,7 +133,9 @@ def collect_batch(batch_idx, duration):
         time.sleep(STP_WAIT)
 
         # 3. 执行动态随机流量
-        print(f"  开始流量生成 (动态随机置换, {duration // PERMUTATION_INTERVAL} 轮)...")
+        print(
+            f"  开始流量生成 (动态随机置换, {duration // PERMUTATION_INTERVAL} 轮)..."
+        )
         run_single_experiment(net, duration)
         print("  流量生成完成")
 
@@ -187,8 +178,10 @@ def main():
 
     print(f"===== 训练数据采集 (动态随机置换) =====")
     print(f"共 {num_batches} 批次，每批 {DURATION} 秒")
-    print(f"每批 {DURATION // PERMUTATION_INTERVAL} 轮置换，"
-          f"每轮 {NUM_PAIRS} 对随机通信")
+    print(
+        f"每批 {DURATION // PERMUTATION_INTERVAL} 轮置换，"
+        f"每轮 {NUM_PAIRS} 对随机通信"
+    )
     print(f"预计总耗时: {num_batches * (DURATION + STP_WAIT + 20) / 60:.0f} 分钟")
 
     for idx in range(1, num_batches + 1):
@@ -196,15 +189,20 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"全部采集完成！")
-    csv_files = sorted([
-        f for f in os.listdir(DATA_DIR)
-        if f.startswith("traffic_data_") and f.endswith(".csv")
-    ])
+    csv_files = sorted(
+        [
+            f
+            for f in os.listdir(DATA_DIR)
+            if f.startswith("traffic_data_") and f.endswith(".csv")
+        ]
+    )
     print(f"共生成 {len(csv_files)} 个数据文件:")
     for f in csv_files:
         size_kb = os.path.getsize(os.path.join(DATA_DIR, f)) / 1024
         print(f"  {f} ({size_kb:.1f} KB)")
-    print(f"\n下一步: cd scripts && python3 assemble_global_features.py && python3 train_global_mlp.py")
+    print(
+        f"\n下一步: cd scripts && python3 assemble_global_features.py && python3 train_global_mlp.py"
+    )
 
 
 if __name__ == "__main__":
