@@ -20,7 +20,7 @@
   - 阈值均衡组：碰撞后 2-3 秒检测到拥塞，响应式迁移
   - Global MLP 组：预测引擎在爬升阶段识别趋势，主动迁移，0 丢包
 
-用法：sudo python3 scripts/run_experiment.py --group [l2|threshold|predictive|all]
+用法：sudo python3 scripts/run_experiment.py --group [l2|threshold|predictive|all] --iters 5
 """
 
 import os
@@ -30,6 +30,7 @@ import signal
 import socket
 import subprocess
 import re
+import csv
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
@@ -133,7 +134,6 @@ def parse_iperf_udp_output(output, expected_bw_mbps=None):
         loss_pct = 100.0
 
     for line in output.split("\n"):
-        # Full server report line: bw + jitter + loss (Mbits or Kbits)
         m = re.search(
             r"(\d+\.?\d*)\s+([MK])bits/sec\s+(\d+\.?\d*)\s+ms\s+\d+/\s*\d+\s+\((\d+\.?\d*)%\)",
             line,
@@ -145,7 +145,6 @@ def parse_iperf_udp_output(output, expected_bw_mbps=None):
             has_server_report = True
             continue
 
-        # Interval/summary line: ... X.Y sec  Z WBytes  BW [MK]bits/sec
         m2 = re.search(
             r"(\d+\.?\d*)\s+\d+\.?\d*\s+sec\s+[\d.]+\s+\w+\s+(\d+\.?\d*)\s+([MK])bits/sec",
             line,
@@ -153,7 +152,6 @@ def parse_iperf_udp_output(output, expected_bw_mbps=None):
         if m2:
             bandwidth_mbps = _to_mbps(float(m2.group(2)), m2.group(3) + "bits/sec")
 
-    # If no server report and we have bandwidth + expected BW, compute approximate loss
     if not has_server_report and bandwidth_mbps > 0 and expected_bw_mbps:
         loss_pct = max(0.0, (1.0 - bandwidth_mbps / expected_bw_mbps) * 100.0)
 
@@ -202,7 +200,6 @@ def run_experiment_group(group_name, controller_script):
     c0.start()
     net.start()
 
-    # 核心修改：利用数据平面静态 ARP，配合控制层双重状态握手，消除网络传输震荡
     net.staticArp()
     configure_select_hash()
 
@@ -210,9 +207,6 @@ def run_experiment_group(group_name, controller_script):
     time.sleep(10)
     print("  Topology core networks stabilized.")
 
-    # 彻底删除原先的多并发后台 ping 学习探测循环（不再需要预学习位置）
-
-    # 启动 iperf 接收服务器端
     all_flows = BACKGROUND_FLOWS + BURST_SUBFLOWS
     server_procs = []
     for i, (_, dst_name) in enumerate(all_flows):
@@ -230,7 +224,6 @@ def run_experiment_group(group_name, controller_script):
             time.sleep(0.1)
     time.sleep(1)
 
-    # 阶段 1：发送背景 UDP 流
     print(f"  Phase 1: Starting {len(BACKGROUND_FLOWS)} background flows...")
     client_procs = []
     for i, (src_name, dst_name) in enumerate(BACKGROUND_FLOWS):
@@ -254,7 +247,6 @@ def run_experiment_group(group_name, controller_script):
     print(f"  Waiting {BURST_DELAY}s before burst ramp-up...")
     time.sleep(BURST_DELAY)
 
-    # 阶段 2：发送渐进突发流
     for j, (src_name, dst_name) in enumerate(BURST_SUBFLOWS):
         if j > 0:
             time.sleep(BURST_STAGGER)
@@ -356,10 +348,6 @@ def print_summary(all_results):
         f"(ramp-up, t={BURST_DELAY}s, stagger={BURST_STAGGER}s)"
     )
     print(f"Total:      {total_bw}Mbps on {4 * CORE_LINK_BW}Mbps capacity")
-    print(
-        f"Collision:  25% probability hash collision -> "
-        f"2 flows on 1 link ({UDP_BANDWIDTH + BURST_SUB_BW:.1f}Mbps > {CORE_LINK_BW}Mbps)"
-    )
     print()
 
     flow_names = [f"Flow {i+1}" for i in range(n_bg)] + ["Flow 4 (burst)"]
@@ -405,15 +393,19 @@ def main():
     parser.add_argument("--duration", type=int, default=TEST_DURATION)
     parser.add_argument("--bw", type=float, default=UDP_BANDWIDTH)
     parser.add_argument("--burst-delay", type=int, default=BURST_DELAY)
+    parser.add_argument(
+        "--iters", type=int, default=5, help="Number of iterations per test group"
+    )
     args = parser.parse_args()
 
     TEST_DURATION = args.duration
     UDP_BANDWIDTH = args.bw
     BURST_DELAY = args.burst_delay
+    iters = args.iters
 
-    os.makedirs(os.path.join(PROJECT_ROOT, "data"), exist_ok=True)
+    data_dir = os.path.join(PROJECT_ROOT, "data")
+    os.makedirs(data_dir, exist_ok=True)
 
-    # Thorough cleanup before starting
     os.system("pkill -f ryu-manager 2>/dev/null")
     time.sleep(1)
     cleanup()
@@ -424,16 +416,103 @@ def main():
     else:
         groups = [args.group]
 
-    all_results = {}
-    for group in groups:
-        try:
-            results = run_experiment_group(group, CONTROLLERS[group])
-            all_results[group] = results
-        except Exception as e:
-            print(f"  ERROR in {group}: {e}")
-            all_results[group] = {}
+    # 初始化单轮详细结果 CSV 文件的表头
+    iteration_csv_path = os.path.join(data_dir, "iteration_results.csv")
+    with open(iteration_csv_path, "w", newline="") as f_iter:
+        writer = csv.writer(f_iter)
+        writer.writerow(
+            ["group", "iteration", "flow", "loss_pct", "jitter_ms", "bandwidth_mbps"]
+        )
 
-    print_summary(all_results)
+    all_groups_avg = {}
+
+    for group in groups:
+        # 用于缓存该组内所有轮次的流数据以计算均值
+        group_history = {}
+
+        for it in range(1, iters + 1):
+            print(f"\n--- Group: {group} | Iteration {it}/{iters} ---")
+            results = run_experiment_group(group, CONTROLLERS[group])
+
+            if not results:
+                continue
+
+            # 实时写入当前轮次的数据至 iteration_results.csv
+            with open(iteration_csv_path, "a", newline="") as f_iter:
+                writer = csv.writer(f_iter)
+                for flow_name, r in results.items():
+                    writer.writerow(
+                        [
+                            group,
+                            it,
+                            flow_name,
+                            r["loss_pct"],
+                            r["jitter_ms"],
+                            r["bandwidth_mbps"],
+                        ]
+                    )
+
+                    if flow_name not in group_history:
+                        group_history[flow_name] = {
+                            "loss_pct": [],
+                            "jitter_ms": [],
+                            "bandwidth_mbps": [],
+                        }
+                    group_history[flow_name]["loss_pct"].append(r["loss_pct"])
+                    group_history[flow_name]["jitter_ms"].append(r["jitter_ms"])
+                    group_history[flow_name]["bandwidth_mbps"].append(
+                        r["bandwidth_mbps"]
+                    )
+
+            time.sleep(2)
+
+        # 计算并保存该组所有轮次的平均值
+        group_avg = {}
+        for flow_name, metrics in group_history.items():
+            avg_loss = (
+                sum(metrics["loss_pct"]) / len(metrics["loss_pct"])
+                if metrics["loss_pct"]
+                else 0.0
+            )
+            avg_jitter = (
+                sum(metrics["jitter_ms"]) / len(metrics["jitter_ms"])
+                if metrics["jitter_ms"]
+                else 0.0
+            )
+            avg_bw = (
+                sum(metrics["bandwidth_mbps"]) / len(metrics["bandwidth_mbps"])
+                if metrics["bandwidth_mbps"]
+                else 0.0
+            )
+
+            group_avg[flow_name] = {
+                "loss_pct": avg_loss,
+                "jitter_ms": avg_jitter,
+                "bandwidth_mbps": avg_bw,
+            }
+        all_groups_avg[group] = group_avg
+
+    # 保存计算好的所有组流平均数据至文件 average_results.csv
+    average_csv_path = os.path.join(data_dir, "average_results.csv")
+    with open(average_csv_path, "w", newline="") as f_avg:
+        writer = csv.writer(f_avg)
+        writer.writerow(
+            ["group", "flow", "avg_loss_pct", "avg_jitter_ms", "avg_bandwidth_mbps"]
+        )
+        for group, flows in all_groups_avg.items():
+            for flow_name, metrics in flows.items():
+                writer.writerow(
+                    [
+                        group,
+                        flow_name,
+                        f"{metrics['loss_pct']:.2f}",
+                        f"{metrics['jitter_ms']:.3f}",
+                        f"{metrics['bandwidth_mbps']:.2f}",
+                    ]
+                )
+
+    # 打印最终的聚合平均值总结界面
+    print_summary(all_groups_avg)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,8 @@ class ThresholdBalancer(BaseBalancer):
 
     def _decision_loop(self):
         CONGESTION_THRESHOLD = 0.70
+        # 引入恢复低水位，防止路由在 70% 边缘频繁横跳（路由震荡）
+        RECOVERY_THRESHOLD = 0.30
 
         while True:
             hub.sleep(self.POLL_INTERVAL)
@@ -89,18 +91,16 @@ class ThresholdBalancer(BaseBalancer):
 
             self.weight_engine.update_all_utilizations(self.link_utilization)
 
-            is_congested = any(
-                util > CONGESTION_THRESHOLD for util in self.link_utilization.values()
-            )
+            max_util = max(self.link_utilization.values(), default=0.0)
             group_weights = {}
 
-            if is_congested:
-                # 触发动态响应
+            if max_util > CONGESTION_THRESHOLD:
+                # 达到高水位，触发拥塞规避
                 group_weights = self.weight_engine.get_group_weights(self.topo)
                 self._was_congested = True
             else:
-                # 仅在发生状态切换时，才恢复 50:50 对称分流
-                if self._was_congested:
+                # 仅在利用率回落到低水位且前置状态为拥塞时，安全恢复对称路由
+                if self._was_congested and max_util < RECOVERY_THRESHOLD:
                     group_weights = {dpid: [(3, 50), (4, 50)] for dpid in range(9, 17)}
                     self._was_congested = False
 
