@@ -32,6 +32,17 @@ class StatsMixin:
                 )
             hub.sleep(self.POLL_INTERVAL)
 
+    def _get_port_bandwidth(self, dpid, port_no):
+        """根据 Fat-Tree k=4 拓扑架构动态返回端口的物理带宽(bps)"""
+        # 边缘交换机上行端口(3,4)和汇聚交换机下行端口(1,2)为 10Mbps
+        if dpid <= 8:
+            return 10_000_000
+        elif dpid <= 16:
+            if port_no in [1, 2]:
+                return 10_000_000
+            return 2_000_000  # 汇聚上行去往核心为 2Mbps
+        return 2_000_000  # 核心交换机端口为 2Mbps
+
     def handle_port_stats_reply(self, ev):
         msg = ev.msg
         dpid = msg.datapath.id
@@ -59,7 +70,9 @@ class StatsMixin:
             if key in self.prev_port_stats:
                 delta_bytes = tx_bytes - self.prev_port_stats[key]
                 if delta_bytes >= 0:
-                    util = (delta_bytes * 8) / (delta_time * self.LINK_BW)
+                    # 动态获取对应的物理通道带宽
+                    link_bw = self._get_port_bandwidth(dpid, port_no)
+                    util = (delta_bytes * 8) / (delta_time * link_bw)
                     self.link_utilization[key] = min(util, 1.0)
                     self.csv_writer.writerow(
                         [

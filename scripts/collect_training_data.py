@@ -56,7 +56,7 @@ def kill_ryu():
 def start_ryu():
     """启动 Ryu 控制器子进程，返回 Popen 对象"""
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    controller_path = os.path.join(project_root, "controller", "threshold_balancer.py")
+    controller_path = os.path.join(project_root, "controller", "base_controller.py")
     proc = subprocess.Popen(
         ["ryu-manager", controller_path, "--observe-links"],
         stdout=subprocess.PIPE,
