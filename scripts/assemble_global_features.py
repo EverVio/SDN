@@ -12,10 +12,10 @@ import pandas as pd
 import numpy as np
 import joblib
 
-# 修改：扩展时序窗口至 6 步（对应 0.5s 采样率下的 3.0 秒历史特征）
 WINDOW_SIZE = 6
-# 新增：定义预测前瞻步长为 2 步（提前 1.0 秒预测未来拓扑状态，为控制器留出下发流表裕度）
 PREDICTION_STEP = 2
+# 新增：目标窗口大小（对应 1.5 秒）。模型将预测这段时间内的最大利用率，而非某一瞬间的值
+TARGET_WINDOW = 3
 
 IN_FILES = "../data/traffic_data_*.csv"
 OUTPUT_FILE = "../data/global_features.pkl"
@@ -72,11 +72,27 @@ def process_global_features():
     X_data = []
     Y_data = []
 
-    # 修改：调整循环边界，留出窗口空间和前瞻预测步长的空间
-    for i in range(len(time_series_data) - WINDOW_SIZE - PREDICTION_STEP + 1):
+    # 修改：收缩循环右边界，预留出前瞻步长与目标窗口所需的数组空间
+    for i in range(
+        len(time_series_data) - WINDOW_SIZE - PREDICTION_STEP - TARGET_WINDOW + 1
+    ):
+        # 特征 X：当前滑动窗口内的历史状态
         window = time_series_data[i : i + WINDOW_SIZE]
-        # 修改：标签 Y 对应当前窗口结束后的第 PREDICTION_STEP 步（即未来的第 2 步，+1.0s）
-        target = time_series_data[i + WINDOW_SIZE + PREDICTION_STEP - 1]
+
+        # 标签 Y：提取未来 [PREDICTION_STEP, PREDICTION_STEP + TARGET_WINDOW) 区间的切片
+        target_slice = time_series_data[
+            i
+            + WINDOW_SIZE
+            + PREDICTION_STEP
+            - 1 : i
+            + WINDOW_SIZE
+            + PREDICTION_STEP
+            - 1
+            + TARGET_WINDOW
+        ]
+        # 算法原理：沿时间轴 (axis=0) 取最大值。对于控制平面，预测拥塞峰值比预测平均值更能保障无损防抖
+        target = np.max(target_slice, axis=0)
+
         X_data.append(window.flatten())
         Y_data.append(target)
 

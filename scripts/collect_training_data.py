@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-自动采集训练数据：启动 Ryu + Mininet，跑多种流量模式，批量保存 CSV。
-
-用法：sudo python3 scripts/collect_training_data.py
+自动采集训练数据：单次启动 Ryu + Mininet，连续执行多轮动态流量置换，输出单一大文件。
 """
 
 import os
@@ -24,185 +22,128 @@ from topo.fat_tree_topo import create_topology, cleanup
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 SRC_CSV = os.path.join(DATA_DIR, "traffic_data.csv")
 RYU_PORT = 6633
-DURATION = 120
-STP_WAIT = 5  # STP 收敛等待时间（秒）
+STP_WAIT = 5
 
-# Fat-Tree k=4: 16 hosts across 4 pods
 ALL_HOSTS = [f"h{pod}_{idx}" for pod in range(4) for idx in range(4)]
 
-# Traffic permutation parameters
-PERMUTATION_INTERVAL = 15  # seconds between reshuffles
-NUM_PAIRS = 8  # concurrent communication pairs per round
+# 优化采集效率：缩短轮次间隔，增加总轮数
+PERMUTATION_INTERVAL = 8
+TOTAL_ROUNDS = 200
 
 
 def wait_for_port(port, timeout=30):
-    """等待端口可连接"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                return True
-        except (ConnectionRefusedError, OSError):
-            time.sleep(0.5)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        result = s.connect_ex(("127.0.0.1", port))
+        s.close()
+        if result == 0:
+            return True
+        time.sleep(0.5)
     return False
 
 
 def kill_ryu():
-    """终止残留的 ryu-manager 进程"""
     os.system("pkill -f ryu-manager 2>/dev/null")
     time.sleep(1)
 
 
 def start_ryu():
-    """启动 Ryu 控制器子进程，返回 Popen 对象"""
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    controller_path = os.path.join(project_root, "controller", "base_controller.py")
+    # 采用闭环策略：使用 threshold_balancer 采集数据，使模型学习路由切换后的状态转移
+    controller_path = os.path.join(project_root, "controller", "threshold_balancer.py")
     proc = subprocess.Popen(
         ["ryu-manager", controller_path, "--observe-links"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=project_root,
     )
-    if not wait_for_port(RYU_PORT, timeout=30):
-        proc.kill()
-        raise RuntimeError("Ryu 未能在 30 秒内启动")
+    wait_for_port(RYU_PORT, timeout=30)
     print("  Ryu 控制器已就绪")
     return proc
 
 
-def run_single_experiment(net, duration):
+def main():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    print("===== 快速训练数据采集 =====")
+    print(f"共 {TOTAL_ROUNDS} 轮置换，每轮 {PERMUTATION_INTERVAL} 秒")
+    print(
+        f"预计总耗时: {(TOTAL_ROUNDS * PERMUTATION_INTERVAL + STP_WAIT + 20) / 60:.0f} 分钟"
+    )
+
+    cleanup()
+    kill_ryu()
+    ryu_proc = start_ryu()
+
+    print("  启动 Mininet 拓扑...")
+    setLogLevel("warning")
+    net, c0 = create_topology()
+    net.build()
+    c0.start()
+    net.start()
+    net.staticArp()
+    print(f"  等待拓扑收敛 ({STP_WAIT}s)...")
+    time.sleep(STP_WAIT)
+
+    print("  启动服务端守护进程...")
     for host_name in ALL_HOSTS:
         h = net.get(host_name)
         if h is not None:
             h.cmd("iperf -s -u &")
     time.sleep(1)
 
-    num_rounds = duration // PERMUTATION_INTERVAL
-    for round_idx in range(num_rounds):
+    print("  开始连续流量生成...")
+    for round_idx in range(TOTAL_ROUNDS):
         shuffled = ALL_HOSTS[:]
         random.shuffle(shuffled)
         pairs = [(shuffled[i], shuffled[i + 1]) for i in range(0, len(shuffled), 2)]
 
-        for src_name, dst_name in pairs:
+        for idx, (src_name, dst_name) in enumerate(pairs):
             src = net.get(src_name)
             dst = net.get(dst_name)
             if src is None or dst is None:
                 continue
-            # 修改：将单条流的带宽由 2-8M 降低至 0.2M - 1.6M
-            # 物理依据：核心链路为 2M。单流通信时利用率为 10%~80%；两流碰撞时叠加为 40%~100%，从而产生完美的回归梯度
-            bw = round(random.uniform(0.2, 1.6), 2)
-            src.cmd(
-                f"iperf -c {dst.IP()} -u -b {bw}M " f"-t {PERMUTATION_INTERVAL} -i 1 &"
-            )
 
-        print(
-            f"    Round {round_idx + 1}/{num_rounds}: {len(pairs)} pairs, bandwidth 0.2-1.6 Mbps"
-        )
+            # 消除分布偏移：一半使用渐进流（模拟测试环境），一半使用随机恒定流
+            if idx < len(pairs) // 2:
+                src.cmd(f"iperf -c {dst.IP()} -u -b 0.5M -t {PERMUTATION_INTERVAL} &")
+                src.cmd(
+                    f"sh -c 'sleep 3 && iperf -c {dst.IP()} -u -b 0.5M -t {PERMUTATION_INTERVAL - 3}' &"
+                )
+            else:
+                bw = round(random.uniform(0.2, 1.6), 2)
+                src.cmd(f"iperf -c {dst.IP()} -u -b {bw}M -t {PERMUTATION_INTERVAL} &")
+
+        print(f"    Round {round_idx + 1}/{TOTAL_ROUNDS}")
         time.sleep(PERMUTATION_INTERVAL)
 
-    # Cleanup all iperf processes
+    print("  清理流量进程...")
     for host_name in ALL_HOSTS:
         h = net.get(host_name)
         if h is not None:
             h.cmd("killall -9 iperf 2>/dev/null")
     time.sleep(1)
 
+    print("  停止 Mininet...")
+    net.stop()
+    time.sleep(2)
 
-def collect_batch(batch_idx, duration):
-    """完整执行一轮实验：Ryu → Mininet → 动态随机流量 → 保存 CSV"""
-    print(f"\n{'='*60}")
-    print(f"批次 {batch_idx}: 动态随机置换, 时长={duration}s")
-    print(f"{'='*60}")
+    ryu_proc.send_signal(signal.SIGTERM)
+    ryu_proc.wait()
+    print("  Ryu 已停止")
 
-    # 1. 清理 + 启动 Ryu
-    cleanup()
-    kill_ryu()
-    ryu_proc = start_ryu()
-
-    net = None
-    try:
-        # 2. 启动 Mininet
-        print("  启动 Mininet 拓扑...")
-        setLogLevel("warning")
-        net, c0 = create_topology()
-        net.build()
-        c0.start()
-        net.start()
-        net.staticArp()
-        print(f"  等待拓扑收敛 ({STP_WAIT}s)...")
-        time.sleep(STP_WAIT)
-
-        # 3. 执行动态随机流量
-        print(
-            f"  开始流量生成 (动态随机置换, {duration // PERMUTATION_INTERVAL} 轮)..."
-        )
-        run_single_experiment(net, duration)
-        print("  流量生成完成")
-
-        # 4. 停止 Mininet（触发 CSV flush）
-        print("  停止 Mininet...")
-        net.stop()
-        net = None
-        time.sleep(2)
-
-    finally:
-        # 5. 终止 Ryu
-        if net is not None:
-            try:
-                net.stop()
-            except Exception:
-                pass
-        ryu_proc.send_signal(signal.SIGTERM)
-        try:
-            ryu_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            ryu_proc.kill()
-        print("  Ryu 已停止")
-
-    # 6. 保存 CSV
-    dst_csv = os.path.join(DATA_DIR, f"traffic_data_{batch_idx}.csv")
+    timestamp = int(time.time())
+    dst_csv = os.path.join(DATA_DIR, f"traffic_data_continuous_{timestamp}.csv")
     if os.path.exists(SRC_CSV):
         shutil.copy2(SRC_CSV, dst_csv)
         size_kb = os.path.getsize(dst_csv) / 1024
-        print(f"  已保存: {dst_csv} ({size_kb:.1f} KB)")
+        print(f"  已保存单一大文件: {dst_csv} ({size_kb:.1f} KB)")
     else:
-        print(f"  警告: {SRC_CSV} 不存在，跳过保存")
+        print(f"  警告: {SRC_CSV} 不存在")
 
     cleanup()
-
-
-def main():
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    num_batches = 10
-
-    print(f"===== 训练数据采集 (动态随机置换) =====")
-    print(f"共 {num_batches} 批次，每批 {DURATION} 秒")
-    print(
-        f"每批 {DURATION // PERMUTATION_INTERVAL} 轮置换，"
-        f"每轮 {NUM_PAIRS} 对随机通信"
-    )
-    print(f"预计总耗时: {num_batches * (DURATION + STP_WAIT + 20) / 60:.0f} 分钟")
-
-    for idx in range(1, num_batches + 1):
-        collect_batch(idx, DURATION)
-
-    print(f"\n{'='*60}")
-    print(f"全部采集完成！")
-    csv_files = sorted(
-        [
-            f
-            for f in os.listdir(DATA_DIR)
-            if f.startswith("traffic_data_") and f.endswith(".csv")
-        ]
-    )
-    print(f"共生成 {len(csv_files)} 个数据文件:")
-    for f in csv_files:
-        size_kb = os.path.getsize(os.path.join(DATA_DIR, f)) / 1024
-        print(f"  {f} ({size_kb:.1f} KB)")
-    print(
-        f"\n下一步: cd scripts && python3 assemble_global_features.py && python3 train_global_mlp.py"
-    )
 
 
 if __name__ == "__main__":

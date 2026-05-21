@@ -48,21 +48,13 @@ class DynamicWeightEngine:
         num_links = len(self.link_keys)
         self.feature_history = [[0.0] * num_links for _ in range(self.window_size)]
 
-    def register_link(self, dpid, port_no):
-        """No-op in global model mode — link set is fixed at model load time."""
-        pass
-
-    def update_utilization(self, dpid, port_no, utilization):
-        """No-op in global model mode — use update_all_utilizations() instead."""
-        pass
-
     def update_all_utilizations(self, link_util_dict):
-        """Update the sliding window with a full snapshot of all link utilizations.
-
-        Called once per polling cycle with the complete link_utilization dict
-        from StatsMixin. Maintains a FIFO queue of WINDOW_SIZE snapshots.
-        """
+        """Update the sliding window with a full snapshot of all link utilizations."""
         self.current_utils = link_util_dict
+
+        # 修复措施：若未加载全局模型，则无需维护时序历史窗口，直接返回避免 pop(0) 触发 IndexError
+        if not self.global_model:
+            return
 
         # Build feature vector in the exact order of link_keys
         current_vector = []
@@ -97,15 +89,9 @@ class DynamicWeightEngine:
 
         return self.ALPHA * 1.0 + self.BETA * current + self.GAMMA * predicted
 
-    def apply_weights_to_topology(self, topo_manager):
-        """Update all edge weights in the TopologyManager graph."""
-        for (src, dst), port in topo_manager.link_ports.items():
-            weight = self.compute_weight(src, port, dst, None)
-            topo_manager.set_edge_weight(src, dst, weight)
-
     def get_group_weights(self, topo_manager):
         WEIGHT_DEADBAND = 0.10
-        # 扩展遍历范围：包含边缘交换机 (1-8) 和汇聚交换机 (9-16)
+        # 汇聚交换机 (9-16)
         SWITCH_MIN, SWITCH_MAX = 1, 16
         result = {}
 
@@ -117,7 +103,7 @@ class DynamicWeightEngine:
                 util = self.predicted_utils.get(key)
                 if util is None:
                     util = self.current_utils.get(key, 0.0)
-                    
+
                 available_list.append(np.exp(-3.0 * util))
 
             total = sum(available_list)
@@ -146,15 +132,3 @@ class DynamicWeightEngine:
             self._last_group_ratios[dpid] = ratios
 
         return result
-
-    def get_state_summary(self):
-        """Return a dict summarizing current engine state."""
-        return {
-            "models_loaded": 1 if self.global_model else 0,
-            "links_monitored": len(self.link_keys),
-            "avg_predicted_util": (
-                np.mean(list(self.predicted_utils.values()))
-                if self.predicted_utils
-                else 0.0
-            ),
-        }

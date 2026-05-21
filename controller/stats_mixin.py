@@ -86,6 +86,3 @@ class StatsMixin:
             self.prev_port_stats[key] = tx_bytes
         self.csv_file.flush()
         self.prev_time[dpid] = now
-
-    def set_path_util_keys(self, path_util_keys):
-        pass

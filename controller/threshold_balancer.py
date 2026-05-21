@@ -14,10 +14,11 @@ class ThresholdBalancer(BaseBalancer):
     def __init__(self, *args, **kwargs):
         super(ThresholdBalancer, self).__init__(*args, **kwargs)
         self.init_stats()
-        # 不传入 model_path， weight_engine 内部自动退化为基于当前实测利用率计算权重
         from controller.weight_engine import DynamicWeightEngine
 
         self.weight_engine = DynamicWeightEngine(model_path=None)
+        # 记录前一状态是否处于拥塞模式
+        self._was_congested = False
         self.decision_thread = hub.spawn(self._decision_loop)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -79,18 +80,30 @@ class ThresholdBalancer(BaseBalancer):
         self.configured_switches.add(dpid)
 
     def _decision_loop(self):
+        CONGESTION_THRESHOLD = 0.70
+
         while True:
             hub.sleep(self.POLL_INTERVAL)
             if not self.datapaths:
                 continue
 
-            # 仅更新当前利用率，不执行 predict_all() 预测
             self.weight_engine.update_all_utilizations(self.link_utilization)
 
-            # 直接基于当前实测的剩余带宽计算组表权重
-            group_weights = self.weight_engine.get_group_weights(self.topo)
+            is_congested = any(
+                util > CONGESTION_THRESHOLD for util in self.link_utilization.values()
+            )
+            group_weights = {}
 
-            # 协同修正全网汇聚层组表
+            if is_congested:
+                # 触发动态响应
+                group_weights = self.weight_engine.get_group_weights(self.topo)
+                self._was_congested = True
+            else:
+                # 仅在发生状态切换时，才恢复 50:50 对称分流
+                if self._was_congested:
+                    group_weights = {dpid: [(3, 50), (4, 50)] for dpid in range(9, 17)}
+                    self._was_congested = False
+
             for dpid, weights in group_weights.items():
                 if dpid in self.datapaths:
                     ofproto = self.datapaths[dpid].ofproto

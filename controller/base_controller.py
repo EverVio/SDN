@@ -44,7 +44,7 @@ class L2LearningSwitch(app_manager.RyuApp, StatsMixin):
             for port in [3, 4]:
                 buckets.append(
                     parser.OFPBucket(
-                        weight=1,
+                        weight=50,
                         watch_port=port,
                         watch_group=ofproto.OFPG_ANY,
                         actions=[parser.OFPActionOutput(port)],

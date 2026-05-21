@@ -42,17 +42,16 @@ def train_model():
     Y_train_scaled = scaler_Y.fit_transform(Y_train)
     Y_test_scaled = scaler_Y.transform(Y_test)
 
-    # 修改：将隐藏层结构由 (128, 64) 扩展至 (256, 128)
-    # 原因：时序窗口扩大一倍后输入空间维度翻倍，扩大网络宽带与深度可有效拟合更长周期的非线性时序依赖
     model = MLPRegressor(
-        hidden_layer_sizes=(256, 128),
+        hidden_layer_sizes=(128, 64),
         activation="relu",
         solver="adam",
-        alpha=0.001,
+        alpha=0.01,
         max_iter=1000,
         tol=1e-5,
         early_stopping=True,
-        validation_fraction=0.1,
+        n_iter_no_change=15,
+        validation_fraction=0.15,
         random_state=42,
         verbose=True,
     )
