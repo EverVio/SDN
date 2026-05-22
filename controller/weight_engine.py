@@ -4,10 +4,6 @@ import joblib
 
 
 class DynamicWeightEngine:
-    ALPHA = 1.0
-    BETA = 2.0
-    GAMMA = 3.0
-
     def __init__(self, model_path=None):
         self.global_model = None
         self.scaler_X = None
@@ -38,7 +34,7 @@ class DynamicWeightEngine:
         self.scaler_X = data["scaler_X"]
         self.scaler_Y = data["scaler_Y"]
         self.link_keys = data["link_keys"]
-        self.window_size = data.get("window_size", 3)
+        self.window_size = data.get("window_size", 6)
         self.models_loaded = True
 
         # 提取 Scaler 参数以实现原生归一化
@@ -50,6 +46,12 @@ class DynamicWeightEngine:
         # 提取 MLP 权重和偏置系数
         self.mlp_weights = self.global_model.coefs_
         self.mlp_biases = self.global_model.intercepts_
+
+        # 释放 sklearn 对象，推理阶段仅使用原生 NumPy
+        del self.global_model, self.scaler_X, self.scaler_Y
+        self.global_model = None
+        self.scaler_X = None
+        self.scaler_Y = None
 
         num_links = len(self.link_keys)
         self.feature_history = [[0.0] * num_links for _ in range(self.window_size)]
@@ -95,22 +97,13 @@ class DynamicWeightEngine:
         for i, key in enumerate(self.link_keys):
             self.predicted_utils[key] = float(pred[i])
 
-    def compute_weight(self, src_dpid, src_port, dst_dpid, dst_port):
-        key = (src_dpid, src_port)
-        current = self.current_utils.get(key, 0.0)
-        predicted = self.predicted_utils.get(key, current)
-
-        return self.ALPHA * 1.0 + self.BETA * current + self.GAMMA * predicted
-
-    def get_group_weights(self, topo_manager):
+    def get_group_weights(self):
         WEIGHT_DEADBAND = 0.05
-        SWITCH_MIN, SWITCH_MAX = 1, 16
-        result = {}
-
         WEIGHT_CURRENT = 0.4
         WEIGHT_PREDICTED = 0.6
+        result = {}
 
-        for dpid in range(SWITCH_MIN, SWITCH_MAX + 1):
+        for dpid in range(9, 17):
             uplink_ports = [3, 4]
             available_list = []
             for port_no in uplink_ports:

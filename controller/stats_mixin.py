@@ -5,15 +5,13 @@ from ryu.lib import hub
 
 
 class StatsMixin:
-    LINK_BW = 2_000_000
     POLL_INTERVAL = 0.5
 
-    def init_stats(self, topo_manager=None):
+    def init_stats(self):
         self.datapaths = {}
         self.prev_port_stats = {}
         self.prev_time = {}
         self.link_utilization = {}
-        self.topo_manager = topo_manager
 
         os.makedirs("data", exist_ok=True)
         self.csv_file = open("data/traffic_data.csv", "w", newline="")

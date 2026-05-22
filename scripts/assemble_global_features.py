@@ -39,7 +39,6 @@ def process_global_features():
     df = pd.concat(all_dfs, ignore_index=True)
 
     df = df[~((df["dpid"] <= 8) & (df["port_no"].isin([1, 2])))]
-    df = df[~df["link_label"].str.startswith("path_")]
     df = df[df["dpid"].isin(VALID_DPIDS)]
 
     print(f"\nBackbone records after filtering: {len(df)}")

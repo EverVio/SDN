@@ -3,81 +3,19 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
-from ryu.controller import ofp_event
-from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 from controller.base_balancer import BaseBalancer
+from controller.weight_engine import DynamicWeightEngine
 
 
 class ThresholdBalancer(BaseBalancer):
     def __init__(self, *args, **kwargs):
         super(ThresholdBalancer, self).__init__(*args, **kwargs)
         self.init_stats()
-        from controller.weight_engine import DynamicWeightEngine
-
         self.weight_engine = DynamicWeightEngine(model_path=None)
         # 记录前一状态是否处于拥塞模式
         self._was_congested = False
         self.decision_thread = hub.spawn(self._decision_loop)
-
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        self._setup_rules(ev.msg.datapath)
-
-    @set_ev_cls(ofp_event.EventOFPStateChange, MAIN_DISPATCHER)
-    def state_change_handler(self, ev):
-        if ev.state == MAIN_DISPATCHER:
-            self._setup_rules(ev.datapath)
-
-    def _setup_rules(self, datapath):
-        dpid = datapath.id
-        if dpid in self.configured_switches:
-            return
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        self.datapaths[dpid] = datapath
-
-        if dpid <= 16:
-            buckets = []
-            for port in [3, 4]:
-                buckets.append(
-                    parser.OFPBucket(
-                        weight=50,
-                        watch_port=port,
-                        watch_group=ofproto.OFPG_ANY,
-                        actions=[parser.OFPActionOutput(port)],
-                    )
-                )
-            datapath.send_msg(
-                parser.OFPGroupMod(
-                    datapath=datapath,
-                    command=ofproto.OFPGC_ADD,
-                    type_=ofproto.OFPGT_SELECT,
-                    group_id=1,
-                    buckets=buckets,
-                )
-            )
-
-        for i in range(16):
-            match = parser.OFPMatch(eth_dst=f"00:00:00:00:00:{i+1:02x}")
-            pod, e_idx = i // 4, (i % 4) // 2
-            if dpid <= 8:
-                actions = (
-                    [parser.OFPActionOutput((i % 2) + 1)]
-                    if (dpid - 1) // 2 == pod and (dpid - 1) % 2 == e_idx
-                    else [parser.OFPActionGroup(group_id=1)]
-                )
-            elif dpid <= 16:
-                actions = (
-                    [parser.OFPActionOutput(e_idx + 1)]
-                    if (dpid - 9) // 2 == pod
-                    else [parser.OFPActionGroup(group_id=1)]
-                )
-            else:
-                actions = [parser.OFPActionOutput(pod + 1)]
-            self.add_flow(datapath, 10, match, actions)
-        self.configured_switches.add(dpid)
 
     def _decision_loop(self):
         CONGESTION_THRESHOLD = 0.70
@@ -96,7 +34,7 @@ class ThresholdBalancer(BaseBalancer):
 
             if max_util > CONGESTION_THRESHOLD:
                 # 达到高水位，触发拥塞规避
-                group_weights = self.weight_engine.get_group_weights(self.topo)
+                group_weights = self.weight_engine.get_group_weights()
                 self._was_congested = True
             else:
                 # 仅在利用率回落到低水位且前置状态为拥塞时，安全恢复对称路由
@@ -106,22 +44,6 @@ class ThresholdBalancer(BaseBalancer):
 
             for dpid, weights in group_weights.items():
                 if dpid in self.datapaths:
-                    ofproto = self.datapaths[dpid].ofproto
-                    parser = self.datapaths[dpid].ofproto_parser
-                    buckets = [
-                        parser.OFPBucket(
-                            weight=w,
-                            watch_port=p,
-                            watch_group=ofproto.OFPG_ANY,
-                            actions=[parser.OFPActionOutput(p)],
-                        )
-                        for p, w in weights
-                    ]
-                    msg = parser.OFPGroupMod(
-                        datapath=self.datapaths[dpid],
-                        command=ofproto.OFPGC_MODIFY,
-                        type_=ofproto.OFPGT_SELECT,
-                        group_id=1,
-                        buckets=buckets,
+                    self._modify_group_weights(
+                        self.datapaths[dpid], group_id=1, weights=weights
                     )
-                    self.datapaths[dpid].send_msg(msg)
