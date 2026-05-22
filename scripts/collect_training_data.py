@@ -28,7 +28,7 @@ ALL_HOSTS = [f"h{pod}_{idx}" for pod in range(4) for idx in range(4)]
 
 # 优化采集效率：缩短轮次间隔，增加总轮数
 PERMUTATION_INTERVAL = 8
-TOTAL_ROUNDS = 200
+TOTAL_ROUNDS = 2000
 
 
 def wait_for_port(port, timeout=30):
@@ -67,7 +67,7 @@ def start_ryu():
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    print("===== 快速训练数据采集 =====")
+    print("===== 训练数据采集 =====")
     print(f"共 {TOTAL_ROUNDS} 轮置换，每轮 {PERMUTATION_INTERVAL} 秒")
     print(
         f"预计总耗时: {(TOTAL_ROUNDS * PERMUTATION_INTERVAL + STP_WAIT + 20) / 60:.0f} 分钟"
@@ -134,12 +134,8 @@ def main():
     ryu_proc.wait()
     print("  Ryu 已停止")
 
-    timestamp = int(time.time())
-    dst_csv = os.path.join(DATA_DIR, f"traffic_data_continuous_{timestamp}.csv")
     if os.path.exists(SRC_CSV):
-        shutil.copy2(SRC_CSV, dst_csv)
-        size_kb = os.path.getsize(dst_csv) / 1024
-        print(f"  已保存单一大文件: {dst_csv} ({size_kb:.1f} KB)")
+        print(f"  数据已保存在 {SRC_CSV}")
     else:
         print(f"  警告: {SRC_CSV} 不存在")
 

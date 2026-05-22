@@ -17,7 +17,7 @@ PREDICTION_STEP = 2
 # 新增：目标窗口大小（对应 1.5 秒）。模型将预测这段时间内的最大利用率，而非某一瞬间的值
 TARGET_WINDOW = 3
 
-IN_FILES = "../data/traffic_data_*.csv"
+IN_FILES = "../data/traffic_data.csv"
 OUTPUT_FILE = "../data/global_features.pkl"
 
 VALID_DPIDS = set(range(1, 21))

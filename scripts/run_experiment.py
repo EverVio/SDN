@@ -26,7 +26,6 @@
 import os
 import sys
 import time
-import signal
 import socket
 import subprocess
 import re
@@ -48,7 +47,6 @@ BURST_SUB_BW = 0.25  # 每条突发子流带宽 (Mbps)
 BASE_PORT = 5000  # iperf 端口基准（每条流使用 BASE_PORT + flow_number）
 CORE_LINK_BW = 2  # 每条核心链路带宽 (Mbps)，与 BW_AGG_CORE 一致
 
-# 扩展为 9 条背景流（3对主机，每对并行3个端口，总计 4.5Mbps）
 BACKGROUND_FLOWS = [
     ("h0_0", "h3_0"),
     ("h0_1", "h3_1"),
@@ -61,7 +59,6 @@ BACKGROUND_FLOWS = [
     ("h0_2", "h3_2"),
 ]
 
-# 扩展为 6 条突发子流（逐步抬升，总计 1.5Mbps）
 BURST_SUBFLOWS = [
     ("h0_3", "h3_3"),
     ("h0_0", "h3_3"),
@@ -81,17 +78,19 @@ CONTROLLERS = {
 def wait_for_port(port, timeout=30):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                return True
-        except (ConnectionRefusedError, OSError):
-            time.sleep(0.5)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        result = s.connect_ex(("127.0.0.1", port))
+        s.close()
+        if result == 0:
+            return True
+        time.sleep(0.5)
     return False
 
 
 def kill_ryu():
     os.system("pkill -f ryu-manager 2>/dev/null")
-    time.sleep(1)
+    time.sleep(0.5)
 
 
 def start_ryu(controller_script, group_name="run"):
@@ -114,17 +113,12 @@ def start_ryu(controller_script, group_name="run"):
 
 
 def _to_mbps(bw_value, unit):
-    """Convert bandwidth value to Mbits/sec."""
     if "Kbits" in unit:
         return bw_value / 1000.0
     return bw_value
 
 
 def parse_iperf_udp_output(output, expected_bw_mbps=None):
-    """Parse iperf2 UDP client output for loss, jitter, and bandwidth.
-
-    Handles both Mbits/sec and Kbits/sec units from iperf2 output.
-    """
     loss_pct = 0.0
     jitter_ms = 0.0
     bandwidth_mbps = 0.0
@@ -159,7 +153,6 @@ def parse_iperf_udp_output(output, expected_bw_mbps=None):
 
 
 def _collect_flow_result(client_log, server_log, expected_bw):
-    """Collect iperf results from client and server logs."""
     loss, jitter, bw = 0.0, 0.0, 0.0
     source = "none"
 
@@ -203,8 +196,9 @@ def run_experiment_group(group_name, controller_script):
     net.staticArp()
     configure_select_hash()
 
-    print("  Waiting for active topology convergence (LLDP Discovery)...")
-    time.sleep(10)
+    # 优化点 1：因架构采用完全离线常数级静态拓扑注入，无需冗长的主动发现等待，下调至 2 秒供连接建立
+    print("  Waiting for switch connections...")
+    time.sleep(2)
     print("  Topology core networks stabilized.")
 
     all_flows = BACKGROUND_FLOWS + BURST_SUBFLOWS
@@ -221,8 +215,7 @@ def run_experiment_group(group_name, controller_script):
                 f"iperf -s -u -p {port} -i 1", stdout=srv_f, stderr=subprocess.STDOUT
             )
             server_procs.append((srv_proc, srv_f))
-            time.sleep(0.1)
-    time.sleep(1)
+    time.sleep(0.5)
 
     print(f"  Phase 1: Starting {len(BACKGROUND_FLOWS)} background flows...")
     client_procs = []
@@ -241,8 +234,8 @@ def run_experiment_group(group_name, controller_script):
                 stderr=subprocess.STDOUT,
             )
             client_procs.append((proc, f))
-            time.sleep(0.5)
-            print(f"    Flow {i+1}: {src_name}->{dst_name} started (pid={proc.pid})")
+            # 优化点 2：缩短串行启动背景流时带来的累计硬件阻塞等待时间
+            time.sleep(0.01)
 
     print(f"  Waiting {BURST_DELAY}s before burst ramp-up...")
     time.sleep(BURST_DELAY)
@@ -267,13 +260,13 @@ def run_experiment_group(group_name, controller_script):
                 stderr=subprocess.STDOUT,
             )
             client_procs.append((proc, f))
-            time.sleep(0.5)
             print(
                 f"  Sub-flow {chr(65+j)}: {src_name}->{dst_name} @ {BURST_SUB_BW}Mbps started (pid={proc.pid})"
             )
+            # 优化点 3：移除此处产生额外 0.5s 累积偏差的 time.sleep(0.5)，确保子流间隔严格受 BURST_STAGGER 控制
 
     last_burst_start = BURST_DELAY + (len(BURST_SUBFLOWS) - 1) * BURST_STAGGER
-    wait_time = TEST_DURATION - last_burst_start + 5
+    wait_time = TEST_DURATION - last_burst_start + 2
     print(f"  Running test for remaining {wait_time}s...")
     time.sleep(wait_time)
 
@@ -329,7 +322,6 @@ def run_experiment_group(group_name, controller_script):
 
 
 def print_summary(all_results):
-    """Print comparative summary of all experiment groups."""
     n_bg = len(BACKGROUND_FLOWS)
     n_burst = len(BURST_SUBFLOWS)
     total_bw = n_bg * UDP_BANDWIDTH + n_burst * BURST_SUB_BW
@@ -407,28 +399,34 @@ def main():
     os.makedirs(data_dir, exist_ok=True)
 
     os.system("pkill -f ryu-manager 2>/dev/null")
-    time.sleep(1)
+    time.sleep(0.5)
     cleanup()
-    time.sleep(2)
+    time.sleep(1)
 
     if args.group == "all":
         groups = ["l2", "threshold", "predictive"]
     else:
         groups = [args.group]
 
-    # 初始化单轮详细结果 CSV 文件的表头
-    iteration_csv_path = os.path.join(data_dir, "iteration_results.csv")
-    with open(iteration_csv_path, "w", newline="") as f_iter:
-        writer = csv.writer(f_iter)
-        writer.writerow(
-            ["group", "iteration", "flow", "loss_pct", "jitter_ms", "bandwidth_mbps"]
-        )
-
     all_groups_avg = {}
 
     for group in groups:
-        # 用于缓存该组内所有轮次的流数据以计算均值
         group_history = {}
+
+        # 为当前 group 创建迭代结果 CSV（覆盖写入表头）
+        iteration_csv = os.path.join(data_dir, f"{group}_iteration_results.csv")
+        with open(iteration_csv, "w", newline="") as f_iter:
+            writer = csv.writer(f_iter)
+            writer.writerow(
+                [
+                    "group",
+                    "iteration",
+                    "flow",
+                    "loss_pct",
+                    "jitter_ms",
+                    "bandwidth_mbps",
+                ]
+            )
 
         for it in range(1, iters + 1):
             print(f"\n--- Group: {group} | Iteration {it}/{iters} ---")
@@ -437,8 +435,8 @@ def main():
             if not results:
                 continue
 
-            # 实时写入当前轮次的数据至 iteration_results.csv
-            with open(iteration_csv_path, "a", newline="") as f_iter:
+            # 追加当前迭代的数据到该 group 的迭代 CSV
+            with open(iteration_csv, "a", newline="") as f_iter:
                 writer = csv.writer(f_iter)
                 for flow_name, r in results.items():
                     writer.writerow(
@@ -464,9 +462,10 @@ def main():
                         r["bandwidth_mbps"]
                     )
 
-            time.sleep(2)
+            # 优化点 4：缩短多轮迭代之间的闲置等待时间至 0.5s
+            time.sleep(0.5)
 
-        # 计算并保存该组所有轮次的平均值
+        # 计算该 group 的平均结果并写入单独的 average CSV
         group_avg = {}
         for flow_name, metrics in group_history.items():
             avg_loss = (
@@ -490,17 +489,15 @@ def main():
                 "jitter_ms": avg_jitter,
                 "bandwidth_mbps": avg_bw,
             }
-        all_groups_avg[group] = group_avg
 
-    # 保存计算好的所有组流平均数据至文件 average_results.csv
-    average_csv_path = os.path.join(data_dir, "average_results.csv")
-    with open(average_csv_path, "w", newline="") as f_avg:
-        writer = csv.writer(f_avg)
-        writer.writerow(
-            ["group", "flow", "avg_loss_pct", "avg_jitter_ms", "avg_bandwidth_mbps"]
-        )
-        for group, flows in all_groups_avg.items():
-            for flow_name, metrics in flows.items():
+        # 保存该 group 的平均结果到 CSV
+        avg_csv = os.path.join(data_dir, f"{group}_average_results.csv")
+        with open(avg_csv, "w", newline="") as f_avg:
+            writer = csv.writer(f_avg)
+            writer.writerow(
+                ["group", "flow", "avg_loss_pct", "avg_jitter_ms", "avg_bandwidth_mbps"]
+            )
+            for flow_name, metrics in group_avg.items():
                 writer.writerow(
                     [
                         group,
@@ -511,7 +508,8 @@ def main():
                     ]
                 )
 
-    # 打印最终的聚合平均值总结界面
+        all_groups_avg[group] = group_avg
+
     print_summary(all_groups_avg)
 
 

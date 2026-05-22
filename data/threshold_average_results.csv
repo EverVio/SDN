@@ -1,0 +1,11 @@
+group,flow,avg_loss_pct,avg_jitter_ms,avg_bandwidth_mbps
+threshold,Flow 1,9.00,31.268,0.48
+threshold,Flow 2,16.66,34.204,0.44
+threshold,Flow 3,13.85,25.241,0.45
+threshold,Flow 4,16.27,32.035,0.44
+threshold,Flow 5,18.75,30.130,0.43
+threshold,Flow 6,18.70,27.597,0.43
+threshold,Flow 7,21.46,30.664,0.41
+threshold,Flow 8,19.87,31.258,0.42
+threshold,Flow 9,7.42,33.297,0.49
+threshold,Flow 4 (burst),15.64,34.618,1.34
