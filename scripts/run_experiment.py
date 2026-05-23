@@ -305,13 +305,13 @@ def run_experiment_group(group_name, controller_script):
             burst_bws.append(bw)
 
     if burst_bws:
-        results["Flow 4 (burst)"] = {
+        results["Burst Flows"] = {
             "loss_pct": sum(burst_losses) / len(burst_losses),
             "jitter_ms": sum(burst_jitters) / len(burst_jitters),
             "bandwidth_mbps": sum(burst_bws),
         }
     else:
-        results["Flow 4 (burst)"] = {"loss_pct": 0, "jitter_ms": 0, "bandwidth_mbps": 0}
+        results["Burst Flows"] = {"loss_pct": 0, "jitter_ms": 0, "bandwidth_mbps": 0}
 
     net.stop()
     ryu_proc.terminate()
@@ -342,7 +342,7 @@ def print_summary(all_results):
     print(f"Total:      {total_bw}Mbps on {4 * CORE_LINK_BW}Mbps capacity")
     print()
 
-    flow_names = [f"Flow {i+1}" for i in range(n_bg)] + ["Flow 4 (burst)"]
+    flow_names = [f"Flow {i+1}" for i in range(n_bg)] + ["Burst Flows"]
     header = f"{'Group':<15} {'Flow':<16} {'Loss%':>8} {'Jitter':>10} {'BW':>10}"
     print(header)
     print("-" * len(header))

@@ -1,42 +1,34 @@
 """
-Phase 1: Assemble global features for Global MLP model.
+Assemble global features for Global MLP model.
 
-Reads all traffic_data_*.csv files, filters to Fat-Tree k=4 backbone links,
+Reads traffic_data.csv, filters to Fat-Tree k=4 backbone links,
 pivots to per-timestamp matrices, and builds sliding window features.
 Output: data/global_features.pkl
 """
 
 import os
-import glob
 import pandas as pd
 import numpy as np
 import joblib
 
 WINDOW_SIZE = 6
 PREDICTION_STEP = 2
-# 新增：目标窗口大小（对应 1.5 秒）。模型将预测这段时间内的最大利用率，而非某一瞬间的值
+# 目标窗口大小（对应 1.5 秒）。模型将预测这段时间内的最大利用率，而非某一瞬间的值
 TARGET_WINDOW = 3
 
-IN_FILES = "../data/traffic_data.csv"
+IN_FILE = "../data/traffic_data.csv"
 OUTPUT_FILE = "../data/global_features.pkl"
 
 VALID_DPIDS = set(range(1, 21))
 
 
 def process_global_features():
-    csv_files = sorted(glob.glob(IN_FILES))
-    if not csv_files:
-        print("ERROR: No traffic_data_*.csv files found")
+    if not os.path.exists(IN_FILE):
+        print(f"ERROR: {IN_FILE} not found")
         return
 
-    print(f"Loading {len(csv_files)} data files...")
-    all_dfs = []
-    for f in csv_files:
-        df = pd.read_csv(f)
-        all_dfs.append(df)
-        print(f"  {f}: {len(df)} records")
-
-    df = pd.concat(all_dfs, ignore_index=True)
+    df = pd.read_csv(IN_FILE)
+    print(f"Loaded {IN_FILE}: {len(df)} records")
 
     df = df[~((df["dpid"] <= 8) & (df["port_no"].isin([1, 2])))]
     df = df[df["dpid"].isin(VALID_DPIDS)]

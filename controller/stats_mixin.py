@@ -17,7 +17,7 @@ class StatsMixin:
         self.csv_file = open("data/traffic_data.csv", "w", newline="")
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(
-            ["timestamp", "dpid", "port_no", "utilization", "link_label"]
+            ["timestamp", "dpid", "port_no", "utilization"]
         )
         self.csv_file.flush()
         self.monitor_thread = hub.spawn(self._monitor)
@@ -78,7 +78,6 @@ class StatsMixin:
                             dpid,
                             port_no,
                             f"{self.link_utilization[key]:.6f}",
-                            f"s{dpid}_p{port_no}",
                         ]
                     )
             self.prev_port_stats[key] = tx_bytes
