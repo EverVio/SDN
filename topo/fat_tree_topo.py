@@ -78,6 +78,11 @@ def create_topology(controller_ip="127.0.0.1", controller_port=6633):
 
 def configure_select_hash():
     for pod in range(PODS):
+        for i in range(EDGE_PER_POD):
+            os.system(
+                f"ovs-vsctl set bridge s{_edge_dpid(pod, i)} other_config:group-table-selection-method=dp_hash"
+            )
+    for pod in range(PODS):
         for i in range(AGG_PER_POD):
             os.system(
                 f"ovs-vsctl set bridge s{_agg_dpid(pod, i)} other_config:group-table-selection-method=dp_hash"
