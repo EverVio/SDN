@@ -62,8 +62,8 @@ def start_experiment():
 
     if group not in ("l2", "threshold", "predictive"):
         return jsonify({"error": "Invalid group"}), 400
-    if not (5 <= duration <= 120):
-        return jsonify({"error": "Duration must be 5-120 seconds"}), 400
+    if not (30 <= duration <= 600):
+        return jsonify({"error": "Duration must be 30-600 seconds"}), 400
 
     ok, msg = runner.start(group, duration)
     if not ok:

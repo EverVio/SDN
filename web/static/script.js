@@ -1,5 +1,5 @@
 /* ===================================================================
-   NOC // SDN Operations Console — Frontend Logic (Optimized Layout)
+   NOC // SDN Operations Console — Frontend Logic (Luxury Modern)
    =================================================================== */
 
 let cy = null;
@@ -13,25 +13,26 @@ let experimentDuration = 60;
 let progressTimer = null;
 let startTime = null;
 
+// Premium Color Palette matching CSS
 const COL = {
     accent: '#00f0ff',
-    accentDim: '#009ba3',
-    accentBright: '#66f7ff',
+    accentDim: '#4488ff',
     green: '#00ff88',
-    greenDim: '#00cc70',
     amber: '#ffb300',
-    amberDim: '#d49500',
     red: '#ff3355',
-    redDim: '#d62443',
-    blue: '#4488ff',
-    blueDim: '#3575e6',
-    textPrimary: '#f1f5f9',
-    textDim: '#64748b',
-    bgNode: '#121c2a',
-    bgNodeCore: '#1a0e14',
-    edgeIdle: '#1a2636',
-    edgeAggIdle: '#1e2e40',
-    edgeCoreIdle: '#261a22',
+    textMain: '#f1f5f9',
+    textMuted: '#94a3b8',
+    bgNodeCore: 'rgba(255, 51, 85, 0.1)',
+    bgNodeAgg: 'rgba(0, 240, 255, 0.1)',
+    bgNodeEdge: 'rgba(0, 255, 136, 0.1)',
+    bgNodeHost: 'rgba(255, 255, 255, 0.05)',
+    borderCore: '#ff3355',
+    borderAgg: '#00f0ff',
+    borderEdge: '#00ff88',
+    borderHost: '#64748b',
+    edgeIdle: 'rgba(255, 255, 255, 0.15)',
+    edgeAggIdle: 'rgba(255, 255, 255, 0.25)',
+    edgeCoreIdle: 'rgba(255, 255, 255, 0.35)',
 };
 
 function utilColor(u) {
@@ -59,15 +60,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     initControls();
     updateCanvasStatus();
 
-    addLog('控制台已初始化', 'info');
-    addLog('等待操作输入…', '');
+    addLog('System UI initialized (Luxury Modern V2).', 'info');
+    addLog('Awaiting input...', '');
 });
 
 function initSocket() {
     socket = io();
 
-    socket.on('connect', () => { addLog('上行链路已建立', 'info'); });
-    socket.on('disconnect', () => { addLog('上行链路已断开', 'error'); });
+    socket.on('connect', () => { addLog('Uplink established.', 'info'); });
+    socket.on('disconnect', () => { addLog('Uplink disconnected.', 'error'); });
     socket.on('update_util', (data) => handleUtilUpdate(data));
     socket.on('update_weights', (data) => handleWeightUpdate(data));
     socket.on('progress', (data) => updateProgress(data.elapsed, data.duration));
@@ -124,6 +125,7 @@ async function initTopology() {
         });
     }
 
+    // Advanced, refined Cytoscape styling
     cy = cytoscape({
         container: document.getElementById('cy'),
         elements: elements,
@@ -134,126 +136,141 @@ async function initTopology() {
         autoungrabify: false,
         style: [
             {
+                selector: 'node',
+                style: {
+                    'color': COL.textMain,
+                    'font-family': 'JetBrains Mono, monospace',
+                    'text-valign': 'bottom',
+                    'text-halign': 'center',
+                    'text-margin-y': 6,
+                    'font-size': '12px',
+                    'font-weight': '500',
+                    'text-outline-width': 2,
+                    'text-outline-color': '#0B0F19',
+                    'text-background-color': 'transparent',
+                    'text-background-opacity': 0,
+                }
+            },
+            {
                 selector: 'node.core',
                 style: {
-                    'shape': 'rectangle',
-                    'width': 56,
-                    'height': 56,
+                    'shape': 'round-rectangle',
+                    'width': 50,
+                    'height': 50,
                     'background-color': COL.bgNodeCore,
-                    'border-width': 2.5,
-                    'border-color': COL.red,
+                    'background-image': "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='50' height='50' viewBox='0 0 50 50'%3E%3Crect x='15' y='15' width='20' height='20' fill='none' stroke='%23ff3355' stroke-width='2'/%3E%3Ccircle cx='25' cy='25' r='4' fill='%23ff3355'/%3E%3C/svg%3E",
+                    'border-width': 2,
+                    'border-color': COL.borderCore,
                     'label': 'data(label)',
-                    'text-wrap': 'wrap',
-                    'text-valign': 'center',
-                    'text-halign': 'center',
-                    'font-size': '16px', /* 提升字号（原本 9px） */
-                    'font-family': 'Share Tech Mono, monospace',
-                    'font-weight': '600',
-                    'color': COL.textPrimary,
-                    'text-outline-width': 2,
-                    'text-outline-color': COL.bgNodeCore,
-                    'background-opacity': 0.9,
-                    'shadow-blur': 16,
-                    'shadow-color': 'rgba(255,51,85,0.25)',
+                    'shadow-blur': 15,
+                    'shadow-color': 'rgba(255, 51, 85, 0.4)',
                 },
             },
             {
                 selector: 'node.aggregation',
                 style: {
                     'shape': 'ellipse',
-                    'width': 48,
-                    'height': 48,
-                    'background-color': COL.bgNode,
-                    'border-width': 2.5,
-                    'border-color': COL.blue,
+                    'width': 42,
+                    'height': 42,
+                    'background-color': COL.bgNodeAgg,
+                    'background-image': "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='42' height='42' viewBox='0 0 42 42'%3E%3Ccircle cx='21' cy='21' r='10' fill='none' stroke='%2300f0ff' stroke-width='1.5'/%3E%3Ccircle cx='21' cy='21' r='3' fill='%2300f0ff'/%3E%3C/svg%3E",
+                    'border-width': 2,
+                    'border-color': COL.borderAgg,
                     'label': 'data(label)',
-                    'text-wrap': 'wrap',
-                    'text-valign': 'center',
-                    'text-halign': 'center',
-                    'font-size': '14px',
-                    'font-family': 'Share Tech Mono, monospace',
-                    'font-weight': '600',
-                    'color': COL.textPrimary,
-                    'text-outline-width': 2,
-                    'text-outline-color': COL.bgNode,
-                    'background-opacity': 0.9,
                     'shadow-blur': 12,
-                    'shadow-color': 'rgba(68,136,255,0.2)',
+                    'shadow-color': 'rgba(0, 240, 255, 0.3)',
                 },
             },
             {
                 selector: 'node.edge',
                 style: {
                     'shape': 'ellipse',
-                    'width': 42,
-                    'height': 42,
-                    'background-color': COL.bgNode,
+                    'width': 36,
+                    'height': 36,
+                    'background-color': COL.bgNodeEdge,
+                    'background-image': "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Cpath d='M18 10 L26 24 L10 24 Z' fill='none' stroke='%2300ff88' stroke-width='1.5'/%3E%3Ccircle cx='18' cy='18' r='2' fill='%2300ff88'/%3E%3C/svg%3E",
                     'border-width': 2,
-                    'border-color': COL.green,
+                    'border-color': COL.borderEdge,
                     'label': 'data(label)',
-                    'text-wrap': 'wrap',
-                    'text-valign': 'center',
-                    'text-halign': 'center',
-                    'font-size': '14px', /* 提升字号（原本 9px） */
-                    'font-family': 'Share Tech Mono, monospace',
-                    'font-weight': '600',
-                    'color': COL.textPrimary,
-                    'text-outline-width': 2,
-                    'text-outline-color': COL.bgNode,
-                    'background-opacity': 0.9,
                     'shadow-blur': 10,
-                    'shadow-color': 'rgba(0,255,136,0.15)',
+                    'shadow-color': 'rgba(0, 255, 136, 0.3)',
                 },
             },
             {
                 selector: 'node.host',
                 style: {
                     'shape': 'round-rectangle',
-                    'width': 68,
-                    'height': 24,
-                    'background-color': '#101820',
+                    'width': 56,
+                    'height': 20,
+                    'background-color': COL.bgNodeHost,
+                    'background-image': "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='20' viewBox='0 0 56 20'%3E%3Cline x1='15' y1='7' x2='41' y2='7' stroke='%2364748b' stroke-width='1'/%3E%3Cline x1='15' y1='13' x2='41' y2='13' stroke='%2364748b' stroke-width='1'/%3E%3C/svg%3E",
                     'border-width': 1.5,
-                    'border-color': '#3a4d64',
+                    'border-color': COL.borderHost,
                     'label': 'data(label)',
-                    'text-wrap': 'none',
-                    'text-valign': 'center',
-                    'text-halign': 'center',
-                    'font-size': '11px',
-                    'font-family': 'Share Tech Mono, monospace',
-                    'font-weight': '500',
-                    'color': COL.textDim,
-                    'text-outline-width': 1,
-                    'text-outline-color': '#101820',
-                    'background-opacity': 0.85,
+                    'font-size': '10px',
+                    'color': COL.textMuted,
+                    'text-margin-y': 4,
                 },
             },
             {
                 selector: 'edge.agg-core',
                 style: {
-                    'width': 2.0,
+                    'width': 2.5,
                     'line-color': COL.edgeCoreIdle,
                     'curve-style': 'bezier',
-                    'opacity': 0.7,
+                    'opacity': 0.6,
+                    'line-style': 'dashed',
+                    'line-dash-pattern': [4, 8],
                 },
             },
             {
                 selector: 'edge.edge-agg',
                 style: {
-                    'width': 1.6,
+                    'width': 2.0,
                     'line-color': COL.edgeAggIdle,
                     'curve-style': 'bezier',
-                    'opacity': 0.6,
+                    'opacity': 0.5,
+                    'line-style': 'dashed',
+                    'line-dash-pattern': [4, 6],
                 },
             },
             {
                 selector: 'edge.host-edge',
                 style: {
-                    'width': 1.2,
+                    'width': 1.5,
                     'line-color': COL.edgeIdle,
                     'curve-style': 'bezier',
-                    'opacity': 0.45,
+                    'opacity': 0.4,
+                    'line-style': 'dashed',
+                    'line-dash-pattern': [3, 5],
                 },
             },
+            {
+                selector: '.faded',
+                style: {
+                    'opacity': 0.05,
+                    'text-opacity': 0
+                }
+            },
+            {
+                selector: 'node.highlight',
+                style: {
+                    'border-width': 3,
+                    'border-color': '#fff',
+                    'shadow-blur': 25,
+                    'shadow-color': '#fff',
+                }
+            },
+            {
+                selector: 'edge.highlight-edge',
+                style: {
+                    'shadow-blur': 15,
+                    'shadow-color': '#fff',
+                    'line-color': '#fff',
+                    'opacity': 1,
+                    'width': 3,
+                }
+            }
         ],
     });
 
@@ -263,6 +280,29 @@ async function initTopology() {
         cy.fit(60); 
         createWeightBadges();
         updateCanvasStatus();
+        requestAnimationFrame(animateEdges); // Start animation loop
+    });
+
+    // Hover logic for neighborhood highlighting
+    cy.on('mouseover', 'node', function(e){
+        var node = e.target;
+        var neighborhood = node.neighborhood().add(node);
+        cy.elements().addClass('faded');
+        neighborhood.removeClass('faded');
+        node.addClass('highlight');
+        node.connectedEdges().addClass('highlight-edge');
+    });
+
+    cy.on('mouseout', 'node', function(e){
+        cy.elements().removeClass('faded highlight highlight-edge');
+    });
+
+    cy.on('mouseover', 'edge', function(e){
+        e.target.addClass('highlight-edge');
+    });
+
+    cy.on('mouseout', 'edge', function(e){
+        e.target.removeClass('highlight-edge');
     });
 
     cy.on('zoom pan', updateBadgePositions);
@@ -271,7 +311,7 @@ async function initTopology() {
 function updateCanvasStatus() {
     if (!cy) return;
     const zoomEl = document.getElementById('canvasZoom');
-    if (zoomEl) zoomEl.textContent = `缩放：${Math.round(cy.zoom() * 100)}%`;
+    if (zoomEl) zoomEl.textContent = `Zoom: ${Math.round(cy.zoom() * 100)}%`;
 }
 
 function createWeightBadges() {
@@ -308,12 +348,10 @@ function updateBadgePositions() {
         if (!badge) continue;
 
         const pos = node.renderedPosition();
-        const x = pos.x;
-        const y = pos.y;
-
-        badge.style.left = x + 'px';
-        badge.style.top = (y + 38 * zoom) + 'px';
-        badge.style.fontSize = Math.max(10, 12 * zoom) + 'px';
+        badge.style.left = pos.x + 'px';
+        badge.style.top = (pos.y + 34 * zoom) + 'px';
+        badge.style.fontSize = Math.max(9, 11 * zoom) + 'px';
+        badge.style.transform = `translate(-50%, 0) scale(${Math.min(1.5, Math.max(0.7, zoom))})`;
     }
 }
 
@@ -334,14 +372,14 @@ function handleUtilUpdate(data) {
         if (edge.length === 0) continue;
 
         const color = utilColor(util);
-        const width = 1.5 + util * 4.0;
-        const opacity = 0.5 + util * 0.5;
+        const width = edge.hasClass('agg-core') ? 2.5 + util * 3 : (edge.hasClass('edge-agg') ? 2.0 + util * 2.5 : 1.5 + util * 2);
+        const opacity = 0.6 + util * 0.4;
 
         edge.style({
             'line-color': color,
             'width': width,
             'opacity': opacity,
-            'shadow-blur': util > 0.5 ? 10 : 0,
+            'shadow-blur': util > 0.4 ? 12 + (util*10) : 0,
             'shadow-color': color,
         });
     }
@@ -350,13 +388,14 @@ function handleUtilUpdate(data) {
         const id = edge.id();
         if (!(id in edgeMax)) {
             let idleColor = COL.edgeIdle;
-            let idleWidth = 1.2;
-            if (edge.hasClass('agg-core')) { idleColor = COL.edgeCoreIdle; idleWidth = 2.0; }
-            else if (edge.hasClass('edge-agg')) { idleColor = COL.edgeAggIdle; idleWidth = 1.6; }
+            let idleWidth = 1.5;
+            let idleOp = 0.4;
+            if (edge.hasClass('agg-core')) { idleColor = COL.edgeCoreIdle; idleWidth = 2.5; idleOp = 0.6; }
+            else if (edge.hasClass('edge-agg')) { idleColor = COL.edgeAggIdle; idleWidth = 2.0; idleOp = 0.5; }
             edge.style({
                 'line-color': idleColor,
                 'width': idleWidth,
-                'opacity': edge.hasClass('host-edge') ? 0.45 : 0.6,
+                'opacity': idleOp,
                 'shadow-blur': 0,
             });
         }
@@ -375,29 +414,74 @@ function handleWeightUpdate(data) {
         const p3 = total > 0 ? Math.round(w3 / total * 100) : 50;
         const p4 = 100 - p3;
 
-        badge.textContent = `端口3:${w3} 端口4:${w4} [${p3}/${p4}]`;
+        badge.textContent = `P3:${w3} P4:${w4} [${p3}%]`;
         badge.classList.add('changed');
         setTimeout(() => badge.classList.remove('changed'), 600);
+    }
+}
+
+// 对数映射转换函数：滑块值 [0, 1000] -> 实际秒数 [30, 600]
+function sliderToValue(x) {
+    const yMin = 30;
+    const yMax = 600;
+    const val = yMin * Math.pow(yMax / yMin, x / 1000);
+    return Math.round(val);
+}
+
+// 逆向对数映射：实际秒数 [30, 600] -> 滑块值 [0, 1000]
+function valueToSlider(y) {
+    const yMin = 30;
+    const yMax = 600;
+    if (y < yMin) return 0;
+    if (y > yMax) return 1000;
+    const x = 1000 * Math.log(y / yMin) / Math.log(yMax / yMin);
+    return Math.round(x);
+}
+
+// 格式化显示时长，自动切换单位
+function formatDuration(seconds) {
+    if (seconds < 60) {
+        return { value: seconds, unit: 'sec' };
+    } else {
+        const m = Math.floor(seconds / 60);
+        const s = seconds % 60;
+        const sStr = String(s).padStart(2, '0');
+        return { value: `${m}:${sStr}`, unit: 'min' };
     }
 }
 
 function initControls() {
     const slider = document.getElementById('durationSlider');
     const valueEl = document.getElementById('durationValue');
+    const unitEl = document.querySelector('.duration-unit');
+
+    // 默认测试时长设为 60 秒
+    experimentDuration = 60;
+
+    // 根据默认时长初始化滑块位置与显示
+    const initialSliderVal = valueToSlider(experimentDuration);
+    slider.value = initialSliderVal;
+
+    const initialFormat = formatDuration(experimentDuration);
+    valueEl.textContent = initialFormat.value;
+    if (unitEl) unitEl.textContent = initialFormat.unit;
 
     slider.addEventListener('input', () => {
-        const val = parseInt(slider.value);
-        valueEl.textContent = val;
+        const x = parseInt(slider.value);
+        const val = sliderToValue(x);
         experimentDuration = val;
+
+        const format = formatDuration(val);
+        valueEl.textContent = format.value;
+        if (unitEl) unitEl.textContent = format.unit;
     });
 }
 
 async function startExperiment() {
     const group = document.getElementById('groupSelect').value;
     const duration = experimentDuration;
-    const groupNames = { l2: 'L2 基线 ECMP', threshold: '阈值响应', predictive: 'MLP 预测式' };
-
-    addLog(`开始执行：${groupNames[group]} / ${duration}秒`, 'info');
+    
+    addLog(`INIT EXECUTING POLICY: ${group.toUpperCase()} / ${duration}s`, 'info');
     setRunningState(true, group);
 
     try {
@@ -409,33 +493,33 @@ async function startExperiment() {
         const data = await resp.json();
 
         if (!resp.ok) {
-            addLog(`执行中止：${data.error}`, 'error');
+            addLog(`ABORTED: ${data.error}`, 'error');
             setRunningState(false);
             return;
         }
 
-        addLog(`实验运行中：${groupNames[group]}`, 'info');
+        addLog(`RUNTIME ACTIVE: ${group.toUpperCase()}`, 'info');
     } catch (err) {
-        addLog(`链路异常：${err.message}`, 'error');
+        addLog(`LINK FAIL: ${err.message}`, 'error');
         setRunningState(false);
     }
 }
 
 async function stopExperiment() {
-    addLog('已请求中止', 'warn');
+    addLog('REQUESTING ABORT...', 'warn');
 
     try {
         const resp = await fetch('/stop', { method: 'POST' });
         const data = await resp.json();
 
         if (!resp.ok) {
-            addLog(`中止失败：${data.error}`, 'error');
+            addLog(`ABORT FAILED: ${data.error}`, 'error');
             return;
         }
 
-        addLog('实验已终止', 'warn');
+        addLog('EXECUTION TERMINATED.', 'warn');
     } catch (err) {
-        addLog(`中止错误：${err.message}`, 'error');
+        addLog(`ABORT ERROR: ${err.message}`, 'error');
     }
 
     setRunningState(false);
@@ -443,62 +527,86 @@ async function stopExperiment() {
 
 function setRunningState(isRunning, group) {
     running = isRunning;
-    const chip = document.getElementById('statusChip');
+    const chip = document.getElementById('hudConsole'); // 绑定到新的 HUD 浮空指示层
     const text = document.getElementById('statusText');
     const code = document.getElementById('statusCode');
     const btnStart = document.getElementById('btnStart');
     const btnStop = document.getElementById('btnStop');
-    const progressSection = document.getElementById('progressSection');
+    const progressSection = document.getElementById('hudProgressSection'); // 绑定到新的 HUD 进度容器
 
     if (isRunning) {
-        chip.className = 'status-chip running';
-        text.textContent = '运行中';
-        code.textContent = '01';
+        if (chip) chip.className = 'hud-console running initializing';
+        if (text) text.textContent = 'Initializing';
+        if (code) code.textContent = '01';
         btnStart.disabled = true;
         btnStop.disabled = false;
-        progressSection.style.display = 'block';
-        startTime = Date.now();
+        if (progressSection) progressSection.style.display = 'flex';
+
+        // 瞬间切换到本地加载反馈
+        const track = document.querySelector('.progress-track');
+        if (track) track.classList.add('initializing');
+        const bar = document.getElementById('progressBar');
+        if (bar) bar.style.width = '100%';
+        const elapsedEl = document.getElementById('progressElapsed');
+        const remainingEl = document.getElementById('progressRemaining');
+        const pctEl = document.getElementById('progressPct');
+        if (elapsedEl) elapsedEl.textContent = '00:00';
+        if (remainingEl) remainingEl.textContent = 'Establishing OpenFlow...';
+        if (pctEl) pctEl.textContent = 'INIT';
     } else {
-        chip.className = 'status-chip';
-        text.textContent = '待机';
-        code.textContent = '00';
+        if (chip) chip.className = 'hud-console';
+        if (text) text.textContent = 'System Standby';
+        if (code) code.textContent = '00';
         btnStart.disabled = false;
         btnStop.disabled = true;
-        progressSection.style.display = 'none';
-        startTime = null;
+        if (progressSection) progressSection.style.display = 'none';
 
-        if (progressTimer) {
-            clearInterval(progressTimer);
-            progressTimer = null;
-        }
+        const track = document.querySelector('.progress-track');
+        if (track) track.classList.remove('initializing');
     }
 }
 
 function updateProgress(elapsed, duration) {
     const bar = document.getElementById('progressBar');
+    const track = document.querySelector('.progress-track');
     const elapsedEl = document.getElementById('progressElapsed');
     const remainingEl = document.getElementById('progressRemaining');
     const pctEl = document.getElementById('progressPct');
+    const statusText = document.getElementById('statusText');
+    const chip = document.getElementById('hudConsole');
 
-    const pct = Math.min(100, (elapsed / duration) * 100);
-    bar.style.width = pct + '%';
+    if (elapsed === 0) {
+        if (chip) chip.className = 'hud-console running initializing';
+        if (track) track.classList.add('initializing');
+        if (bar) bar.style.width = '100%';
+        if (elapsedEl) elapsedEl.textContent = '00:00';
+        if (remainingEl) remainingEl.textContent = 'Establishing OpenFlow...';
+        if (pctEl) pctEl.textContent = 'INIT';
+        if (statusText) statusText.textContent = 'Initializing';
+    } else {
+        if (chip) chip.className = 'hud-console running';
+        if (track) track.classList.remove('initializing');
+        const pct = Math.min(100, (elapsed / duration) * 100);
+        if (bar) bar.style.width = pct + '%';
 
-    const mins = Math.floor(elapsed / 60);
-    const secs = Math.floor(elapsed % 60);
-    elapsedEl.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        const mins = Math.floor(elapsed / 60);
+        const secs = Math.floor(elapsed % 60);
+        if (elapsedEl) elapsedEl.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 
-    const rem = Math.max(0, duration - elapsed);
-    remainingEl.textContent = `剩余：${Math.ceil(rem)}秒`;
-    pctEl.textContent = `${Math.floor(pct)}%`;
+        const rem = Math.max(0, duration - elapsed);
+        if (remainingEl) remainingEl.textContent = `Remaining: ${Math.ceil(rem)}s`;
+        if (pctEl) pctEl.textContent = `${Math.floor(pct)}%`;
+        if (statusText && running) statusText.textContent = 'Active Engine';
+    }
 }
 
 function onExperimentComplete(data) {
     setRunningState(false);
 
     if (data.status === 'success') {
-        addLog(`完成于 ${Math.floor(data.elapsed)}秒`, 'info');
+        addLog(`TASK COMPLETE IN ${Math.floor(data.elapsed)}s`, 'info');
     } else {
-        addLog(`失败，退出码 ${data.exit_code}`, 'error');
+        addLog(`TASK FAILED. EXIT CODE ${data.exit_code}`, 'error');
     }
 }
 
@@ -508,16 +616,16 @@ function showResults(data) {
     const body = document.getElementById('modalBody');
 
     const groupNames = {
-        'l2': 'L2 基线 ECMP',
-        'threshold': '阈值响应',
-        'predictive': 'MLP 预测式',
+        'l2': 'L2 Baseline ECMP',
+        'threshold': 'Threshold Active',
+        'predictive': 'MLP Predictive',
     };
 
-    title.textContent = `${groupNames[data.group] || data.group} // 报告`;
+    title.textContent = `${groupNames[data.group] || data.group} // REPORT`;
 
     let html = '<table class="results-table">';
     html += '<thead><tr>';
-    html += '<th>流</th><th>丢包率 %</th><th>抖动（毫秒）</th><th>带宽（Mbps）</th>';
+    html += '<th>Flow</th><th>Loss (%)</th><th>Jitter (ms)</th><th>BW (Mbps)</th>';
     html += '</tr></thead><tbody>';
 
     for (const row of data.results) {
@@ -529,10 +637,10 @@ function showResults(data) {
         const jitterClass = jitter > 5 ? 'metric-bad' : jitter > 1 ? 'metric-warn' : 'metric-good';
 
         html += '<tr>';
-        html += `<td>${row.flow}</td>`;
+        html += `<td><span style="opacity: 0.7; font-size: 11px;">#</span> ${row.flow}</td>`;
         html += `<td class="${lossClass}">${loss.toFixed(2)}%</td>`;
-        html += `<td class="${jitterClass}">${jitter.toFixed(3)} ms</td>`;
-        html += `<td>${bw.toFixed(2)} Mbps</td>`;
+        html += `<td class="${jitterClass}">${jitter.toFixed(3)}</td>`;
+        html += `<td>${bw.toFixed(2)}</td>`;
         html += '</tr>';
     }
 
@@ -550,14 +658,14 @@ function resetHighlight() {
 
     cy.edges().forEach(edge => {
         let idleColor = COL.edgeIdle;
-        let idleWidth = 1.2;
-        let idleOpacity = 0.45;
-        if (edge.hasClass('agg-core')) { idleColor = COL.edgeCoreIdle; idleWidth = 2.0; idleOpacity = 0.6; }
-        else if (edge.hasClass('edge-agg')) { idleColor = COL.edgeAggIdle; idleWidth = 1.6; idleOpacity = 0.6; }
+        let idleWidth = 1.5;
+        let idleOp = 0.4;
+        if (edge.hasClass('agg-core')) { idleColor = COL.edgeCoreIdle; idleWidth = 2.5; idleOp = 0.6; }
+        else if (edge.hasClass('edge-agg')) { idleColor = COL.edgeAggIdle; idleWidth = 2.0; idleOp = 0.5; }
         edge.style({
             'line-color': idleColor,
             'width': idleWidth,
-            'opacity': idleOpacity,
+            'opacity': idleOp,
             'shadow-blur': 0,
         });
     });
@@ -568,20 +676,25 @@ function resetHighlight() {
     }
 
     edgeUtil = {};
-    addLog('显示已重置', '');
+    addLog('Canvas visual state reset.', '');
 }
 
 function addLog(msg, cls) {
     const area = document.getElementById('logArea');
     const line = document.createElement('div');
-    line.className = 'log-line' + (cls ? ` ${cls}` : '');
+    
+    let finalCls = cls || '';
+    if (msg.startsWith('>>>') || msg.includes('[SYSTEM]')) {
+        finalCls = finalCls ? `${finalCls} system` : 'system';
+    }
+    line.className = 'log-line' + (finalCls ? ` ${finalCls}` : '');
 
     const now = new Date();
     const ts = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
 
     const tsSpan = document.createElement('span');
     tsSpan.className = 'log-ts';
-    tsSpan.textContent = ts;
+    tsSpan.textContent = `[${ts}]`;
 
     line.appendChild(tsSpan);
     line.appendChild(document.createTextNode(msg));
@@ -596,5 +709,26 @@ function addLog(msg, cls) {
 
 function clearLog() {
     document.getElementById('logArea').innerHTML = '';
-    addLog('日志已清空', '');
+    addLog('Terminal cleared.', '');
+}
+
+// Data flow animation
+let lastTime = 0;
+function animateEdges(time) {
+    requestAnimationFrame(animateEdges);
+    let dt = time - lastTime;
+    if (dt < 40) return; // Limit ~25fps for performance
+    lastTime = time;
+
+    cy.batch(() => {
+        cy.edges().forEach(edge => {
+            const util = edgeUtil[edge.id()] || 0;
+            // Only animate edges with active utilization to save performance
+            if (util > 0.05) {
+                let speed = Math.max(1, util * 8); // Speed scales with utilization
+                let currentOffset = edge.numericStyle('line-dash-offset') || 0;
+                edge.style('line-dash-offset', currentOffset - speed);
+            }
+        });
+    });
 }

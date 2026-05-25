@@ -36,7 +36,7 @@ class ExperimentRunner:
 
             self.group = group
             self.duration = duration
-            self.start_time = time.time()
+            self.start_time = None
 
             # Truncate traffic_data.csv to avoid stale data
             traffic_csv = os.path.join(PROJECT_ROOT, "data", "traffic_data.csv")
@@ -55,7 +55,7 @@ class ExperimentRunner:
                 pass
 
             cmd = [
-                "sudo", "python3",
+                "sudo", "python3", "-u",
                 os.path.join(PROJECT_ROOT, "scripts", "run_experiment.py"),
                 "--group", group,
                 "--duration", str(duration),
@@ -128,6 +128,20 @@ class ExperimentRunner:
                     decoded = line.decode("utf-8", errors="replace").strip()
                     if decoded:
                         self.socketio.emit("experiment_log", {"line": decoded})
+                        
+                        # 检测全网络连接完全建立并稳定的日志行，激活计时器
+                        if self.start_time is None:
+                            if ("Topology core networks stabilized." in decoded or
+                                "Starting background flows" in decoded or
+                                "Phase 1:" in decoded or
+                                "Sub-flow" in decoded):
+                                with self._lock:
+                                    if self.start_time is None:
+                                        import time
+                                        self.start_time = time.time()
+                                        self.socketio.emit("experiment_log", {
+                                            "line": ">>> [SYSTEM] Network fully connected. Starting timer now."
+                                        })
             except Exception:
                 pass
 
