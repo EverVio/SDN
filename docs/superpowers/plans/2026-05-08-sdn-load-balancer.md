@@ -149,18 +149,18 @@ h0_0 h0_1 h1_0 h1_1 h2_0 h2_1 h3_0 h3_1 h4_0 h4_1 h5_0 h5_1 h6_0 h6_1 h7_0 h7_1
 │                                    - 概率哈希碰撞 + 渐进突发
 │                                    - 多轮迭代 + CSV 输出
 ├── data/                          # 实验数据
-│   ├── traffic_data.csv           # 采集的原始遥测数据
+│   ├── traffic_data.csv           # 采集的原始遥测数据 (timestamp, dpid, port_no, utilization)
 │   ├── global_features.pkl        # 组装后的训练特征
-│   ├── l2_average_results.csv     # L2 基线平均结果
-│   ├── l2_iteration_results.csv   # L2 基线逐轮结果
-│   ├── threshold_average_results.csv
-│   ├── threshold_iteration_results.csv
-│   ├── predictive_average_results.csv
-│   ├── predictive_iteration_results.csv
+│   ├── predictive_average_results.csv  # AI 预测式平均结果
+│   ├── predictive_iteration_results.csv # AI 预测式逐轮结果
+│   ├── l2_average_results.csv     # L2 基线平均结果（待生成）
+│   ├── l2_iteration_results.csv   # L2 基线逐轮结果（待生成）
+│   ├── threshold_average_results.csv   # 阈值响应式平均结果（待生成）
+│   ├── threshold_iteration_results.csv # 阈值响应式逐轮结果（待生成）
 │   ├── ryu_l2.log / ryu_threshold.log / ryu_predictive.log
 │   └── screenshot/                # 环境截图
 ├── models/                        # ML 模型文件
-│   └── global_mlp_model.pkl       # 全局 MLP 模型 ✅ (~745KB)
+│   └── global_mlp_model.pkl       # 全局 MLP 模型 ✅ (~2.2MB)
 ├── figures/                       # 可视化图表（待生成）
 ├── docs/
 │   └── superpowers/plans/
@@ -253,7 +253,7 @@ python3 -c "from topo.fat_tree_topo import create_topology, cleanup; print('Impo
 
 - 每 0.5s 向所有交换机发送 `OFPPortStatsRequest`
 - 计算每条链路的瞬时利用率：`util = delta_bytes * 8 / (delta_time * LINK_BW)`
-- 写入 `data/traffic_data.csv`（timestamp, dpid, port_no, utilization, link_label）
+- 写入 `data/traffic_data.csv`（timestamp, dpid, port_no, utilization）
 - 固定轮询间隔 0.5s（无自适应调整）
 
 ### 2.2 按层带宽计算
@@ -268,10 +268,6 @@ def _get_port_bandwidth(self, dpid, port_no):
         return 2_000_000             # 上行端口 2 Mbps
     return 2_000_000                 # Core 层 2 Mbps
 ```
-
-### 2.3 链路标签
-
-简化为 `s{dpid}_p{port_no}` 格式，用于训练数据中的链路标识。
 
 ---
 
@@ -323,19 +319,22 @@ weight ∝ exp(-3.0 × effective_util)   （指数可用带宽分配）
 ```python
 def _load_global_model(self, model_path):
     data = joblib.load(model_path)
-    self.global_model = data["model"]        # sklearn MLPRegressor
-    self.scaler_X = data["scaler_X"]         # StandardScaler (输入)
-    self.scaler_Y = data["scaler_Y"]         # StandardScaler (输出)
+    model = data["model"]                    # sklearn MLPRegressor
+    scaler_X = data["scaler_X"]             # StandardScaler (输入)
+    scaler_Y = data["scaler_Y"]             # StandardScaler (输出)
     self.link_keys = data["link_keys"]       # [(dpid, port), ...] 骨干链路列表
     self.window_size = data.get("window_size", 6)
 
     # 提取权重矩阵用于原生 NumPy 推理（零 sklearn 运行时依赖）
-    self.mlp_weights = self.global_model.coefs_
-    self.mlp_biases = self.global_model.intercepts_
-    self.scaler_mean_X = self.scaler_X.mean_
-    self.scaler_scale_X = self.scaler_X.scale_
-    self.scaler_mean_Y = self.scaler_Y.mean_
-    self.scaler_scale_Y = self.scaler_Y.scale_
+    self.mlp_weights = model.coefs_
+    self.mlp_biases = model.intercepts_
+    self.scaler_mean_X = scaler_X.mean_
+    self.scaler_scale_X = scaler_X.scale_
+    self.scaler_mean_Y = scaler_Y.mean_
+    self.scaler_scale_Y = scaler_Y.scale_
+
+    # 释放 sklearn 对象，仅保留 NumPy 数组
+    del model, scaler_X, scaler_Y
 ```
 
 ### 4.3 原生 NumPy 前向传播推理
@@ -389,7 +388,7 @@ def get_group_weights(self):
 ### 5.1 架构
 
 ```
-base_controller.py (继承 StatsMixin)
+base_controller.py (继承 BaseBalancer → StatsMixin)
 ├── _setup_rules(datapath)
 │   ├── 创建 Group Table (SELECT, port 3/4, weight 50/50)
 │   └── 安装 16 条 eth_dst 流表 (priority 10)
@@ -418,8 +417,8 @@ threshold_balancer.py (继承 BaseBalancer)
 ├── BaseBalancer                 # 公共基类：Group Table + 流表
 ├── DynamicWeightEngine          # 无 ML 模型 (model_path=None)
 ├── __init__                     # _was_congested = False
-├── _setup_rules(datapath)       # 与 BaseBalancer 相同的 Group + 流表
-├── _decision_loop()             # 迟滞阈值决策
+├── _setup_rules(datapath)       # 继承自 BaseBalancer
+├── on_telemetry_tick()          # 每 0.5s 由 StatsMixin._monitor 回调
 │   ├── CONGESTION_THRESHOLD = 0.70
 │   ├── RECOVERY_THRESHOLD = 0.30
 │   ├── max_util > 0.70 → get_group_weights() + MODIFY Group
@@ -430,7 +429,7 @@ threshold_balancer.py (继承 BaseBalancer)
 ### 6.2 决策循环
 
 ```
-每 0.5s:
+on_telemetry_tick() — 每 0.5s 由 StatsMixin._monitor 回调:
   1. update_all_utilizations(link_utilization)
   2. max_util = max(link_utilization.values())
   3. if max_util > 0.70:
@@ -454,22 +453,22 @@ threshold_balancer.py (继承 BaseBalancer)
 
 ```
 predictive_balancer.py (继承 BaseBalancer)
-├── BaseBalancer                 # 公共基类
+├── BaseBalancer                 # 公共基类（含 _modify_group_weights）
 ├── DynamicWeightEngine          # 加载 global_mlp_model.pkl
 ├── __init__                     # 加载 MLP 模型
-├── _setup_rules(datapath)       # Group + 流表
-├── _decision_loop()             # ML 驱动决策
+├── _setup_rules(datapath)       # 继承自 BaseBalancer
+├── on_telemetry_tick()          # 每 0.5s 由 StatsMixin._monitor 回调
 │   ├── update_all_utilizations → 喂入当前利用率
 │   ├── predict_all → NumPy 前向传播
 │   ├── get_group_weights → 指数权重分配
-│   └── _modify_group_weights → MODIFY Group Table
-└── _modify_group_weights(datapath, group_id, weights)
+│   └── 遍历 dpid 9-16 → _modify_group_weights → MODIFY Group Table
+└── port_stats_reply_handler → StatsMixin
 ```
 
 ### 7.2 决策循环
 
 ```
-每 0.5s:
+on_telemetry_tick() — 每 0.5s 由 StatsMixin._monitor 回调:
   1. weight_engine.update_all_utilizations(link_utilization)
      → 维护滑动窗口 feature_history (window=6)
   2. weight_engine.predict_all()
@@ -480,7 +479,7 @@ predictive_balancer.py (继承 BaseBalancer)
        effective = 0.4×current + 0.6×predicted
        weight ∝ exp(-3 × effective)
      → 5% 死区防振荡
-  4. 对每个需要更新的交换机:
+  4. 对每个需要更新的交换机 (dpid 9-16):
      _modify_group_weights(datapath, group_id=1, weights)
      → OFPGC_MODIFY: 更新 SELECT Group 的 bucket weights
 ```
@@ -493,6 +492,7 @@ predictive_balancer.py (继承 BaseBalancer)
 | 利用率计算 | 仅当前 `current_util` | `0.4×current + 0.6×predicted` |
 | 决策触发 | `max_util > 0.70` 才行动 | 每轮都调整（指数权重平滑过渡） |
 | 恢复机制 | `max_util < 0.30` 重置 50/50 | 权重自然恢复（预测值降低时） |
+| 回调方法 | `on_telemetry_tick()` | `on_telemetry_tick()` |
 | 响应延迟 | 拥塞后 2-3s 检测 | 趋势提前识别 |
 
 ---
@@ -508,7 +508,7 @@ predictive_balancer.py (继承 BaseBalancer)
 ```bash
 sudo python3 scripts/collect_training_data.py
 # 2000 轮 × 8s，约 267 分钟（~4.5 小时）
-# 使用 Fat-Tree 拓扑 + threshold_balancer 控制器
+# 使用 Fat-Tree 拓扑 + base_controller 控制器（L2 基线）
 # 每轮随机配对 16 个主机，产生多样化流量模式
 ```
 
@@ -536,8 +536,10 @@ cd scripts && python3 train_global_mlp.py
 ```
 
 **模型配置：**
-- `MLPRegressor(hidden_layer_sizes=(128, 64), activation='relu', solver='adam')`
-- `alpha=0.01, max_iter=1000, early_stopping=True, validation_fraction=0.15`
+- `MLPRegressor(hidden_layer_sizes=(256, 128, 64), activation='relu', solver='adam')`
+- `alpha=0.001, learning_rate='adaptive', max_iter=1000, tol=1e-5`
+- `early_stopping=True, n_iter_no_change=20, validation_fraction=0.15`
+- `random_state=42, verbose=True`
 - StandardScaler 对输入 X 和输出 Y 分别标准化
 - 80/20 时间序列切分（无 shuffle）
 - 输出：`models/global_mlp_model.pkl`（包含 model, scaler_X, scaler_Y, link_keys, window_size）
@@ -579,13 +581,19 @@ Fat-Tree k=4: Pod 0 ↔ Pod 3 有 4 条等价 Core 路径
 总横截带宽 = 4 × 2Mbps = 8Mbps
 
 阶段 1 (t=0s):   启动 9 条 0.5Mbps 背景流 (4.5Mbps, 无拥塞)
-阶段 2 (t=20s):  渐进启动突发子流 (3 条 0.25Mbps, 间隔 6s)
+  - 3 对唯一 src-dst 对各重复 3 次: h0_0→h3_0, h0_1→h3_1, h0_2→h3_2
+阶段 2 (t=20s):  渐进启动突发子流 (6 条 0.25Mbps, 间隔 6s)
+  - 3 对 src-dst 对各重复 2 次: h0_3→h3_3, h0_0→h3_3, h0_1→h3_3
   - t=20s: +0.25Mbps → 4.75Mbps
   - t=26s: +0.25Mbps → 5.0Mbps
   - t=32s: +0.25Mbps → 5.25Mbps
+  - t=38s: +0.25Mbps → 5.50Mbps
+  - t=44s: +0.25Mbps → 5.75Mbps
+  - t=50s: +0.25Mbps → 6.0Mbps
 
 哈希碰撞: 背景流占路径，突发流有概率哈希到已占用路径
 碰撞时该链路 > 2Mbps → 丢包
+实验总时长: 60s
 ```
 
 ### 9.3 运行实验
@@ -602,31 +610,28 @@ sudo python3 scripts/run_experiment.py --group predictive --iters 5
 
 ### 9.4 实验结果
 
-**L2 基线（静态 ECMP 50/50）：**
+> **注意：** 目前仅完成了 AI 预测式（predictive）的实验。L2 基线和阈值响应式的实验结果待运行后补充。
+> 运行命令：`sudo python3 scripts/run_experiment.py --group l2 --iters 5` 和 `--group threshold`
+
+**AI 预测式（全局 MLP）— 5 轮平均：**
 
 | 流 | 平均丢包率 | 平均抖动 | 平均带宽 |
 |----|-----------|---------|---------|
-| Flow 1-9 | 5.3% ~ 49.3% | 4.1 ~ 13.7 ms | 0.27 ~ 0.50 Mbps |
-| 突发流 | 30.1% | 16.9 ms | 1.11 Mbps |
+| Flow 1 | 5.88% | 22.6 ms | 0.46 Mbps |
+| Flow 2 | 10.44% | 26.5 ms | 0.43 Mbps |
+| Flow 3 | 10.02% | 19.9 ms | 0.44 Mbps |
+| Flow 4 | 5.81% | 17.4 ms | 0.46 Mbps |
+| Flow 5 | 16.70% | 13.6 ms | 0.40 Mbps |
+| Flow 6 | 18.08% | 25.2 ms | 0.40 Mbps |
+| Flow 7 | 16.14% | 13.1 ms | 0.41 Mbps |
+| Flow 8 | 8.20% | 19.0 ms | 0.45 Mbps |
+| Flow 9 | 2.56% | 28.9 ms | 0.48 Mbps |
+| 突发流（聚合） | 13.28% | 19.4 ms | 1.33 Mbps |
 
-**阈值响应式：**
-
-| 流 | 平均丢包率 | 平均抖动 | 平均带宽 |
-|----|-----------|---------|---------|
-| Flow 1-9 | 7.4% ~ 21.5% | 25.2 ~ 34.2 ms | 0.41 ~ 0.49 Mbps |
-| 突发流 | 15.6% | 34.6 ms | 1.34 Mbps |
-
-**AI 预测式（全局 MLP）：**
-
-| 流 | 平均丢包率 | 平均抖动 | 平均带宽 |
-|----|-----------|---------|---------|
-| Flow 1-9 | 4.1% ~ 14.3% | 20.9 ~ 26.0 ms | 0.45 ~ 0.50 Mbps |
-| 突发流 | 11.2% | 28.6 ms | 1.41 Mbps |
-
-**关键对比：**
-- 丢包率：AI (4-14%) < 阈值 (7-21%) < L2 (5-49%)，AI 降低约 30-50%
-- 突发流丢包：AI 11.2% vs 阈值 15.6% vs L2 30.1%
-- 带宽利用率：AI 1.41 Mbps > 阈值 1.34 Mbps > L2 1.11 Mbps
+**待补充的关键对比（L2 + 阈值实验完成后）：**
+- 丢包率：AI vs 阈值 vs L2
+- 突发流丢包率对比
+- 带宽利用率对比
 
 ### 9.5 结果可视化
 
@@ -739,6 +744,9 @@ sh ovs-ofctl dump-groups s9 -O OpenFlow13
 - [x] **Phase 8：** 数据采集 + 全局特征组装 + 全局 MLP 训练
 - [x] **Phase 9：** 三阶段对照实验 + CSV 结果输出
 - [ ] **收尾：** 结果可视化 (plot_results.py) + 截图 + 录屏 + 数据文件整理
+  - [ ] 运行 L2 基线实验：`sudo python3 scripts/run_experiment.py --group l2 --iters 5`
+  - [ ] 运行阈值响应式实验：`sudo python3 scripts/run_experiment.py --group threshold --iters 5`
+  - [ ] 编写 plot_results.py 生成对比图表到 figures/
 
 ---
 
@@ -746,7 +754,7 @@ sh ovs-ofctl dump-groups s9 -O OpenFlow13
 
 | 维度 | 旧版（计划） | 当前实现 |
 |------|-------------|---------|
-| ML 模型 | 逐链路 RandomForestRegressor | 全局 MLPRegressor (128, 64) |
+| ML 模型 | 逐链路 RandomForestRegressor | 全局 MLPRegressor (256, 128, 64) |
 | 模型文件 | `model_link_{name}.pkl` (多个) | `global_mlp_model.pkl` (单个) |
 | 推理方式 | sklearn predict() | 原生 NumPy 前向传播（零 sklearn 依赖） |
 | 路由机制 | Dijkstra 最短路径 + per-flow 流表 | OpenFlow Group Table (SELECT) + eth_dst 流表 |

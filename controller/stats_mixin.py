@@ -1,6 +1,6 @@
-import time
-import os
 import csv
+import os
+import time
 from ryu.lib import hub
 
 
@@ -12,6 +12,8 @@ class StatsMixin:
         self.prev_port_stats = {}
         self.prev_time = {}
         self.link_utilization = {}
+        self.current_snapshot_ts = 0.0
+        self.xid_to_ts = {}
 
         os.makedirs("data", exist_ok=True)
         self.csv_file = open("data/traffic_data.csv", "w", newline="")
@@ -26,16 +28,17 @@ class StatsMixin:
             if not self.datapaths:
                 continue
 
-            # 1. 串行触发周期性决策：此时上一轮下发的异步 Reply 早已全部处理完毕并写入内存
-            # 这样保证了状态读取和时序推进与主遥测时钟域完全对齐
+            self.current_snapshot_ts = (
+                time.time() // self.POLL_INTERVAL
+            ) * self.POLL_INTERVAL
+
             if hasattr(self, "on_telemetry_tick"):
                 self.on_telemetry_tick()
 
-            # 2. 推进到下一管道阶段，正式下发新一轮的拓扑遥测请求
             for dp in list(self.datapaths.values()):
-                dp.send_msg(
-                    dp.ofproto_parser.OFPPortStatsRequest(dp, 0, dp.ofproto.OFPP_ANY)
-                )
+                req = dp.ofproto_parser.OFPPortStatsRequest(dp, 0, dp.ofproto.OFPP_ANY)
+                self.xid_to_ts[req.xid] = self.current_snapshot_ts
+                dp.send_msg(req)
 
     def _get_port_bandwidth(self, dpid, port_no):
         if dpid <= 8:
@@ -50,7 +53,12 @@ class StatsMixin:
         msg = ev.msg
         dpid = msg.datapath.id
         now = time.time()
-        bucket_ts = (now // self.POLL_INTERVAL) * self.POLL_INTERVAL
+
+        # 精确反解析发出遥测请求时的时钟快照时间
+        bucket_ts = self.xid_to_ts.get(msg.xid, self.current_snapshot_ts)
+
+        if msg.xid in self.xid_to_ts:
+            del self.xid_to_ts[msg.xid]
 
         if dpid not in self.prev_time:
             for stat in msg.body:

@@ -4,19 +4,19 @@
 """
 
 import os
-import sys
-import time
 import random
 import signal
 import socket
 import subprocess
+import sys
+import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 sys.path.append("/usr/lib/python3/dist-packages")
 
 from mininet.log import setLogLevel
-from topo.fat_tree_topo import create_topology, cleanup
+from topo.fat_tree_topo import cleanup, create_topology
 
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 SRC_CSV = os.path.join(DATA_DIR, "traffic_data.csv")
@@ -50,8 +50,8 @@ def kill_ryu():
 
 def start_ryu():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    # 采用闭环策略：使用 threshold_balancer 采集数据，使模型学习路由切换后的状态转移
-    controller_path = os.path.join(project_root, "controller", "threshold_balancer.py")
+    # 采用开环策略：使用 base_controller 采集数据，使模型学习无干预下的自然流量动态
+    controller_path = os.path.join(project_root, "controller", "base_controller.py")
     proc = subprocess.Popen(
         ["ryu-manager", controller_path, "--observe-links"],
         stdout=subprocess.PIPE,
@@ -90,7 +90,9 @@ def main():
     for host_name in ALL_HOSTS:
         h = net.get(host_name)
         if h is not None:
-            h.cmd("iperf -s -u &")
+            # 关键修改：在两套不同的端口上启动服务端，支持同源同目的并发 UDP 流的精确接收
+            h.cmd("iperf -s -u -p 5001 &")
+            h.cmd("iperf -s -u -p 5002 &")
     time.sleep(1)
 
     print("  开始连续流量生成...")
@@ -107,16 +109,28 @@ def main():
 
             # 消除分布偏移：一半使用渐进流（模拟测试环境），一半使用随机恒定流
             if idx < len(pairs) // 2:
-                src.cmd(f"iperf -c {dst.IP()} -u -b 0.5M -t {PERMUTATION_INTERVAL} &")
+                # 关键修改：显式隔离并发测试流的物理目标端口（5001 与 5002）
                 src.cmd(
-                    f"sh -c 'sleep 3 && iperf -c {dst.IP()} -u -b 0.5M -t {PERMUTATION_INTERVAL - 3}' &"
+                    f"iperf -c {dst.IP()} -u -b 0.5M -t {PERMUTATION_INTERVAL} -p 5001 &"
+                )
+                src.cmd(
+                    f"sh -c 'sleep 3 && iperf -c {dst.IP()} -u -b 0.5M -t {PERMUTATION_INTERVAL - 3} -p 5002' &"
                 )
             else:
                 bw = round(random.uniform(0.2, 1.6), 2)
-                src.cmd(f"iperf -c {dst.IP()} -u -b {bw}M -t {PERMUTATION_INTERVAL} &")
+                src.cmd(
+                    f"iperf -c {dst.IP()} -u -b {bw}M -t {PERMUTATION_INTERVAL} -p 5001 &"
+                )
 
         print(f"    Round {round_idx + 1}/{TOTAL_ROUNDS}")
         time.sleep(PERMUTATION_INTERVAL)
+
+        # 关键修改：在当前轮次倒计时结束时，强制杀掉当前所有的 iperf 客户端发流进程
+        # 防止因 Linux 调度或环境延迟导致旧进程残留、并在下一轮初期发生流量重叠污染
+        for host_name in ALL_HOSTS:
+            h = net.get(host_name)
+            if h is not None:
+                h.cmd("pkill -f 'iperf -c'")
 
     print("  清理流量进程...")
     for host_name in ALL_HOSTS:
