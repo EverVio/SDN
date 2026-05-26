@@ -1,11 +1,11 @@
 group,flow,avg_loss_pct,avg_jitter_ms,avg_bandwidth_mbps
-predictive,Flow 1,13.18,16.349,0.45
-predictive,Flow 2,14.77,17.213,0.44
-predictive,Flow 3,9.49,17.694,0.47
-predictive,Flow 4,14.56,20.873,0.44
-predictive,Flow 5,14.76,21.083,0.44
-predictive,Flow 6,16.21,20.840,0.43
-predictive,Flow 7,11.94,18.334,0.45
-predictive,Flow 8,19.76,17.488,0.41
-predictive,Flow 9,10.25,18.524,0.46
-predictive,Burst Flows,14.22,20.758,1.33
+predictive,Flow 1,17.00,27.131,0.43
+predictive,Flow 2,36.00,27.308,0.33
+predictive,Flow 3,7.50,41.398,0.48
+predictive,Flow 4,7.10,2.330,0.49
+predictive,Flow 5,6.80,4.833,0.49
+predictive,Flow 6,17.00,23.691,0.43
+predictive,Flow 7,6.80,7.321,0.49
+predictive,Flow 8,21.00,26.672,0.41
+predictive,Flow 9,13.00,27.710,0.46
+predictive,Burst Flows,12.47,12.823,1.38

@@ -14,11 +14,12 @@ def get_topology_json():
     edges = []
 
     # --- Core switches (dpid 17-20) ---
+    # 黄金几何对称点：居中分布在 Pod 半区交界线上，Y 轴置于 100px
     core_positions = [
-        (300, 80),
-        (600, 80),
-        (900, 80),
-        (1200, 80),
+        (300, 100),
+        (500, 100),
+        (1100, 100),
+        (1300, 100),
     ]
     for i, (x, y) in enumerate(core_positions):
         dpid = 17 + i
@@ -35,15 +36,12 @@ def get_topology_json():
         )
 
     # --- Aggregation switches (dpid 9-16) ---
+    # 均匀等间距排列 (200px 步长)，Y 轴与核心层大幅度拉开至 520px
     agg_positions = [
-        (250, 280),
-        (450, 280),  # Pod 0: s9, s10
-        (550, 280),
-        (750, 280),  # Pod 1: s11, s12
-        (850, 280),
-        (1050, 280),  # Pod 2: s13, s14
-        (1150, 280),
-        (1350, 280),  # Pod 3: s15, s16
+        (200, 520), (400, 520),  # Pod 0
+        (600, 520), (800, 520),  # Pod 1
+        (1000, 520), (1200, 520),  # Pod 2
+        (1400, 520), (1600, 520),  # Pod 3
     ]
     for i, (x, y) in enumerate(agg_positions):
         dpid = 9 + i
@@ -61,15 +59,12 @@ def get_topology_json():
         )
 
     # --- Edge switches (dpid 1-8) ---
+    # 与汇聚层对齐等间距排列，Y 轴与汇聚层大幅度拉开至 940px
     edge_positions = [
-        (250, 530),
-        (450, 530),  # Pod 0: s1, s2
-        (550, 530),
-        (750, 530),  # Pod 1: s3, s4
-        (850, 530),
-        (1050, 530),  # Pod 2: s5, s6
-        (1150, 530),
-        (1350, 530),  # Pod 3: s7, s8
+        (200, 940), (400, 940),  # Pod 0
+        (600, 940), (800, 940),  # Pod 1
+        (1000, 940), (1200, 940),  # Pod 2
+        (1400, 940), (1600, 940),  # Pod 3
     ]
     for i, (x, y) in enumerate(edge_positions):
         dpid = 1 + i
@@ -86,15 +81,15 @@ def get_topology_json():
         )
 
     # --- Hosts (h{pod}_{idx}) ---
-    # Each edge switch has 2 hosts below it
+    # 终端高度拉近：Host Y 轴缩进至 1100px (与边缘层仅相差 160px)，呈现Pod内聚终端卡
     for pod in range(4):
         for e_idx in range(2):
             edge_dpid = pod * 2 + e_idx + 1
             ex, ey = edge_positions[pod * 2 + e_idx]
             for h_idx in range(2):
                 host_name = f"h{pod}_{e_idx * 2 + h_idx}"
-                hx = ex + (h_idx * 2 - 1) * 30  # -30, +30 offset
-                hy = 730
+                hx = ex + (h_idx * 2 - 1) * 45  
+                hy = 1100
                 nodes.append(
                     {
                         "data": {

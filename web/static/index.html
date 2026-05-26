@@ -8,7 +8,9 @@
     <link rel="stylesheet" href="/static/style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+        rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
 </head>
@@ -26,7 +28,8 @@
                 <div class="logo-glyph">
                     <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
                         <!-- Modernized sleek geometric logo -->
-                        <path d="M18 4L30 11V25L18 32L6 25V11L18 4Z" stroke="url(#logo-grad)" stroke-width="1.5" fill="rgba(20, 255, 200, 0.05)">
+                        <path d="M18 4L30 11V25L18 32L6 25V11L18 4Z" stroke="url(#logo-grad)" stroke-width="1.5"
+                            fill="rgba(20, 255, 200, 0.05)">
                             <animate attributeName="opacity" values="0.8;1;0.8" dur="3s" repeatCount="indefinite" />
                         </path>
                         <circle cx="18" cy="18" r="4" fill="url(#logo-grad)">
@@ -106,11 +109,11 @@
                     <div class="btn-group">
                         <button class="btn btn-primary" id="btnStart" onclick="startExperiment()">
                             <span class="btn-icon">▶</span>
-                            <span>初始化执行 (EXECUTE)</span>
+                            <span>开始</span>
                         </button>
                         <button class="btn btn-danger" id="btnStop" onclick="stopExperiment()" disabled>
                             <span class="btn-icon">■</span>
-                            <span>紧急中止 (ABORT)</span>
+                            <span>中止</span>
                         </button>
                     </div>
 
@@ -144,22 +147,22 @@
                             <div class="lg-swatch"></div>
                             <div class="lg-text">
                                 <span class="lg-title">正常</span>
-                                <span class="lg-sub">&lt; 30%</span>
                             </div>
+                            <span class="lg-sub">&lt; 30%</span>
                         </div>
                         <div class="legend-card warn">
                             <div class="lg-swatch"></div>
                             <div class="lg-text">
                                 <span class="lg-title">负载升高</span>
-                                <span class="lg-sub">30 - 70%</span>
                             </div>
+                            <span class="lg-sub">30 - 70%</span>
                         </div>
                         <div class="legend-card crit">
                             <div class="lg-swatch"></div>
                             <div class="lg-text">
                                 <span class="lg-title">过载临界</span>
-                                <span class="lg-sub">&gt; 70%</span>
                             </div>
+                            <span class="lg-sub">&gt; 70%</span>
                         </div>
                     </div>
                 </div>
@@ -169,7 +172,7 @@
         <!-- Topology Canvas -->
         <main class="canvas-area">
             <div class="radar-grid"></div>
-            
+
             <!-- HUD 抬头悬浮监控指示器 -->
             <div class="hud-console" id="hudConsole">
                 <!-- 顶层核心指标行 -->
@@ -181,13 +184,13 @@
                         </div>
                         <span class="hud-label" id="statusText">System Standby</span>
                     </div>
-                    
+
                     <div class="hud-timer-pill">
                         <span class="time-pulse-dot"></span>
                         <span class="hud-timer-num" id="progressElapsed">00:00</span>
                     </div>
                 </div>
-                
+
                 <!-- 底层进度跟踪行（实验运行期间可见） -->
                 <div class="hud-progress-row" id="hudProgressSection" style="display: none;">
                     <div class="hud-progress-track progress-track">
@@ -201,23 +204,24 @@
                     </div>
                 </div>
             </div>
-            
+
             <div class="canvas-toolbar">
-                <button class="tool-btn" onclick="cy.fit(80)" title="适配屏幕">
+                <button class="tool-btn btn-fit" onclick="cy.fit(80)" title="适配屏幕">
                     ⛶ FIT
                 </button>
                 <div class="toolbar-sep"></div>
                 <button class="tool-btn icon-only" onclick="cy.zoom(cy.zoom()*1.3)" title="放大">+</button>
                 <button class="tool-btn icon-only" onclick="cy.zoom(cy.zoom()/1.3)" title="缩小">−</button>
                 <div class="toolbar-sep"></div>
-                <button class="tool-btn" onclick="resetHighlight()" title="重置状态">
+                <button class="tool-btn btn-reset" onclick="resetHighlight()" title="重置状态">
                     ↺ RESET
                 </button>
             </div>
-            
+
             <div id="cy"></div>
             <div id="weightOverlays"></div>
-            
+            <div id="topoTooltip" class="topo-tooltip"></div>
+
             <div class="canvas-status">
                 <div class="status-pill"><span class="pill-dot"></span><span id="canvasZoom">Zoom: 100%</span></div>
                 <div class="status-pill"><span class="pill-dot"></span><span id="canvasNodes">Nodes: 36</span></div>
@@ -261,7 +265,7 @@
                         <div class="tl-row host">
                             <div class="tl-icon"></div>
                             <div class="tl-info">
-                                <span>终端节点</span>
+                                <span>终端</span>
                                 <span class="tl-count">x16</span>
                             </div>
                         </div>
@@ -304,4 +308,5 @@
 
     <script src="/static/script.js"></script>
 </body>
+
 </html>

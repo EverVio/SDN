@@ -142,9 +142,9 @@ async function initTopology() {
                     'font-family': 'JetBrains Mono, monospace',
                     'text-valign': 'bottom',
                     'text-halign': 'center',
-                    'text-margin-y': 6,
-                    'font-size': '12px',
-                    'font-weight': '500',
+                    'text-margin-y': 18,
+                    'font-size': '27px',
+                    'font-weight': '700',
                     'text-outline-width': 2,
                     'text-outline-color': '#0B0F19',
                     'text-background-color': 'transparent',
@@ -154,26 +154,26 @@ async function initTopology() {
             {
                 selector: 'node.core',
                 style: {
-                    'shape': 'round-rectangle',
-                    'width': 50,
-                    'height': 50,
-                    'background-color': COL.bgNodeCore,
-                    'background-image': "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='50' height='50' viewBox='0 0 50 50'%3E%3Crect x='15' y='15' width='20' height='20' fill='none' stroke='%23ff3355' stroke-width='2'/%3E%3Ccircle cx='25' cy='25' r='4' fill='%23ff3355'/%3E%3C/svg%3E",
+                    'shape': 'diamond',
+                    'width': 42,
+                    'height': 42,
+                    'background-color': COL.borderCore,
+                    'background-opacity': 0.08, /* 显式开启半透明度，形成与图例一致的内空外框发光效果 */
                     'border-width': 2,
                     'border-color': COL.borderCore,
                     'label': 'data(label)',
-                    'shadow-blur': 15,
-                    'shadow-color': 'rgba(255, 51, 85, 0.4)',
+                    'shadow-blur': 16,
+                    'shadow-color': 'rgba(255, 51, 85, 0.45)',
                 },
             },
             {
                 selector: 'node.aggregation',
                 style: {
                     'shape': 'ellipse',
-                    'width': 42,
-                    'height': 42,
-                    'background-color': COL.bgNodeAgg,
-                    'background-image': "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='42' height='42' viewBox='0 0 42 42'%3E%3Ccircle cx='21' cy='21' r='10' fill='none' stroke='%2300f0ff' stroke-width='1.5'/%3E%3Ccircle cx='21' cy='21' r='3' fill='%2300f0ff'/%3E%3C/svg%3E",
+                    'width': 36,
+                    'height': 36,
+                    'background-color': COL.borderAgg,
+                    'background-opacity': 0.08, /* 显式开启半透明度，形成与图例一致的内空外框发光效果 */
                     'border-width': 2,
                     'border-color': COL.borderAgg,
                     'label': 'data(label)',
@@ -185,10 +185,10 @@ async function initTopology() {
                 selector: 'node.edge',
                 style: {
                     'shape': 'ellipse',
-                    'width': 36,
-                    'height': 36,
-                    'background-color': COL.bgNodeEdge,
-                    'background-image': "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Cpath d='M18 10 L26 24 L10 24 Z' fill='none' stroke='%2300ff88' stroke-width='1.5'/%3E%3Ccircle cx='18' cy='18' r='2' fill='%2300ff88'/%3E%3C/svg%3E",
+                    'width': 30,
+                    'height': 30,
+                    'background-color': COL.borderEdge,
+                    'background-opacity': 0.08, /* 显式开启半透明度，形成与图例一致的内空外框发光效果 */
                     'border-width': 2,
                     'border-color': COL.borderEdge,
                     'label': 'data(label)',
@@ -200,16 +200,16 @@ async function initTopology() {
                 selector: 'node.host',
                 style: {
                     'shape': 'round-rectangle',
-                    'width': 56,
-                    'height': 20,
-                    'background-color': COL.bgNodeHost,
-                    'background-image': "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='20' viewBox='0 0 56 20'%3E%3Cline x1='15' y1='7' x2='41' y2='7' stroke='%2364748b' stroke-width='1'/%3E%3Cline x1='15' y1='13' x2='41' y2='13' stroke='%2364748b' stroke-width='1'/%3E%3C/svg%3E",
-                    'border-width': 1.5,
+                    'width': 44,
+                    'height': 18,
+                    'background-color': COL.borderHost,
+                    'background-opacity': 0.05, /* 显式开启半透明度，形成与图例一致的内空外框发光效果 */
+                    'border-width': 1.2,
                     'border-color': COL.borderHost,
                     'label': 'data(label)',
-                    'font-size': '10px',
-                    'color': COL.textMuted,
-                    'text-margin-y': 4,
+                    'font-size': '24px',
+                    'color': COL.textMain, /* 增强终端亮度以防暗色模糊 */
+                    'text-margin-y': 15,
                 },
             },
             {
@@ -283,7 +283,7 @@ async function initTopology() {
         requestAnimationFrame(animateEdges); // Start animation loop
     });
 
-    // Hover logic for neighborhood highlighting
+    // Hover logic for neighborhood highlighting and holographic tooltip
     cy.on('mouseover', 'node', function(e){
         var node = e.target;
         var neighborhood = node.neighborhood().add(node);
@@ -291,21 +291,29 @@ async function initTopology() {
         neighborhood.removeClass('faded');
         node.addClass('highlight');
         node.connectedEdges().addClass('highlight-edge');
+        showNodeTooltip(node);
     });
 
     cy.on('mouseout', 'node', function(e){
         cy.elements().removeClass('faded highlight highlight-edge');
+        hideTooltip();
     });
 
     cy.on('mouseover', 'edge', function(e){
-        e.target.addClass('highlight-edge');
+        var edge = e.target;
+        edge.addClass('highlight-edge');
+        showEdgeTooltip(edge);
     });
 
     cy.on('mouseout', 'edge', function(e){
         e.target.removeClass('highlight-edge');
+        hideTooltip();
     });
 
-    cy.on('zoom pan', updateBadgePositions);
+    cy.on('zoom pan', () => {
+        updateBadgePositions();
+        hideTooltip(); // 画布拖拽缩放时隐藏Tooltip，保证完美流畅度
+    });
 }
 
 function updateCanvasStatus() {
@@ -326,7 +334,7 @@ function createWeightBadges() {
         const dpid = node.data('dpid');
         const badge = document.createElement('div');
         badge.className = 'weight-badge';
-        badge.textContent = '50:50';
+        badge.textContent = '50% ⇄ 50%';
         badge.dataset.dpid = dpid;
         container.appendChild(badge);
         weightBadges[dpid] = badge;
@@ -348,10 +356,12 @@ function updateBadgePositions() {
         if (!badge) continue;
 
         const pos = node.renderedPosition();
-        badge.style.left = pos.x + 'px';
-        badge.style.top = (pos.y + 34 * zoom) + 'px';
-        badge.style.fontSize = Math.max(9, 11 * zoom) + 'px';
-        badge.style.transform = `translate(-50%, 0) scale(${Math.min(1.5, Math.max(0.7, zoom))})`;
+        badge.style.left = pos.x + 'px'; /* 补回X轴绝对定位 */
+        badge.style.top = (pos.y + 95 * zoom) + 'px'; /* 增大纵向偏置，彻底拉开与汇聚层文字标签的上下间隔，防重合遮挡 */
+        badge.style.fontSize = Math.min(24, Math.max(14, 20 * zoom)) + 'px'; /* 适度收缩动态字号，根绝重叠干涉 */
+        const scaleBase = Math.min(1.6, Math.max(0.8, zoom));
+        const scaleFactor = running ? scaleBase * 1.06 : scaleBase; // 实验运行时稳定大 6%，且有变化时保持静止定位，不跳动抖动
+        badge.style.transform = `translate(-50%, 0) scale(${scaleFactor})`;
     }
 }
 
@@ -372,15 +382,32 @@ function handleUtilUpdate(data) {
         if (edge.length === 0) continue;
 
         const color = utilColor(util);
-        const width = edge.hasClass('agg-core') ? 2.5 + util * 3 : (edge.hasClass('edge-agg') ? 2.0 + util * 2.5 : 1.5 + util * 2);
-        const opacity = 0.6 + util * 0.4;
+        // 极限制宽度微调：只比空闲状态下增加极其微量的一点点，物理宽度变化限制在 0.1px ~ 0.3px，视觉完全清澈，无突兀跳变
+        let baseWidth = 1.5;
+        let baseOpacity = 0.4;
+        let addWidth = util * 0.1;
+        let addOpacity = util * 0.1;
+
+        if (edge.hasClass('agg-core')) {
+            baseWidth = 2.5;
+            baseOpacity = 0.6;
+            addWidth = util * 0.3;
+            addOpacity = util * 0.1;
+        } else if (edge.hasClass('edge-agg')) {
+            baseWidth = 2.0;
+            baseOpacity = 0.5;
+            addWidth = util * 0.2;
+            addOpacity = util * 0.1;
+        }
+
+        const width = baseWidth + addWidth;
+        const opacity = baseOpacity + addOpacity;
 
         edge.style({
             'line-color': color,
             'width': width,
             'opacity': opacity,
-            'shadow-blur': util > 0.4 ? 12 + (util*10) : 0,
-            'shadow-color': color,
+            'shadow-blur': 0, // 彻底剥离极其夸张的雾状外围霓虹发光阴影，保持拓扑连线绝对高精度与高透感
         });
     }
 
@@ -414,7 +441,22 @@ function handleWeightUpdate(data) {
         const p3 = total > 0 ? Math.round(w3 / total * 100) : 50;
         const p4 = 100 - p3;
 
-        badge.textContent = `P3:${w3} P4:${w4} [${p3}%]`;
+        // 智能分析路由倾向与指向箭头
+        let arrow = "⇄";
+        if (p3 > p4) arrow = "◀";
+        else if (p4 > p3) arrow = "▶";
+
+        badge.textContent = `${p3}% ${arrow} ${p4}%`;
+
+        // 智能不平衡路由分配警告阈值
+        const diff = Math.abs(p3 - p4);
+        badge.classList.remove('imbalance-warn', 'imbalance-crit');
+        if (diff >= 60) {
+            badge.classList.add('imbalance-crit');
+        } else if (diff >= 30) {
+            badge.classList.add('imbalance-warn');
+        }
+
         badge.classList.add('changed');
         setTimeout(() => badge.classList.remove('changed'), 600);
     }
@@ -564,6 +606,7 @@ function setRunningState(isRunning, group) {
         const track = document.querySelector('.progress-track');
         if (track) track.classList.remove('initializing');
     }
+    updateBadgePositions();
 }
 
 function updateProgress(elapsed, duration) {
@@ -671,7 +714,7 @@ function resetHighlight() {
     });
 
     for (const badge of Object.values(weightBadges)) {
-        badge.textContent = '50:50';
+        badge.textContent = '50% ⇄ 50%';
         badge.classList.remove('changed');
     }
 
@@ -725,10 +768,131 @@ function animateEdges(time) {
             const util = edgeUtil[edge.id()] || 0;
             // Only animate edges with active utilization to save performance
             if (util > 0.05) {
-                let speed = Math.max(1, util * 8); // Speed scales with utilization
+                let speed = Math.max(0.5, util * 2.5); // 极度克制优雅的流速，防视觉夸张
                 let currentOffset = edge.numericStyle('line-dash-offset') || 0;
                 edge.style('line-dash-offset', currentOffset - speed);
             }
         });
     });
+}
+
+/* ===== HOLOGRAPHIC TOPOLOGY TOOLTIP FUNCTIONS ===== */
+function showNodeTooltip(node) {
+    const tooltip = document.getElementById('topoTooltip');
+    if (!tooltip) return;
+
+    const label = node.data('label') || node.id();
+    const type = node.data('nodeType') || 'Unknown';
+    const dpid = node.data('dpid') || node.data('edgeDpid') || 'None';
+    const links = node.connectedEdges().length;
+
+    const typeNames = {
+        'core': 'Core (核心层交换机)',
+        'aggregation': 'Aggregation (汇聚层交换机)',
+        'edge': 'Edge (边缘层交换机)',
+        'host': 'Host (终端计算节点)'
+    };
+    
+    const badgeColors = {
+        'core': '#ff3355',
+        'aggregation': '#00f0ff',
+        'edge': '#00ff88',
+        'host': '#94a3b8'
+    };
+
+    let html = `
+        <div class="tt-title">
+            <span>${label.toUpperCase()}</span>
+            <span class="tt-badge" style="color: ${badgeColors[type] || '#fff'}; border: 1px solid ${badgeColors[type] || '#fff'}">${type.toUpperCase()}</span>
+        </div>
+        <div class="tt-row">
+            <span class="tt-label">DPID / Ident:</span>
+            <span class="tt-val highlight">${dpid}</span>
+        </div>
+        <div class="tt-row">
+            <span class="tt-label">架构层次:</span>
+            <span class="tt-val">${typeNames[type] || type}</span>
+        </div>
+        <div class="tt-row">
+            <span class="tt-label">活跃链路:</span>
+            <span class="tt-val">${links} 端口在线</span>
+        </div>
+    `;
+
+    tooltip.innerHTML = html;
+    tooltip.classList.add('visible');
+    
+    const pos = node.renderedPosition();
+    const zoom = cy.zoom();
+    tooltip.style.left = pos.x + 'px';
+    tooltip.style.top = (pos.y - (node.height() / 2) * zoom - 15) + 'px';
+}
+
+function showEdgeTooltip(edge) {
+    const tooltip = document.getElementById('topoTooltip');
+    if (!tooltip) return;
+
+    const id = edge.id();
+    const source = cy.$('#' + edge.data('source')).data('label') || edge.data('source');
+    const target = cy.$('#' + edge.data('target')).data('label') || edge.data('target');
+    const type = edge.data('edgeType') || 'Unknown';
+    const bandwidth = edge.data('bandwidth') || '10G';
+    const util = edgeUtil[id] || 0;
+
+    const typeNames = {
+        'agg-core': 'Agg-Core (骨干核心干线)',
+        'edge-agg': 'Edge-Agg (汇聚级中继线)',
+        'host-edge': 'Host-Edge (终端接入链路)'
+    };
+
+    const utilPct = Math.round(util * 100);
+    let barColor = COL.green;
+    if (util >= 0.7) barColor = COL.red;
+    else if (util >= 0.3) barColor = COL.amber;
+
+    const rawBw = parseFloat(bandwidth) || 10;
+    const currentTraffic = (rawBw * util).toFixed(2);
+
+    let html = `
+        <div class="tt-title">
+            <span>LINK OVERVIEW</span>
+            <span class="tt-badge" style="color: var(--accent-secondary); border: 1px solid var(--accent-secondary)">MONITOR</span>
+        </div>
+        <div class="tt-row">
+            <span class="tt-label">拓扑关联:</span>
+            <span class="tt-val highlight">${source.toUpperCase()} ⇄ ${target.toUpperCase()}</span>
+        </div>
+        <div class="tt-row">
+            <span class="tt-label">带宽能力:</span>
+            <span class="tt-val">${bandwidth}bps</span>
+        </div>
+        <div class="tt-row">
+            <span class="tt-label">链路性质:</span>
+            <span class="tt-val">${typeNames[type] || type}</span>
+        </div>
+        
+        <div class="tt-progress-wrap">
+            <div class="tt-progress-header">
+                <span>实时负载利用率</span>
+                <span class="tt-val highlight" style="color: ${barColor}">${utilPct}% (${currentTraffic} Gbps)</span>
+            </div>
+            <div class="tt-progress-bar">
+                <div class="tt-progress-fill" style="width: ${utilPct}%; background-color: ${barColor}; box-shadow: 0 0 8px ${barColor}"></div>
+            </div>
+        </div>
+    `;
+
+    tooltip.innerHTML = html;
+    tooltip.classList.add('visible');
+
+    const pos = edge.renderedMidpoint();
+    tooltip.style.left = pos.x + 'px';
+    tooltip.style.top = pos.y + 'px';
+}
+
+function hideTooltip() {
+    const tooltip = document.getElementById('topoTooltip');
+    if (tooltip) {
+        tooltip.classList.remove('visible');
+    }
 }
