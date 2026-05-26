@@ -1,6 +1,6 @@
-# AI 预测驱动的 SDN 动态负载均衡调度系统
+# 基于 MLP 预测的 SDN 动态负载均衡器（MLP-Predictive Dynamic Load Balancer for SDN）
 
-基于 Ryu 控制器与 Mininet Fat-Tree k=4 拓扑，实现了一个“AI 预测驱动的主动式动态负载均衡调度系统”。本系统通过 OpenFlow 1.3 Group Table（SELECT 类型）实现等价多路径（ECMP）转发，并集成全局多层感知机（MLP）时序网络，在链路上游预测网络拥塞趋势，通过指数可用带宽分配公式与 5% 变化死区防震荡机制，实现主动预防式的流分流调度。
+基于 Ryu 控制器与 Mininet Fat-Tree k=4 拓扑，实现了一个”基于 MLP 预测的 SDN 动态负载均衡器”。本系统通过 OpenFlow 1.3 Group Table（SELECT 类型）实现等价多路径（ECMP）转发，并集成全局多层感知机（MLP）时序网络，在链路上游预测网络拥塞趋势，通过指数可用带宽分配公式与 5% 变化死区防震荡机制，实现主动预防式的流分流调度。
 
 ---
 
