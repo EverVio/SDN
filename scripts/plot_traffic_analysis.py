@@ -8,6 +8,7 @@ import os
 import sys
 import joblib
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -174,8 +175,8 @@ def plot_key_links(matrix, link_keys, timestamps):
     # 时间轴：转为相对分钟
     t_min = (timestamps - timestamps[0]) / 60.0
 
-    # 对利用率做轻度平滑（滑动窗口均值，窗口=20 即 10 秒）使曲线可读
-    def smooth(arr, w=20):
+    # 对利用率做平滑（滑动窗口均值，窗口=240 即 2 分钟）消除毛刺
+    def smooth(arr, w=240):
         kernel = np.ones(w) / w
         return np.convolve(arr, kernel, mode="same")
 
@@ -189,9 +190,6 @@ def plot_key_links(matrix, link_keys, timestamps):
         label = make_link_label(d, p)
         ax.plot(t_min, smoothed, color=colors[i % len(colors)],
                 linewidth=0.9, alpha=0.85, label=label)
-        # 淡色原始数据在背景
-        ax.plot(t_min, raw_line, color=colors[i % len(colors)],
-                linewidth=0.2, alpha=0.2)
 
     # 阈值线
     ax.axhline(y=0.70, color="red", linestyle="--", linewidth=1.2, alpha=0.7,
@@ -206,7 +204,7 @@ def plot_key_links(matrix, link_keys, timestamps):
     ax.legend(loc="upper right", fontsize=8, ncol=2, framealpha=0.9)
     ax.set_title(
         "Key Backbone Link Utilization Over Time\n"
-        "(Smoothed w/ 10s window, raw in background)",
+        "(Smoothed w/ 2-minute window)",
         fontsize=13,
         fontweight="bold",
     )
@@ -219,6 +217,107 @@ def plot_key_links(matrix, link_keys, timestamps):
     print(f"Saved: {out_path}")
 
 
+# ─────────────────────────────────────────────────────
+# 图表 3: 全网总吞吐负荷演趋图 (Total Network Load Timeline)
+# ─────────────────────────────────────────────────────
+def plot_total_network_load():
+    traffic_path = os.path.join(DATA_DIR, "traffic_data.csv")
+    if not os.path.exists(traffic_path):
+        print(f"Warning: {traffic_path} not found. Skipping total load chart.")
+        return
+    df = pd.read_csv(traffic_path)
+    
+    # 按照时间戳分组计算平均利用率
+    grouped = df.groupby("timestamp")["utilization"].mean().reset_index().sort_values("timestamp")
+    
+    min_ts = grouped["timestamp"].min()
+    t_rel = grouped["timestamp"] - min_ts
+    
+    fig, ax = plt.subplots(figsize=(14, 6))
+    
+    ax.plot(t_rel, grouped["utilization"], color="#9b59b6", linewidth=2.0, label="All Ports Avg Utilization")
+    ax.fill_between(t_rel, grouped["utilization"], color="#9b59b6", alpha=0.15)
+    
+    # 标注实验事件 (Use transform=ax.get_xaxis_transform() to fix height safely at 15% from the bottom axis)
+    ax.axvline(x=0, color="gray", linestyle="--", linewidth=1.0)
+    ax.text(0.5, 0.15, "t=0s: Background Flows Start", rotation=90, fontsize=8.5, color="gray", transform=ax.get_xaxis_transform())
+    
+    ax.axvline(x=20, color="red", linestyle=":", linewidth=1.2)
+    ax.text(20.5, 0.15, "t=20s: Burst Subflow A", rotation=90, fontsize=8.5, color="red", transform=ax.get_xaxis_transform())
+    
+    ax.axvline(x=26, color="red", linestyle=":", linewidth=1.2)
+    ax.text(26.5, 0.15, "t=26s: Burst Subflow B", rotation=90, fontsize=8.5, color="red", transform=ax.get_xaxis_transform())
+    
+    ax.axvline(x=32, color="red", linestyle=":", linewidth=1.2)
+    ax.text(32.5, 0.15, "t=32s: Burst Subflow C", rotation=90, fontsize=8.5, color="red", transform=ax.get_xaxis_transform())
+
+    ax.set_xlabel("Time (seconds)", fontsize=12)
+    ax.set_ylabel("Average Telemetry Utilization", fontsize=12)
+    ax.set_title(
+        "Total Network Load Timeline\n"
+        "(Arithmetic average of utilization across all ports over time)",
+        fontsize=13, fontweight="bold"
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+    
+    fig.tight_layout()
+    out = os.path.join(FIGURES_DIR, "3_total_network_load.png")
+    fig.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
+# ─────────────────────────────────────────────────────
+# 图表 4: 链路流量空间相关性热力图 (Traffic Correlation Matrix Heatmap)
+# ─────────────────────────────────────────────────────
+def plot_correlation_matrix(matrix, link_keys):
+    labels = [make_link_label(d, p) for d, p in link_keys]
+    df_mat = pd.DataFrame(matrix, columns=labels)
+    corr_matrix = df_mat.corr(method="pearson").fillna(0.0)
+    
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    im = ax.imshow(
+        corr_matrix.values,
+        cmap="coolwarm",
+        vmin=-1.0,
+        vmax=1.0,
+        aspect="equal",
+        origin="lower"
+    )
+    
+    n_links = len(labels)
+    ax.set_xticks(range(n_links))
+    ax.set_xticklabels(labels, rotation=90, fontsize=4.5)  # Set slightly smaller fontsize (4.5pt) to avoid overlap
+    ax.set_yticks(range(n_links))
+    ax.set_yticklabels(labels, fontsize=4.5)
+    
+    ax.set_xticks(np.arange(n_links) - 0.5, minor=True)
+    ax.set_yticks(np.arange(n_links) - 0.5, minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.2)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    
+    cbar = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.85)
+    cbar.set_label("Pearson Correlation Coefficient", fontsize=11)
+    cbar.ax.tick_params(labelsize=9)
+    
+    # Text annotation cell annotation is removed to offer clean, professional, high-density macroeconomic visual clarity.
+    # Grid color intensities (RdBu/Coolwarm) are sufficient for demonstrating spatial correlation patterns.
+                
+    ax.set_title(
+        "Traffic Correlation Matrix Heatmap of Backbone Links\n"
+        "(Fat-Tree k=4 symmetrical topology, showing complementary/synchronous paths)",
+        fontsize=13, fontweight="bold"
+    )
+    
+    fig.tight_layout()
+    out = os.path.join(FIGURES_DIR, "4_traffic_correlation_matrix.png")
+    fig.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
 if __name__ == "__main__":
     os.makedirs(FIGURES_DIR, exist_ok=True)
 
@@ -227,10 +326,16 @@ if __name__ == "__main__":
     print(f"  matrix shape: {matrix.shape}, links: {len(link_keys)}, "
           f"ts range: {timestamps[0]:.1f} - {timestamps[-1]:.1f}")
 
-    print("\nPlotting heatmap...")
+    print("\n[1/4] Plotting spatiotemporal heatmap...")
     plot_heatmap(matrix, link_keys, timestamps, downsample_time=4)
 
-    print("\nPlotting key link utilization...")
+    print("\n[2/4] Plotting key link utilization curves...")
     plot_key_links(matrix, link_keys, timestamps)
+
+    print("\n[3/4] Plotting total network load timeline...")
+    plot_total_network_load()
+
+    print("\n[4/4] Plotting traffic correlation matrix...")
+    plot_correlation_matrix(matrix, link_keys)
 
     print("\nDone.")

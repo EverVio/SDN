@@ -192,7 +192,33 @@ def plot_tracking(pred_data):
 
     t_min = (timestamps - timestamps[0]) / 60.0
 
-    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+    # 自动寻找最具代表性（三链路平均方差最大）的 15 分钟微观片段 (每分钟约 120 个点)
+    window_len = 15 * 120
+    n_samples = len(t_min)
+    if n_samples > window_len:
+        max_var = -1
+        best_start = 0
+        for start_idx in range(0, n_samples - window_len, 60):
+            end_idx = start_idx + window_len
+            total_var = 0.0
+            for name, idx in selected.items():
+                if idx is not None:
+                    total_var += np.var(Y_true[start_idx:end_idx, idx])
+            if total_var > max_var:
+                max_var = total_var
+                best_start = start_idx
+        best_end = best_start + window_len
+        t_plot = t_min[best_start:best_end]
+        Y_true_plot = Y_true[best_start:best_end, :]
+        Y_pred_plot = Y_pred[best_start:best_end, :]
+        span_str = f"Time window: {t_min[best_start]:.1f} - {t_min[best_end-1]:.1f} min"
+    else:
+        t_plot = t_min
+        Y_true_plot = Y_true
+        Y_pred_plot = Y_pred
+        span_str = f"Test span: {t_min[-1]:.1f} min"
+
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=False)
     colors = {"Core": "#e74c3c", "Agg": "#e67e22", "Edge": "#2ecc71"}
 
     for ax, (layer_name, idx) in zip(axes, selected.items()):
@@ -202,20 +228,20 @@ def plot_tracking(pred_data):
         dpid, port_no = link_keys[idx]
         label = make_link_label(dpid, port_no)
 
-        ax.plot(t_min, Y_true[:, idx], color=colors[layer_name],
-                linewidth=0.8, alpha=0.8, label=f"True ({label})")
-        ax.plot(t_min, Y_pred[:, idx], color=colors[layer_name],
-                linewidth=0.8, alpha=0.8, linestyle="--", label=f"Predicted ({label})")
+        ax.plot(t_plot, Y_true_plot[:, idx], color=colors[layer_name],
+                linewidth=1.2, alpha=0.85, label=f"True ({label})")
+        ax.plot(t_plot, Y_pred_plot[:, idx], color=colors[layer_name],
+                linewidth=1.2, alpha=0.85, linestyle="--", label=f"Predicted ({label})")
 
         # 填充误差区域
         ax.fill_between(
-            t_min,
-            Y_true[:, idx], Y_pred[:, idx],
+            t_plot,
+            Y_true_plot[:, idx], Y_pred_plot[:, idx],
             alpha=0.12, color=colors[layer_name],
         )
 
-        # 计算该链路 RMSE
-        rmse = np.sqrt(np.mean((Y_true[:, idx] - Y_pred[:, idx]) ** 2))
+        # 计算该链路在该局部窗口的 RMSE
+        rmse = np.sqrt(np.mean((Y_true_plot[:, idx] - Y_pred_plot[:, idx]) ** 2))
         ax.text(
             0.02, 0.92, f"{layer_name} Layer  |  {label}\nRMSE = {rmse:.4f}",
             transform=ax.transAxes, fontsize=10,
@@ -226,11 +252,11 @@ def plot_tracking(pred_data):
         ax.set_ylim(-0.05, 1.05)
         ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
         ax.grid(True, alpha=0.3)
+        ax.set_xlabel("Time (minutes)", fontsize=11)
 
-    axes[-1].set_xlabel("Time (minutes)", fontsize=12)
     fig.suptitle(
-        "Single-Link Predictive Tracking: True vs. Predicted Utilization\n"
-        f"(PREDICTION_STEP=2, TARGET_WINDOW=3, Test span: {t_min[-1]:.1f} min)",
+        "Micro-Window Predictive Tracking: True vs. Predicted Utilization\n"
+        f"(15-Minute Dynamic Fragment, {span_str})",
         fontsize=13, fontweight="bold", y=0.98,
     )
 
@@ -338,20 +364,37 @@ def plot_spatial_error(metrics_csv):
         else:
             return "#2ecc71"   # Edge - green
 
-    colors = [layer_color(int(row["dpid"])) for _, row in df_sorted.iterrows()]
+    # 仅展示 Top-20 错误链路，其余归入 "Others (Mean)"
+    top_n = 20
+    if len(df_sorted) > top_n:
+        df_top = df_sorted.iloc[:top_n].copy()
+        df_others = df_sorted.iloc[top_n:]
+        others_mean = df_others["RMSE"].mean()
+        
+        # 追加 Others 虚拟行
+        others_row = pd.DataFrame([{
+            "dpid": 0, "port_no": 0, "RMSE": others_mean, "MAE": 0.0, "R2": 0.0,
+            "label": f"Others (n={len(df_others)})"
+        }])
+        df_plot = pd.concat([df_top, others_row], ignore_index=True)
+        colors = [layer_color(int(row["dpid"])) if int(row["dpid"]) > 0 else "#95a5a6" for _, row in df_plot.iterrows()]
+    else:
+        df_plot = df_sorted
+        colors = [layer_color(int(row["dpid"])) for _, row in df_plot.iterrows()]
 
-    fig, ax = plt.subplots(figsize=(18, 7))
+    fig, ax = plt.subplots(figsize=(14, 7))
 
-    x = np.arange(len(df_sorted))
-    bars = ax.bar(x, df_sorted["RMSE"], color=colors, alpha=0.85, edgecolor="white", linewidth=0.3)
+    x = np.arange(len(df_plot))
+    bars = ax.bar(x, df_plot["RMSE"], color=colors, alpha=0.85, edgecolor="white", linewidth=0.3)
 
-    # 在最高的几根柱子上标注数值
-    for i in range(min(8, len(df_sorted))):
-        ax.text(
-            i, df_sorted.iloc[i]["RMSE"] + 0.003,
-            f'{df_sorted.iloc[i]["RMSE"]:.3f}',
-            ha="center", va="bottom", fontsize=7, color="#333",
-        )
+    # 在最高的几根柱子和 Others 柱子上面标注数值
+    for i in range(len(df_plot)):
+        if i < 8 or df_plot.iloc[i]["label"].startswith("Others"):
+            ax.text(
+                i, df_plot.iloc[i]["RMSE"] + 0.003,
+                f'{df_plot.iloc[i]["RMSE"]:.3f}',
+                ha="center", va="bottom", fontsize=7.5, color="#333", fontweight="bold"
+            )
 
     # 全局均值线
     global_mean_rmse = df_sorted["RMSE"].mean()
@@ -364,16 +407,17 @@ def plot_spatial_error(metrics_csv):
         Patch(facecolor="#e74c3c", alpha=0.85, label="Core (dpid>16)"),
         Patch(facecolor="#e67e22", alpha=0.85, label="Aggregation (dpid 9-16)"),
         Patch(facecolor="#2ecc71", alpha=0.85, label="Edge (dpid≤8)"),
+        Patch(facecolor="#95a5a6", alpha=0.85, label="Others (Grouped Mean)"),
     ]
     ax.legend(handles=legend_elements, loc="upper right", fontsize=10)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(df_sorted["label"], rotation=65, ha="right", fontsize=7)
+    ax.set_xticklabels(df_plot["label"], rotation=45, ha="right", fontsize=8.5)
     ax.set_ylabel("RMSE", fontsize=12)
     ax.set_xlabel("Backbone Link (sorted by RMSE descending)", fontsize=12)
     ax.set_title(
         "Per-Link Prediction Error Distribution (Spatial)\n"
-        f"({len(df_sorted)} backbone links, Fat-Tree k=4)",
+        f"(Top-20 Highest Error Links individually + Grouped Mean, total {len(df_sorted)} links)",
         fontsize=13, fontweight="bold",
     )
     ax.grid(True, axis="y", alpha=0.3)
@@ -383,6 +427,108 @@ def plot_spatial_error(metrics_csv):
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
+
+
+# ─────────────────────────────────────────────────────
+# 图表 8: 拓扑层级预测误差分组小提琴图 (Hierarchical Prediction Error Distribution)
+# ─────────────────────────────────────────────────────
+def plot_hierarchical_error(metrics_csv):
+    df = pd.read_csv(metrics_csv)
+    
+    # 划分层级
+    def get_layer(dpid):
+        if dpid > 16:
+            return "Core"
+        elif dpid >= 9:
+            return "Aggregation"
+        else:
+            return "Edge"
+            
+    df["layer"] = df["dpid"].apply(get_layer)
+    
+    # 获取各个层级的 RMSE 数据
+    layers = ["Core", "Aggregation", "Edge"]
+    data_by_layer = [df[df["layer"] == l]["RMSE"].values for l in layers]
+    
+    # 检查是否有数据，防止空数组报错
+    for i, l in enumerate(layers):
+        if len(data_by_layer[i]) == 0:
+            print(f"Warning: No data for layer {l}. Skipping violin plot.")
+            return
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    
+    # 绘制小提琴图
+    parts = ax.violinplot(
+        data_by_layer,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+        widths=0.6
+    )
+    
+    # 设置小提琴的填充颜色和样式
+    colors = ["#e74c3c", "#e67e22", "#2ecc71"]
+    for pc, color in zip(parts["bodies"], colors):
+        pc.set_facecolor(color)
+        pc.set_edgecolor("black")
+        pc.set_alpha(0.6)
+        pc.set_linewidth(1.0)
+        
+    # 在小提琴内部绘制精美箱线图
+    bp = ax.boxplot(
+        data_by_layer,
+        patch_artist=True,
+        widths=0.15,
+        medianprops=dict(color="black", linewidth=1.5),
+        whiskerprops=dict(color="gray", linewidth=1.0),
+        capprops=dict(color="gray", linewidth=1.0),
+        flierprops=dict(marker="o", markerfacecolor="gray", markersize=4, alpha=0.5)
+    )
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.85)
+        
+    # 添加带随机抖动的数据点（Jitter Scatter）
+    for i, layer_data in enumerate(data_by_layer):
+        x_pos = np.random.normal(i + 1, 0.04, size=len(layer_data))
+        ax.scatter(
+            x_pos,
+            layer_data,
+            color=colors[i],
+            edgecolors="black",
+            linewidths=0.5,
+            s=25,
+            alpha=0.6,
+            zorder=3
+        )
+        
+    ax.set_xticks([1, 2, 3])
+    ax.set_xticklabels([f"{l}\n(n={len(d)})" for l, d in zip(layers, data_by_layer)], fontsize=11, fontweight="bold")
+    ax.set_ylabel("RMSE Prediction Error", fontsize=12)
+    ax.set_title(
+        "Hierarchical Prediction Error Distribution (Violin Plot)\n"
+        "(Comparison of model performance across Core, Aggregation, and Edge layers)",
+        fontsize=13, fontweight="bold"
+    )
+    ax.grid(True, axis="y", alpha=0.3)
+    
+    # 标注各层级的平均 RMSE (Align horizontally at 90% of the maximum Y-limit to avoid outliers distortion)
+    ymin, ymax = ax.get_ylim()
+    y_pos = ymin + (ymax - ymin) * 0.9
+    for i, layer_data in enumerate(data_by_layer):
+        mean_val = np.mean(layer_data)
+        ax.text(
+            i + 1, y_pos,
+            f"Mean: {mean_val:.4f}",
+            ha="center", va="bottom", fontsize=9.5, fontweight="bold", color=colors[i]
+        )
+        
+    fig.tight_layout()
+    out = os.path.join(FIGURES_DIR, "8_hierarchical_error_distribution.png")
+    fig.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
 
 
 if __name__ == "__main__":
@@ -401,19 +547,22 @@ if __name__ == "__main__":
     df_metrics = pd.read_csv(metrics_csv)
     print(f"  Per-link metrics: {len(df_metrics)} links")
 
-    print("\n[3/7] Plotting training convergence...")
+    print("\n[3/8] Plotting training convergence...")
     plot_convergence(history)
 
-    print("\n[4/7] Plotting true vs predicted scatter...")
+    print("\n[4/8] Plotting true vs predicted scatter...")
     plot_scatter(pred_data)
 
-    print("\n[5/7] Plotting single-link tracking...")
+    print("\n[5/8] Plotting single-link tracking...")
     plot_tracking(pred_data)
 
-    print("\n[6/7] Plotting residual distribution...")
+    print("\n[6/8] Plotting residual distribution...")
     plot_residual_histogram(pred_data)
 
-    print("\n[7/7] Plotting spatial error distribution...")
+    print("\n[7/8] Plotting spatial error distribution...")
     plot_spatial_error(metrics_csv)
 
-    print("\nAll 5 evaluation charts saved to figures/")
+    print("\n[8/8] Plotting hierarchical error violin plot...")
+    plot_hierarchical_error(metrics_csv)
+
+    print("\nAll 6 evaluation charts saved to figures/")
