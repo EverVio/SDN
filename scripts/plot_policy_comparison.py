@@ -1,7 +1,7 @@
 """
 多策略负载均衡性能对比实验评估可视化
 - Chart 1: 多指标核心策略对比分组柱状图
-- Chart 2: 20轮迭代实验鲁棒性与稳定性箱线图
+- Chart 2: 30轮迭代实验鲁棒性与稳定性箱线图
 - Chart 4: 丢包与抖动性能指标累计分布函数图 (CDF)
 """
 
@@ -133,7 +133,7 @@ def plot_box():
         patch.set_alpha(0.8)
     ax1.set_ylabel("Loss Rate (%)", fontsize=12)
     ax1.set_title(
-        "Burst Flow Loss Rate Distribution\n(20 Independent Iterations)",
+        "Burst Flow Loss Rate Distribution\n(30 Independent Iterations)",
         fontsize=12, fontweight="bold",
     )
     ax1.grid(axis="y", alpha=0.3)
@@ -163,7 +163,7 @@ def plot_box():
         patch.set_alpha(0.8)
     ax2.set_ylabel("Throughput (Mbps)", fontsize=12)
     ax2.set_title(
-        "Burst Flow Throughput Distribution\n(20 Independent Iterations)",
+        "Burst Flow Throughput Distribution\n(30 Independent Iterations)",
         fontsize=12, fontweight="bold",
     )
     ax2.grid(axis="y", alpha=0.3)
@@ -179,7 +179,7 @@ def plot_box():
         )
 
     fig.suptitle(
-        "Policy Robustness & Stability: Burst Flow Performance Across 20 Iterations\n"
+        "Policy Robustness & Stability: Burst Flow Performance Across 30 Iterations\n"
         "(Narrower boxes = more consistent control under hash collision uncertainty)",
         fontsize=14, fontweight="bold", y=1.02,
     )
@@ -253,7 +253,7 @@ def plot_cdf():
     ax2.set_ylim(-0.02, 1.02)
 
     fig.suptitle(
-        "CDF of Network Impairments Across All Flows & 20 Iterations\n"
+        "CDF of Network Impairments Across All Flows & 30 Iterations\n"
         "(Steeper curve reaching Y=1.0 on the left = better QoS control)",
         fontsize=14, fontweight="bold", y=1.02,
     )
