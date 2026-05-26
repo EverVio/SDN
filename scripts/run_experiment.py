@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-三组对比实验脚本：L2 基线 / 阈值均衡 / Global MLP 预测均衡。
+三组对比实验脚本：base 基线 / 阈值均衡 / Global MLP 预测均衡。
 
 实验设计 — 概率哈希碰撞 + 渐进突发 (Probabilistic Hash Collision + Ramp-up)：
 
@@ -16,11 +16,11 @@
   哈希碰撞概率：9 背景流占多条路径，突发流有概率哈希到已占用路径。
   碰撞时该链路超载 > 2Mbps → 丢包。
 
-  - L2 基线组：静态哈希，碰撞后持续丢包
+  - base 基线组：静态哈希，碰撞后持续丢包
   - 阈值均衡组：碰撞后 2-3 秒检测到拥塞，响应式迁移
   - Global MLP 组：预测引擎在爬升阶段识别趋势，主动迁移，0 丢包
 
-用法：sudo python3 scripts/run_experiment.py --group [l2|threshold|predictive|all] --iters 5
+用法：sudo python3 scripts/run_experiment.py --group [base|threshold|predictive|all] --iters 5
 """
 
 import os
@@ -69,7 +69,7 @@ BURST_SUBFLOWS = [
 ]
 
 CONTROLLERS = {
-    "l2": "controller/base_controller.py",
+    "base": "controller/base_controller.py",
     "threshold": "controller/threshold_balancer.py",
     "predictive": "controller/predictive_balancer.py",
 }
@@ -378,7 +378,7 @@ def main():
     )
     parser.add_argument(
         "--group",
-        choices=["l2", "threshold", "predictive", "all"],
+        choices=["base", "threshold", "predictive", "all"],
         default="all",
         help="Which group to test",
     )
@@ -404,7 +404,7 @@ def main():
     time.sleep(1)
 
     if args.group == "all":
-        groups = ["l2", "threshold", "predictive"]
+        groups = ["base", "threshold", "predictive"]
     else:
         groups = [args.group]
 

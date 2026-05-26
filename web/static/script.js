@@ -12,6 +12,7 @@ let running = false;
 let experimentDuration = 60;
 let progressTimer = null;
 let startTime = null;
+const TOPOLOGY_VERTICAL_OFFSET = 20;
 
 // Premium Color Palette matching CSS
 const COL = {
@@ -277,14 +278,15 @@ async function initTopology() {
     cy.on('zoom pan', () => updateCanvasStatus());
 
     cy.ready(() => {
-        cy.fit(60); 
+        cy.fit(60);
+        cy.panBy({ x: 0, y: TOPOLOGY_VERTICAL_OFFSET });
         createWeightBadges();
         updateCanvasStatus();
         requestAnimationFrame(animateEdges); // Start animation loop
     });
 
     // Hover logic for neighborhood highlighting and holographic tooltip
-    cy.on('mouseover', 'node', function(e){
+    cy.on('mouseover', 'node', function (e) {
         var node = e.target;
         var neighborhood = node.neighborhood().add(node);
         cy.elements().addClass('faded');
@@ -294,18 +296,18 @@ async function initTopology() {
         showNodeTooltip(node);
     });
 
-    cy.on('mouseout', 'node', function(e){
+    cy.on('mouseout', 'node', function (e) {
         cy.elements().removeClass('faded highlight highlight-edge');
         hideTooltip();
     });
 
-    cy.on('mouseover', 'edge', function(e){
+    cy.on('mouseover', 'edge', function (e) {
         var edge = e.target;
         edge.addClass('highlight-edge');
         showEdgeTooltip(edge);
     });
 
-    cy.on('mouseout', 'edge', function(e){
+    cy.on('mouseout', 'edge', function (e) {
         e.target.removeClass('highlight-edge');
         hideTooltip();
     });
@@ -522,7 +524,7 @@ function initControls() {
 async function startExperiment() {
     const group = document.getElementById('groupSelect').value;
     const duration = experimentDuration;
-    
+
     addLog(`INIT EXECUTING POLICY: ${group.toUpperCase()} / ${duration}s`, 'info');
     setRunningState(true, group);
 
@@ -659,7 +661,7 @@ function showResults(data) {
     const body = document.getElementById('modalBody');
 
     const groupNames = {
-        'l2': 'L2 Baseline ECMP',
+        'base': 'Base Baseline ECMP',
         'threshold': 'Threshold Active',
         'predictive': 'MLP Predictive',
     };
@@ -725,7 +727,7 @@ function resetHighlight() {
 function addLog(msg, cls) {
     const area = document.getElementById('logArea');
     const line = document.createElement('div');
-    
+
     let finalCls = cls || '';
     if (msg.startsWith('>>>') || msg.includes('[SYSTEM]')) {
         finalCls = finalCls ? `${finalCls} system` : 'system';
@@ -792,7 +794,7 @@ function showNodeTooltip(node) {
         'edge': 'Edge (边缘层交换机)',
         'host': 'Host (终端计算节点)'
     };
-    
+
     const badgeColors = {
         'core': '#ff3355',
         'aggregation': '#00f0ff',
@@ -821,7 +823,7 @@ function showNodeTooltip(node) {
 
     tooltip.innerHTML = html;
     tooltip.classList.add('visible');
-    
+
     const pos = node.renderedPosition();
     const zoom = cy.zoom();
     tooltip.style.left = pos.x + 'px';

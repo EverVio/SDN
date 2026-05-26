@@ -1,0 +1,11 @@
+group,flow,avg_loss_pct,avg_jitter_ms,avg_bandwidth_mbps
+base,Flow 1,39.63,17.258,0.29
+base,Flow 2,30.19,17.214,0.34
+base,Flow 3,21.34,7.965,0.38
+base,Flow 4,17.78,12.219,0.40
+base,Flow 5,33.84,9.723,0.32
+base,Flow 6,34.10,8.712,0.32
+base,Flow 7,29.50,9.245,0.34
+base,Flow 8,46.35,21.154,0.26
+base,Flow 9,26.77,8.106,0.36
+base,Burst Flows,28.77,23.976,1.06

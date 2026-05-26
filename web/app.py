@@ -33,6 +33,7 @@ polling_lock = threading.Lock()
 
 # ---------- REST endpoints ----------
 
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -46,21 +47,23 @@ def topology():
 
 @app.route("/api/status")
 def status():
-    return jsonify({
-        "running": runner.is_running,
-        "group": runner.group,
-        "elapsed": runner.get_elapsed(),
-        "duration": runner.duration,
-    })
+    return jsonify(
+        {
+            "running": runner.is_running,
+            "group": runner.group,
+            "elapsed": runner.get_elapsed(),
+            "duration": runner.duration,
+        }
+    )
 
 
 @app.route("/start", methods=["POST"])
 def start_experiment():
     data = request.get_json(force=True)
-    group = data.get("group", "l2")
+    group = data.get("group", "base")
     duration = int(data.get("duration", 60))
 
-    if group not in ("l2", "threshold", "predictive"):
+    if group not in ("base", "threshold", "predictive"):
         return jsonify({"error": "Invalid group"}), 400
     if not (30 <= duration <= 600):
         return jsonify({"error": "Duration must be 30-600 seconds"}), 400
@@ -83,6 +86,7 @@ def stop_experiment():
 
 # ---------- WebSocket ----------
 
+
 @socketio.on("connect")
 def on_connect():
     _ensure_polling()
@@ -90,15 +94,19 @@ def on_connect():
 
 @socketio.on("request_status")
 def on_request_status():
-    socketio.emit("status_update", {
-        "running": runner.is_running,
-        "group": runner.group,
-        "elapsed": runner.get_elapsed(),
-        "duration": runner.duration,
-    })
+    socketio.emit(
+        "status_update",
+        {
+            "running": runner.is_running,
+            "group": runner.group,
+            "elapsed": runner.get_elapsed(),
+            "duration": runner.duration,
+        },
+    )
 
 
 # ---------- Background polling ----------
+
 
 def _ensure_polling():
     global polling_active
@@ -150,10 +158,13 @@ def _poll_loop():
             # --- Progress update ---
             if runner.is_running:
                 elapsed = runner.get_elapsed()
-                socketio.emit("progress", {
-                    "elapsed": elapsed,
-                    "duration": runner.duration,
-                })
+                socketio.emit(
+                    "progress",
+                    {
+                        "elapsed": elapsed,
+                        "duration": runner.duration,
+                    },
+                )
 
         except Exception:
             pass
@@ -227,4 +238,6 @@ def _parse_weight_lines(lines):
 if __name__ == "__main__":
     print("SDN Load Balancer Demo")
     print("Open http://localhost:5000 in your browser")
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(
+        app, host="0.0.0.0", port=5000, debug=False, allow_unsafe_werkzeug=True
+    )
