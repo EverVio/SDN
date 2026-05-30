@@ -117,7 +117,7 @@
 | 机器学习 | scikit-learn `MLPRegressor`（仅训练阶段） |
 | 数值计算 | NumPy（运行时推理） |
 | 数据处理 | Pandas、joblib |
-| 可视化 | Matplotlib（180 DPI 输出） |
+| 可视化 | Matplotlib（300 DPI 输出） |
 | Web 后端 | Flask + Flask-SocketIO |
 | Web 前端 | Cytoscape.js（拓扑图）+ 原生 JS |
 
@@ -372,7 +372,7 @@ Core 交换机 (DPID 17-20):
 │
 ├── data/                              # 实验数据与中间产物
 │   ├── traffic_data.csv               # 原始遥测数据（timestamp, dpid, port_no, utilization）
-│   ├── global_features.pkl            # 特征矩阵（X: [N,144], Y: [N,24], timestamps, link_keys）
+│   ├── global_features.pkl            # 特征矩阵（X: [N,384], Y: [N,64], timestamps, link_keys）
 │   ├── group_weights.csv              # 运行时组权重变化日志（timestamp, dpid, port3, port4）
 │   ├── viz_raw_traffic_matrix.pkl     # 完整时序矩阵（供热力图绘制）
 │   ├── viz_training_history.pkl       # 训练收敛曲线（loss_curve_, validation_scores_）
@@ -388,7 +388,7 @@ Core 交换机 (DPID 17-20):
 ├── models/                            # 序列化模型
 │   └── global_mlp_model.pkl           # MLP 权重 + Scaler 参数 + link_keys + window_size (1.7MB)
 │
-├── figures/                           # 可视化输出（16 张 PNG，180 DPI）
+├── figures/                           # 可视化输出（16 张 PNG，300 DPI）
 │   ├── 1_spatiotemporal_heatmap.png   # 全网链路时空利用率热力图
 │   ├── 2_key_link_utilization.png     # 关键骨干链路利用率曲线
 │   ├── 3_traffic_correlation_matrix.png # 链路流量相关矩阵
@@ -665,7 +665,7 @@ def _load_global_model(self, model_path):
     self.global_model = data["model"]
     self.scaler_X = data.get("scaler_X")
     self.scaler_Y = data.get("scaler_Y")
-    self.link_keys = data["link_keys"]           # 24 条骨干链路的 (dpid, port_no) 列表
+    self.link_keys = data["link_keys"]           # 64 条骨干链路的 (dpid, port_no) 列表
     self.window_size = data.get("window_size", 6)
     self.models_loaded = True
 
@@ -687,16 +687,16 @@ def _load_global_model(self, model_path):
     self.scaler_X = None
     self.scaler_Y = None
 
-    # 初始化滑动窗口（6 × 24 的零矩阵）
+    # 初始化滑动窗口（6 × 64 的零矩阵）
     num_links = len(self.link_keys)
     self.feature_history = [[0.0] * num_links for _ in range(self.window_size)]
 ```
 
 **权重矩阵维度**（以 (256,128,64) 隐藏层为例）：
-- `coefs_[0]`: (144, 256) — 输入层 → 第一隐藏层
+- `coefs_[0]`: (384, 256) — 输入层 → 第一隐藏层
 - `coefs_[1]`: (256, 128) — 第一 → 第二隐藏层
 - `coefs_[2]`: (128, 64)  — 第二 → 第三隐藏层
-- `coefs_[3]`: (64, 24)   — 第三隐藏层 → 输出层
+- `coefs_[3]`: (64, 64)   — 第三隐藏层 → 输出层
 
 #### 滑动窗口更新（`update_all_utilizations`）
 
@@ -725,7 +725,7 @@ def predict_all(self):
 
     # 1. 展平滑动窗口为一维输入向量
     X = np.array(self.feature_history, dtype=np.float32).ravel()
-    # X.shape = (144,) = 6 时间步 × 24 链路
+    # X.shape = (384,) = 6 时间步 × 64 链路
 
     # 2. StandardScaler 逆变换（输入标准化）
     X_scaled = (X - self.scaler_mean_X) / self.scaler_scale_X
@@ -942,7 +942,7 @@ def on_telemetry_tick(self):
 | 参数 | 值 | 说明 |
 |:---|:---|:---|
 | `PERMUTATION_INTERVAL` | 8s | 每轮持续时间 |
-| `TOTAL_ROUNDS` | 2000 | 总轮数（约 4.5 小时） |
+| `TOTAL_ROUNDS` | 2000 | 总轮数（约 5 小时） |
 | `STP_WAIT` | 5s | 拓扑收敛等待 |
 | `ALL_HOSTS` | 16 台 | 所有主机列表 |
 
@@ -1003,12 +1003,12 @@ def on_telemetry_tick(self):
 #### 特征组装算法
 
 ```
-输入: traffic_data.csv（约 30 万条记录）
+输入: traffic_data.csv（约 258 万条记录）
 
 步骤 1: 过滤非骨干链路
   移除: dpid ≤ 8 且 port_no ∈ {1, 2}（Edge 主机侧端口）
   保留: Aggregation 上行端口 (3, 4) + Core 所有端口
-  结果: 24 条骨干链路
+  结果: 64 条骨干链路
 
 步骤 2: Pivot 操作
   将 (timestamp, dpid, port_no, utilization) 转换为矩阵
@@ -1022,15 +1022,15 @@ def on_telemetry_tick(self):
 
 步骤 4: 构建滑动窗口特征
   对每个位置 i:
-    X = matrix[i : i+6].flatten()     → 形状 (144,) = 6 × 24
-    Y = max(matrix[i+6+1 : i+6+1+3])  → 形状 (24,)，3 步最大值
+    X = matrix[i : i+6].flatten()     → 形状 (384,) = 6 × 64
+    Y = max(matrix[i+6+1 : i+6+1+3])  → 形状 (64,)，3 步最大值
 
 步骤 5: 保存
   global_features.pkl: {X, Y, timestamps, link_keys, window_size}
   viz_raw_traffic_matrix.pkl: {matrix, link_keys, timestamps}
 ```
 
-#### 24 条骨干链路的构成
+#### 64 条骨干链路的构成
 
 ```
 Aggregation 上行链路 (8×2 = 16 条):
@@ -1040,7 +1040,7 @@ Aggregation 上行链路 (8×2 = 16 条):
 Core 全部链路 (4×4 = 16 条，但实际只取到 8 条上行方向):
   (17,1), (17,2), (17,3), (17,4),
   (18,1), (18,2), (18,3), (18,4),
-  ... 共 24 条
+  ... 共 64 条
 ```
 
 ### 5.3 MLP 模型训练（`scripts/train_global_mlp.py`）
@@ -1068,7 +1068,7 @@ model = MLPRegressor(
 
 ```
 步骤 1: 加载特征
-  global_features.pkl → X (N×144), Y (N×24), timestamps
+  global_features.pkl → X (N×384), Y (N×64), timestamps
 
 步骤 2: 时序划分（不打乱）
   80% 训练集 | 20% 测试集
@@ -1185,8 +1185,8 @@ BURST_SUBFLOWS = [
 #### CLI 接口
 
 ```bash
-# 运行所有策略，各 5 轮
-sudo python scripts/run_experiment.py --group all --iters 5
+# 运行所有策略，各 30 轮
+sudo python scripts/run_experiment.py --group all --iters 30
 
 # 仅运行 AI 预测式策略，3 轮
 sudo python scripts/run_experiment.py --group predictive --iters 3
@@ -1502,7 +1502,7 @@ t+2.0s: port3=16, port4=83  (再次反转)
 #### 图表 1：时空热力图（`1_spatiotemporal_heatmap.png`）
 
 - **X 轴**：时间（秒）
-- **Y 轴**：24 条骨干链路，按层排序（Core → Aggregation → Edge）
+- **Y 轴**：64 条骨干链路，按层排序（Core → Aggregation → Edge）
 - **颜色**：利用率（YlOrRd 色图，0=黄，1=红）
 - **降采样**：4 倍降采样提升渲染性能
 - **分隔线**：层间绘制水平虚线并标注层名
@@ -1515,7 +1515,7 @@ t+2.0s: port3=16, port4=83  (再次反转)
 
 #### 图表 3：流量相关矩阵（`3_traffic_correlation_matrix.png`）
 
-- 24 条骨干链路间的 Pearson 相关系数
+- 64 条骨干链路间的 Pearson 相关系数
 - coolwarm 色图，居中于 0
 
 ### 8.2 MLP 模型评估（`scripts/plot_mlp_evaluation.py`）
@@ -2023,7 +2023,7 @@ else:
 
 #### 根本原因
 
-原始代码中，每条突发子流启动后有一个 `time.sleep(0.5)` 调用。6 条子流累积 3 秒偏移。此外，背景流串行启动时的 `time.sleep(0.5)` 也产生了 4.5 秒的初始偏移（9 条流 × 0.5 秒）。
+原始代码中，每条突发子流启动后有一个 `time.sleep(0.5)` 调用。6 条子流累积 3 秒偏移。此外，背景流串行启动时的 `time.sleep(0.5)` 也产生了 5 秒的初始偏移（9 条流 × 0.5 秒）。
 
 ```python
 # 原始代码 — 累积偏移
@@ -2096,7 +2096,7 @@ python -c "import sklearn; print(sklearn.__version__)"  # 预期：1.x
 # 激活环境
 conda activate sdn_env
 
-# 步骤 1：采集训练数据（约 4.5 小时，可中断后继续）
+# 步骤 1：采集训练数据（约 5 小时，可中断后继续）
 sudo python scripts/collect_training_data.py
 
 # 步骤 2：组装特征矩阵（约 1 分钟）
@@ -2105,8 +2105,8 @@ cd scripts && python assemble_global_features.py && cd ..
 # 步骤 3：训练 MLP 模型（约 5-10 分钟）
 cd scripts && python train_global_mlp.py && cd ..
 
-# 步骤 4：运行对照实验（每策略 5 轮，约 15 分钟）
-sudo python scripts/run_experiment.py --group all --iters 5
+# 步骤 4：运行对照实验（每策略 30 轮）
+sudo python scripts/run_experiment.py --group all --iters 30
 
 # 步骤 5：生成可视化图表（约 2 分钟）
 cd scripts && python plot_traffic_analysis.py
@@ -2143,10 +2143,10 @@ timestamp,dpid,port_no,utilization
 
 ```python
 {
-    "X": np.array,          # 形状 (N, 144)，N 为样本数，144 = 6 × 24
-    "Y": np.array,          # 形状 (N, 24)，24 条骨干链路的预测目标
+    "X": np.array,          # 形状 (N, 384)，N 为样本数，384 = 6 × 64
+    "Y": np.array,          # 形状 (N, 64)，64 条骨干链路的预测目标
     "timestamps": np.array, # 形状 (N,)，每个样本的预测目标时间戳
-    "link_keys": list,      # 24 个 (dpid, port_no) 元组
+    "link_keys": list,      # 64 个 (dpid, port_no) 元组
     "window_size": 6,       # 滑动窗口大小
 }
 ```
@@ -2158,7 +2158,7 @@ timestamp,dpid,port_no,utilization
     "model": MLPRegressor,      # 训练好的模型对象
     "scaler_X": StandardScaler, # 输入标准化器
     "scaler_Y": StandardScaler, # 输出标准化器
-    "link_keys": list,          # 24 个 (dpid, port_no) 元组
+    "link_keys": list,          # 64 个 (dpid, port_no) 元组
     "window_size": 6,           # 滑动窗口大小
 }
 ```
@@ -2237,7 +2237,7 @@ dpid,port_no,MSE,MAE,RMSE
 | 步骤 | 内容 | 产出 | 预计耗时 |
 |:---|:---|:---|:---|
 | 3.1 | 实现 `collect_training_data.py` | 自动化数据采集脚本 | 2h |
-| 3.2 | 运行数据采集（2000 轮） | traffic_data.csv（约 30 万条） | 4.5h |
+| 3.2 | 运行数据采集（2000 轮） | traffic_data.csv（约 258 万条） | 4.5h |
 | 3.3 | 实现 `assemble_global_features.py` | 特征组装脚本 | 2h |
 | 3.4 | 运行特征组装 | global_features.pkl | 0.5h |
 | 3.5 | 实现 `train_global_mlp.py` | MLP 训练脚本 | 2h |
@@ -2264,7 +2264,7 @@ dpid,port_no,MSE,MAE,RMSE
 | 步骤 | 内容 | 产出 | 预计耗时 |
 |:---|:---|:---|:---|
 | 5.1 | 完善 `run_experiment.py`（三策略 + 多轮次） | 完整实验框架 | 2h |
-| 5.2 | 运行对照实验（3 策略 × 5 轮） | 所有 *_results.csv | 0.5h |
+| 5.2 | 运行对照实验（3 策略 × 30 轮） | 所有 *_results.csv | 3h |
 | 5.3 | 实现 `plot_traffic_analysis.py` | 3 张流量分析图 | 3h |
 | 5.4 | 实现 `plot_mlp_evaluation.py` | 6 张模型评估图 | 3h |
 | 5.5 | 实现 `plot_policy_comparison.py` | 7 张策略对比图 | 3h |
@@ -2319,8 +2319,7 @@ dpid,port_no,MSE,MAE,RMSE
 |:---|:---|:---|:---:|
 | **仅 UDP 测试** | 所有实验使用 iperf UDP 模式，无 TCP 流量 | TCP 的拥塞控制（AIMD）与负载均衡策略存在耦合效应，UDP 结果无法直接推广到 TCP 场景 | 高 |
 | **哈希碰撞不可控** | OVS dp_hash 的具体哈希函数和碰撞分布取决于内核实现版本 | 不同运行间的哈希碰撞模式可能不同，实验可复现性受限 | 中 |
-| **训练数据耗时** | 2000 轮采集需要 4.5 小时，且必须在 Mininet 环境中运行 | 快速迭代时成为瓶颈；无法在无 Mininet 的 CI/CD 环境中自动采集 | 中 |
-| **Predictive 实验轮次不足** | AI 预测式策略仅运行 1 轮（base 和 threshold 各 30 轮） | 统计显著性有限，无法确认 AI 策略的方差特征和尾部行为 | 高 |
+| **训练数据耗时** | 2000 轮采集需要 5 小时，且必须在 Mininet 环境中运行 | 快速迭代时成为瓶颈；无法在无 Mininet 的 CI/CD 环境中自动采集 | 中 |
 | **流量模式单一** | 实验仅包含 Pod 0 → Pod 3 的单方向跨 Pod 流量，无东西向混合流量 | 无法验证策略在复杂多方向流量矩阵下的表现 | 中 |
 | **无背景噪声** | 实验环境中无 DNS、ARP、管理流量等背景噪声 | 实际部署中背景流量可能干扰利用率计算和预测精度 | 低 |
 
@@ -2359,7 +2358,7 @@ dpid,port_no,MSE,MAE,RMSE
 | **TCP 感知负载均衡** | 考虑 TCP 拥塞控制与负载均衡的交互效应 | 区分 TCP/UDP 流，对 TCP 流使用更保守的权重调整策略，避免与 TCP AIMD 产生振荡 | 中 |
 | **QoS 区分** | 为不同优先级的流量应用不同的权重分配策略 | 在流表匹配中增加 DSCP/ToS 字段，高优先级流量使用更稳定的路径 | 中 |
 | **容器化部署** | 使用 Docker 容器化 Ryu 控制器和 Mininet 拓扑 | 编写 Dockerfile，使用 docker-compose 编排控制器和网络仿真环境 | 低 |
-| **CI/CD 集成** | 自动化测试流水线，每次代码提交自动运行对照实验 | 使用 GitHub Actions + Mininet 容器，自动运行 5 轮对照实验并生成报告 | 中 |
+| **CI/CD 集成** | 自动化测试流水线，每次代码提交自动运行对照实验 | 使用 GitHub Actions + Mininet 容器，自动运行多轮对照实验并生成报告 | 中 |
 
 #### 14.2.3 可视化与可观测性层面
 
@@ -2393,11 +2392,11 @@ dpid,port_no,MSE,MAE,RMSE
 
 #### 14.3.3 可扩展性分析
 
-当前系统在 Fat-Tree k=4（20 交换机、24 骨干链路）上验证。向更大规模扩展时的瓶颈分析：
+当前系统在 Fat-Tree k=4（20 交换机、64 骨干链路）上验证。向更大规模扩展时的瓶颈分析：
 
 | 规模 | 交换机数 | 骨干链路 | MLP 输入维度 | 预估推理延迟 | 主要瓶颈 |
 |:---|:---:|:---:|:---:|:---:|:---|
-| k=4（当前） | 20 | 24 | 144 | ~0.1ms | 无 |
+| k=4（当前） | 20 | 64 | 384 | ~0.1ms | 无 |
 | k=6 | 54 | 72 | 432 | ~0.3ms | 模型维度增长 |
 | k=8 | 128 | 160 | 960 | ~1.0ms | 遥测采集延迟 |
 | k=10 | 250 | 300 | 1800 | ~3.0ms | 串行统计请求瓶颈 |

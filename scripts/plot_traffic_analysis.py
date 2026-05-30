@@ -19,10 +19,8 @@ import datetime
 FIGURES_DIR = os.path.join(os.path.dirname(__file__), "..", "figures")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
-# 只绘制局部时间窗，默认取实验开始后的前 60 秒
 LOCAL_WINDOW_START = 0
 LOCAL_WINDOW_SECONDS = 60
-# 图表 2 单独使用 5 分钟窗口
 CHART2_WINDOW_SECONDS = 300
 
 
@@ -34,11 +32,11 @@ def load_data():
 def make_link_label(dpid, port_no):
     """S{dpid}-P{port_no}, 带拓扑层级前缀便于纵轴阅读"""
     if dpid <= 8:
-        prefix = "E"  # Edge
+        prefix = "E"
     elif dpid <= 16:
-        prefix = "A"  # Aggregation
+        prefix = "A"
     else:
-        prefix = "C"  # Core
+        prefix = "C"
     return f"{prefix}{dpid}-P{port_no}"
 
 
@@ -70,7 +68,6 @@ def plot_heatmap(matrix, link_keys, timestamps, downsample_time=4):
     热力图: X=时间, Y=链路, 颜色=利用率
     downsample_time: 每 N 个时间步取 1 个，减少渲染负担
     """
-    # 先截取局部时间窗，再下采样时间维度
     matrix, link_keys, timestamps = select_time_window(
         matrix,
         link_keys,
@@ -79,15 +76,12 @@ def plot_heatmap(matrix, link_keys, timestamps, downsample_time=4):
         duration=LOCAL_WINDOW_SECONDS,
     )
 
-    # 下采样时间维度
     ts_ds = timestamps[::downsample_time]
     mat_ds = matrix[::downsample_time, :]
     n_time, n_links = mat_ds.shape
 
-    # Y 轴标签
     y_labels = [make_link_label(d, p) for d, p in link_keys]
 
-    # 按拓扑层级排序: Core → Aggregation → Edge
     layer_order = []
     for target_prefix in ["C", "A", "E"]:
         for i, (d, p) in enumerate(link_keys):
@@ -97,10 +91,8 @@ def plot_heatmap(matrix, link_keys, timestamps, downsample_time=4):
     mat_sorted = mat_ds[:, layer_order]
     y_labels_sorted = [y_labels[i] for i in layer_order]
 
-    # 绘图
     fig, ax = plt.subplots(figsize=(18, 10))
 
-    # 时间轴用相对秒数（从 0 开始）
     t_rel = ts_ds - ts_ds[0]
     extent = [t_rel[0], t_rel[-1], -0.5, n_links - 0.5]
 
@@ -115,7 +107,6 @@ def plot_heatmap(matrix, link_keys, timestamps, downsample_time=4):
         interpolation="nearest",
     )
 
-    # 在层级分界处画水平线
     n_core = sum(1 for d, p in link_keys if d > 16)
     n_agg = sum(1 for d, p in link_keys if 9 <= d <= 16)
     ax.axhline(y=n_core - 0.5, color="white", linewidth=1.5, linestyle="--")
@@ -154,7 +145,6 @@ def plot_heatmap(matrix, link_keys, timestamps, downsample_time=4):
         bbox=dict(facecolor="black", alpha=0.6, pad=2),
     )
 
-    # Y 轴刻度：只显示部分（太密集会重叠）
     if n_links <= 80:
         ax.set_yticks(range(n_links))
         ax.set_yticklabels(y_labels_sorted, fontsize=6)
@@ -164,7 +154,6 @@ def plot_heatmap(matrix, link_keys, timestamps, downsample_time=4):
         ax.set_yticks(ticks)
         ax.set_yticklabels([y_labels_sorted[i] for i in ticks], fontsize=6)
 
-    # X 轴：用原始时间戳格式化
     n_x_ticks = 8
     tick_positions = np.linspace(t_rel[0], t_rel[-1], n_x_ticks)
     tick_timestamps = np.linspace(ts_ds[0], ts_ds[-1], n_x_ticks)
@@ -173,7 +162,6 @@ def plot_heatmap(matrix, link_keys, timestamps, downsample_time=4):
         [format_timestamp(t) for t in tick_timestamps], fontsize=8, rotation=30
     )
 
-    # Colorbar
     cbar = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.85)
     cbar.set_label("Link Utilization", fontsize=11)
     cbar.ax.tick_params(labelsize=9)
@@ -210,7 +198,6 @@ def plot_key_links(matrix, link_keys, timestamps):
         duration=CHART2_WINDOW_SECONDS,
     )
 
-    # 选取策略：Core 2 条 + Agg 2 条 + Edge 2 条（上行端口）
     candidates = {
         "Core": [(d, p) for d, p in link_keys if d > 16 and p in [1, 2]],
         "Agg-Up": [(d, p) for d, p in link_keys if 9 <= d <= 16 and p in [3, 4]],
@@ -219,7 +206,6 @@ def plot_key_links(matrix, link_keys, timestamps):
     selected = []
     for layer_name, links in candidates.items():
         if links:
-            # 取方差最大的（最有变化的链路）
             variances = []
             for d, p in links:
                 idx = link_keys.index((d, p))
@@ -228,10 +214,8 @@ def plot_key_links(matrix, link_keys, timestamps):
             for _, d, p in variances[:2]:
                 selected.append((d, p))
 
-    # 时间轴：转为相对分钟
     t_min = (timestamps - timestamps[0]) / 60.0
 
-    # 对利用率做平滑；窗口自适应，避免 1 分钟局部窗口下窗口长度超过样本数
     def smooth(arr, w=21):
         w = min(w, len(arr))
         if w < 3:
@@ -258,7 +242,6 @@ def plot_key_links(matrix, link_keys, timestamps):
             label=label,
         )
 
-    # 阈值线
     ax.axhline(
         y=0.70,
         color="red",
@@ -325,9 +308,7 @@ def plot_correlation_matrix(matrix, link_keys, timestamps):
 
     n_links = len(labels)
     ax.set_xticks(range(n_links))
-    ax.set_xticklabels(
-        labels, rotation=90, fontsize=4.5
-    )  # Set slightly smaller fontsize (4.5pt) to avoid overlap
+    ax.set_xticklabels(labels, rotation=90, fontsize=4.5)
     ax.set_yticks(range(n_links))
     ax.set_yticklabels(labels, fontsize=4.5)
 
@@ -339,9 +320,6 @@ def plot_correlation_matrix(matrix, link_keys, timestamps):
     cbar = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.85)
     cbar.set_label("Pearson Correlation Coefficient", fontsize=11)
     cbar.ax.tick_params(labelsize=9)
-
-    # Text annotation cell annotation is removed to offer clean, professional, high-density macroeconomic visual clarity.
-    # Grid color intensities (RdBu/Coolwarm) are sufficient for demonstrating spatial correlation patterns.
 
     ax.set_title(
         "Traffic Correlation Matrix Heatmap of Backbone Links\n"

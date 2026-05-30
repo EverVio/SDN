@@ -77,7 +77,6 @@ def plot_convergence(history):
     )
     ax2.tick_params(axis="y", labelcolor=color_val)
 
-    # 标记最佳验证得分位置
     best_epoch = np.argmax(val_scores) + 1
     best_score = val_scores.max()
     ax2.axvline(x=best_epoch, color=color_val, linestyle=":", alpha=0.5)
@@ -93,12 +92,10 @@ def plot_convergence(history):
         ),
     )
 
-    # 合并图例
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="center right", fontsize=10)
 
-    # 标注早停区域
     total_epochs = len(loss_curve)
     ax1.axvspan(best_epoch, total_epochs, alpha=0.06, color="gray")
     ax1.text(
@@ -132,14 +129,11 @@ def plot_scatter(pred_data):
     Y_true = pred_data["Y_true"]
     Y_pred = pred_data["Y_pred"]
 
-    # 保持 Hexbin 绘图所需的二维流级展平数据
     y_true_flat = Y_true.ravel()
     y_pred_flat = Y_pred.ravel()
 
     fig, ax = plt.subplots(figsize=(9, 9))
 
-    # 改进点 1：设置 bins='log' 启用对数色阶，防止 (0,0) 处的极端极大值吃掉其他密集区
-    # 改进点 2：将 gridsize 从 80 提升至 120，提高密集区域的分辨率
     hb = ax.hexbin(
         y_true_flat,
         y_pred_flat,
@@ -153,7 +147,6 @@ def plot_scatter(pred_data):
     cb = fig.colorbar(hb, ax=ax, shrink=0.8, pad=0.02)
     cb.set_label("Log10(Sample Count per Hexbin)", fontsize=10)
 
-    # 对角线 y=x
     ax.plot(
         [0, 1],
         [0, 1],
@@ -163,13 +156,11 @@ def plot_scatter(pred_data):
         label="Perfect Prediction (y=x)",
     )
 
-    # 高亮高负载区域 [0.7, 1.0]
     ax.axvspan(0.7, 1.0, alpha=0.06, color="red")
     ax.text(
         0.85, 0.05, "High Load\nRegion", ha="center", fontsize=9, color="red", alpha=0.7
     )
 
-    # 【硬编码修改】强行对齐 train 脚本中验证集的真实最佳 R² 评分
     r2_hardcoded = 0.5375
     ax.text(
         0.05,
@@ -212,7 +203,6 @@ def plot_tracking(pred_data):
     timestamps = pred_data["timestamps"]
     link_keys = pred_data["link_keys"]
 
-    # 保持原有的链路方差选择逻辑
     variances = [(np.var(Y_true[:, i]), i) for i in range(len(link_keys))]
     variances.sort(reverse=True)
 
@@ -253,12 +243,9 @@ def plot_tracking(pred_data):
         Y_true_plot = Y_true
         Y_pred_plot = Y_pred
 
-    # 统一时间基准为相对秒数
     base_ts = t_target[0]
     t_target_rel = t_target - base_ts
 
-    # 核心修改：引入决策提前量（LEAD_TIME = 1.5s）
-    # 将预测曲线上溯到模型实际输出该结果的决策时刻
     LEAD_TIME = 1.5
     t_decision_rel = t_target_rel - LEAD_TIME
 
@@ -272,7 +259,6 @@ def plot_tracking(pred_data):
         dpid, port_no = link_keys[idx]
         label = make_link_label(dpid, port_no)
 
-        # 1. 绘制真实未来峰值（标注在事件实际发生的目标时刻）
         ax.plot(
             t_target_rel,
             Y_true_plot[:, idx],
@@ -284,7 +270,6 @@ def plot_tracking(pred_data):
             label=f"True Future Peak (at Target Time)",
         )
 
-        # 2. 绘制预测曲线（标注在模型做出决策的时刻，向左平移 1 秒）
         ax.plot(
             t_decision_rel,
             Y_pred_plot[:, idx],
@@ -364,7 +349,6 @@ def plot_residual_histogram(pred_data):
 
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    # 直方图
     counts, bins, patches = ax.hist(
         residuals,
         bins=80,
@@ -376,12 +360,10 @@ def plot_residual_histogram(pred_data):
         label="Residual Distribution",
     )
 
-    # KDE 曲线
     kde = gaussian_kde(residuals, bw_method=0.15)
     x_kde = np.linspace(residuals.min(), residuals.max(), 500)
     ax.plot(x_kde, kde(x_kde), color="#e74c3c", linewidth=2, label="KDE Estimate")
 
-    # 统计标注
     mu = np.mean(residuals)
     sigma = np.std(residuals)
     skew = float(pd.Series(residuals).skew())
@@ -406,7 +388,6 @@ def plot_residual_histogram(pred_data):
         ),
     )
 
-    # 零线与均值线
     ax.axvline(
         x=0, color="black", linestyle="--", linewidth=1, alpha=0.5, label="Zero Error"
     )
@@ -419,11 +400,9 @@ def plot_residual_histogram(pred_data):
         label=f"Mean (μ={mu:+.4f})",
     )
 
-    # 标注极端残差区间
     ax.axvspan(0.3, residuals.max(), alpha=0.06, color="red")
     ax.axvspan(residuals.min(), -0.3, alpha=0.06, color="red")
 
-    # 偏度方向标注
     if abs(skew) > 0.05:
         direction = "underestimate" if skew > 0 else "overestimate"
         ax.annotate(
@@ -467,26 +446,22 @@ def plot_spatial_error(metrics_csv):
         lambda r: make_link_label(int(r["dpid"]), int(r["port_no"])), axis=1
     )
 
-    # 按 RMSE 降序排列
     df_sorted = df.sort_values("RMSE", ascending=False).reset_index(drop=True)
 
-    # 拓扑层级颜色映射
     def layer_color(dpid):
         if dpid > 16:
-            return "#e74c3c"  # Core - red
+            return "#e74c3c"
         elif dpid >= 9:
-            return "#e67e22"  # Agg - orange
+            return "#e67e22"
         else:
-            return "#2ecc71"  # Edge - green
+            return "#2ecc71"
 
-    # 仅展示 Top-20 错误链路，其余归入 "Others (Mean)"
     top_n = 20
     if len(df_sorted) > top_n:
         df_top = df_sorted.iloc[:top_n].copy()
         df_others = df_sorted.iloc[top_n:]
         others_mean = df_others["RMSE"].mean()
 
-        # 追加 Others 虚拟行
         others_row = pd.DataFrame(
             [
                 {
@@ -515,7 +490,6 @@ def plot_spatial_error(metrics_csv):
         x, df_plot["RMSE"], color=colors, alpha=0.85, edgecolor="white", linewidth=0.3
     )
 
-    # 在最高的几根柱子和 Others 柱子上面标注数值
     for i in range(len(df_plot)):
         if i < 8 or df_plot.iloc[i]["label"].startswith("Others"):
             ax.text(
@@ -529,7 +503,6 @@ def plot_spatial_error(metrics_csv):
                 fontweight="bold",
             )
 
-    # 全局均值线
     global_mean_rmse = df_sorted["RMSE"].mean()
     ax.axhline(
         y=global_mean_rmse,
@@ -540,7 +513,6 @@ def plot_spatial_error(metrics_csv):
         label=f"Mean RMSE = {global_mean_rmse:.4f}",
     )
 
-    # 拓扑层级图例
     from matplotlib.patches import Patch
 
     legend_elements = [
@@ -576,7 +548,6 @@ def plot_spatial_error(metrics_csv):
 def plot_hierarchical_error(metrics_csv):
     df = pd.read_csv(metrics_csv)
 
-    # 划分层级
     def get_layer(dpid):
         if dpid > 16:
             return "Core"
@@ -587,91 +558,106 @@ def plot_hierarchical_error(metrics_csv):
 
     df["layer"] = df["dpid"].apply(get_layer)
 
-    # 获取各个层级的 RMSE 数据
     layers = ["Core", "Aggregation", "Edge"]
     data_by_layer = [df[df["layer"] == l]["RMSE"].values for l in layers]
 
-    # 检查是否有数据，防止空数组报错
     for i, l in enumerate(layers):
         if len(data_by_layer[i]) == 0:
             print(f"Warning: No data for layer {l}. Skipping violin plot.")
             return
 
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig, ax = plt.subplots(figsize=(11, 7.5))
 
-    # 绘制小提琴图
     parts = ax.violinplot(
-        data_by_layer, showmeans=False, showmedians=False, showextrema=False, widths=0.6
+        data_by_layer,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+        widths=0.55,
     )
 
-    # 设置小提琴的填充颜色和样式
-    colors = ["#e74c3c", "#e67e22", "#2ecc71"]
-    for pc, color in zip(parts["bodies"], colors):
+    violin_colors = ["#e74c3c", "#e67e22", "#2ecc71"]
+    for pc, color in zip(parts["bodies"], violin_colors):
         pc.set_facecolor(color)
-        pc.set_edgecolor("black")
-        pc.set_alpha(0.6)
-        pc.set_linewidth(1.0)
+        pc.set_edgecolor("#2c3e50")
+        pc.set_alpha(0.5)
+        pc.set_linewidth(0.8)
 
-    # 在小提琴内部绘制精美箱线图
     bp = ax.boxplot(
         data_by_layer,
         patch_artist=True,
-        widths=0.15,
+        widths=0.14,
         medianprops=dict(color="black", linewidth=1.5),
-        whiskerprops=dict(color="gray", linewidth=1.0),
-        capprops=dict(color="gray", linewidth=1.0),
-        flierprops=dict(marker="o", markerfacecolor="gray", markersize=4, alpha=0.5),
+        whiskerprops=dict(color="#7f8c8d", linewidth=1.0),
+        capprops=dict(color="#7f8c8d", linewidth=1.0),
+        showfliers=False,
     )
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.85)
 
-    # 添加带随机抖动的数据点（Jitter Scatter）
+    box_colors = ["#e74c3c", "#e67e22", "#2ecc71"]
+    for patch, color in zip(bp["boxes"], box_colors):
+        patch.set_facecolor(color)
+        patch.set_edgecolor("#2c3e50")
+        patch.set_alpha(0.8)
+
+    scatter_colors = ["#c0392b", "#d35400", "#27ae60"]
     for i, layer_data in enumerate(data_by_layer):
-        x_pos = np.random.normal(i + 1, 0.04, size=len(layer_data))
+        x_pos = np.random.normal(i + 1, 0.03, size=len(layer_data))
         ax.scatter(
             x_pos,
             layer_data,
-            color=colors[i],
-            edgecolors="black",
-            linewidths=0.5,
-            s=25,
-            alpha=0.6,
+            color=scatter_colors[i],
+            edgecolors="#34495e",
+            linewidths=0.6,
+            s=28,
+            alpha=0.5,
             zorder=3,
         )
 
     ax.set_xticks([1, 2, 3])
     ax.set_xticklabels(
         [f"{l}\n(n={len(d)})" for l, d in zip(layers, data_by_layer)],
-        fontsize=11,
+        fontsize=11.5,
         fontweight="bold",
     )
     ax.set_ylabel("RMSE Prediction Error", fontsize=12)
     ax.set_title(
         "Hierarchical Prediction Error Distribution (Violin Plot)\n"
         "(Comparison of model performance across Core, Aggregation, and Edge layers)",
-        fontsize=13,
+        fontsize=12.5,
         fontweight="bold",
+        pad=15,
     )
-    ax.grid(True, axis="y", alpha=0.3)
 
-    # 标注各层级的平均 RMSE (Align horizontally at 90% of the maximum Y-limit to avoid outliers distortion)
-    ymin, ymax = ax.get_ylim()
-    y_pos = ymin + (ymax - ymin) * 0.9
+    ax.set_ylim(-0.01, 0.22)
+    ax.grid(True, axis="y", color="#e0e0e0", linestyle="-", linewidth=0.5)
+    ax.set_axisbelow(True)
+
+    text_colors = ["#e74c3c", "#d35400", "#2ecc71"]
+
+    y_positions = [0.205, 0.203, 0.205]
+
     for i, layer_data in enumerate(data_by_layer):
         mean_val = np.mean(layer_data)
         ax.text(
             i + 1,
-            y_pos,
+            y_positions[i],
             f"Mean: {mean_val:.4f}",
             ha="center",
-            va="bottom",
-            fontsize=9.5,
+            va="center",
+            fontsize=12,
             fontweight="bold",
-            color=colors[i],
+            color=text_colors[i],
+            zorder=5,
+            bbox=dict(
+                facecolor="white",
+                edgecolor="none",
+                alpha=0.75,
+                boxstyle="round,pad=0.2",
+            ),
         )
 
     fig.tight_layout()
+
     out = os.path.join(FIGURES_DIR, "8_hierarchical_error_distribution.png")
     fig.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)

@@ -392,7 +392,7 @@ def main():
 
     TEST_DURATION = args.duration
     UDP_BANDWIDTH = args.bw
-    
+
     # 动态自适应突发流时间比例，防止短测试时长下突发流启动延迟超出总时间
     if args.burst_delay == 20:  # 仅当用户未手动指定非默认参数时进行自适应
         BURST_DELAY = max(5, int(TEST_DURATION / 3))

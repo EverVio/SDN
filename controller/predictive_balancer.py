@@ -26,7 +26,9 @@ class PredictiveBalancer(BaseBalancer):
         os.makedirs("data", exist_ok=True)
         self._weights_file = open("data/group_weights.csv", "w", newline="")
         self._weights_writer = csv.writer(self._weights_file)
-        self._weights_writer.writerow(["timestamp", "dpid", "port3_weight", "port4_weight"])
+        self._weights_writer.writerow(
+            ["timestamp", "dpid", "port3_weight", "port4_weight"]
+        )
         self._weights_file.flush()
 
     def _write_weights(self, dpid, weights):

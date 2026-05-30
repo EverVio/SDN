@@ -17,7 +17,6 @@ from matplotlib.patches import Patch
 FIGURES_DIR = os.path.join(os.path.dirname(__file__), "..", "figures")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
-# Unified burst flow name across all groups
 BURST_LABEL = "Burst Flows"
 
 POLICY_COLORS = {
@@ -51,7 +50,6 @@ def plot_grouped_bar():
     groups = ["base", "threshold", "predictive"]
     dfs = {g: load_average(g) for g in groups}
 
-    # Determine flow order: Flow 1-9 sorted, then Burst Flows last
     all_flows = []
     for i in range(1, 10):
         all_flows.append(f"Flow {i}")
@@ -141,7 +139,6 @@ def plot_box():
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
 
-    # Subplot 1: Loss rate distribution
     ax1 = axes[0]
     loss_data = [burst_dfs[g]["loss_pct"].values for g in groups]
     bp1 = ax1.boxplot(
@@ -163,9 +160,8 @@ def plot_box():
     )
     ax1.grid(axis="y", alpha=0.3)
     ax1.set_axisbelow(True)
-    ax1.set_xlim(0.5, 4.2)  # 进一步增加右侧边界，为移远的标签留出空间
+    ax1.set_xlim(0.5, 4.2)
 
-    # Annotate median and IQR with arrows
     for i, g in enumerate(groups):
         data = burst_dfs[g]["loss_pct"]
         if len(data) == 0:
@@ -173,11 +169,10 @@ def plot_box():
         med = data.median()
         q1, q3 = data.quantile(0.25), data.quantile(0.75)
 
-        # xy 是中位数线条右侧边缘的坐标 (当前箱体中心为 i+1，宽度 0.5，右边缘即为 i+1.25)
         ax1.annotate(
             f"Med={med:.1f}%\nIQR={q1:.1f}–{q3:.1f}%",
             xy=(i + 1.25, med),
-            xytext=(i + 1.45, med + 5),  # 将文本向右移远至 1.45
+            xytext=(i + 1.45, med + 5),
             va="center",
             ha="left",
             fontsize=7.5,
@@ -187,14 +182,13 @@ def plot_box():
                 boxstyle="round,pad=0.2", facecolor="white", edgecolor="#ddd", alpha=0.8
             ),
             arrowprops=dict(
-                arrowstyle="->",  # 细箭头样式
-                color="#666666",  # 灰色细线避免抢眼
-                linewidth=0.8,  # 线宽
+                arrowstyle="->",
+                color="#666666",
+                linewidth=0.8,
                 connectionstyle="arc3",
             ),
         )
 
-    # Subplot 2: Bandwidth distribution
     ax2 = axes[1]
     bw_data = [burst_dfs[g]["bandwidth_mbps"].values for g in groups]
     bp2 = ax2.boxplot(
@@ -216,7 +210,7 @@ def plot_box():
     )
     ax2.grid(axis="y", alpha=0.3)
     ax2.set_axisbelow(True)
-    ax2.set_xlim(0.5, 4.2)  # 同步增加右侧边界
+    ax2.set_xlim(0.5, 4.2)
 
     for i, g in enumerate(groups):
         data = burst_dfs[g]["bandwidth_mbps"]
@@ -228,7 +222,7 @@ def plot_box():
         ax2.annotate(
             f"Med={med:.2f} Mbps\nIQR={q1:.2f}–{q3:.2f}",
             xy=(i + 1.25, med),
-            xytext=(i + 1.45, med - 0.1),  # 将文本向右移远至 1.45
+            xytext=(i + 1.45, med - 0.1),
             va="center",
             ha="left",
             fontsize=7.5,
@@ -268,7 +262,6 @@ def plot_cdf():
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 
-    # Subplot 1: Loss rate CDF
     ax1 = axes[0]
     for g in groups:
         loss = all_data[g]["loss_pct"].values
@@ -284,7 +277,6 @@ def plot_cdf():
             label=f"{POLICY_LABELS[g]} (n={len(sorted_loss)})",
         )
 
-    # Mark P95 only (removed P99)
     for g in groups:
         loss = all_data[g]["loss_pct"].values
         if len(loss) == 0:
@@ -309,11 +301,9 @@ def plot_cdf():
     ax1.set_ylabel("Cumulative Probability", fontsize=12)
     ax1.set_title("Loss Rate CDF", fontsize=12, fontweight="bold")
     ax1.legend(fontsize=9, loc="lower right")
-    # No grid
     ax1.set_xlim(left=-1)
     ax1.set_ylim(-0.02, 1.02)
 
-    # Subplot 2: Jitter CDF (unchanged, only P95)
     ax2 = axes[1]
     for g in groups:
         jitter = all_data[g]["jitter_ms"].values
@@ -391,7 +381,6 @@ def plot_weight_evolution():
         sub_df = df[df["dpid"] == dpid].sort_values("timestamp")
         t_rel = sub_df["timestamp"] - min_ts
 
-        # Rolling average smoothing (w=5) for weights
         w_smooth = 5
         smoothed_w3 = (
             sub_df["port3_weight"].rolling(w_smooth, min_periods=1, center=True).mean()
@@ -400,7 +389,6 @@ def plot_weight_evolution():
             sub_df["port4_weight"].rolling(w_smooth, min_periods=1, center=True).mean()
         )
 
-        # Normalize to ensure they sum to exactly 100%
         total_w = smoothed_w3 + smoothed_w4
         smoothed_w3 = (smoothed_w3 / total_w) * 100.0
         smoothed_w4 = (smoothed_w4 / total_w) * 100.0
@@ -416,12 +404,8 @@ def plot_weight_evolution():
         ax.set_ylabel(f"S{dpid} Weight (%)", fontsize=9)
         ax.set_ylim(0, 100)
         ax.grid(True, alpha=0.3)
-        # 移除原有的图例（不再在每个子图中显示）
 
     axes[-1].set_xlabel("Time (seconds)", fontsize=11)
-
-    # 在标题下方添加横向排列的图例
-    from matplotlib.patches import Patch
 
     legend_elements = [
         Patch(facecolor="#3498db", alpha=0.85, label="Port 3"),
@@ -443,7 +427,6 @@ def plot_weight_evolution():
         fontweight="bold",
         y=0.99,
     )
-    # 调整布局，为标题和图例预留空间
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     out = os.path.join(FIGURES_DIR, "policy_5_weight_evolution.png")
     fig.savefig(out, dpi=300, bbox_inches="tight")
@@ -466,7 +449,6 @@ def plot_dual_axis_coevolution():
     df_w = pd.read_csv(weights_path)
     df_t = pd.read_csv(traffic_path)
 
-    # Target Switch: DPID 9 (first Aggregation switch)
     dpid_target = 9
     df_w_sub = df_w[df_w["dpid"] == dpid_target].sort_values("timestamp")
     df_t_sub3 = df_t[
@@ -480,7 +462,6 @@ def plot_dual_axis_coevolution():
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6.5))
 
-    # Subplot 1: Port 3
     ax1 = axes[0]
     t_w = df_w_sub["timestamp"] - global_min_ts
     t_t3 = df_t_sub3["timestamp"] - global_min_ts
@@ -523,12 +504,10 @@ def plot_dual_axis_coevolution():
         f"Switch S{dpid_target} Port 3 Co-evolution", fontsize=12, fontweight="bold"
     )
 
-    # Merge dual-axis legends to avoid confusion
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax1_twin.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8.5)
 
-    # Subplot 2: Port 4
     ax2 = axes[1]
     t_t4 = df_t_sub4["timestamp"] - global_min_ts
 
@@ -562,7 +541,6 @@ def plot_dual_axis_coevolution():
         f"Switch S{dpid_target} Port 4 Co-evolution", fontsize=12, fontweight="bold"
     )
 
-    # Merge dual-axis legends to avoid confusion
     lines1, labels1 = ax2.get_legend_handles_labels()
     lines2, labels2 = ax2_twin.get_legend_handles_labels()
     ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8.5)
@@ -598,9 +576,9 @@ def plot_pareto_tradeoff():
     fig, ax = plt.subplots(figsize=(10, 8))
 
     markers = {
-        "base": "o",  # Circle
-        "threshold": "s",  # Square
-        "predictive": "^",  # Triangle
+        "base": "o",
+        "threshold": "s",
+        "predictive": "^",
     }
 
     for g in groups:
@@ -617,7 +595,6 @@ def plot_pareto_tradeoff():
             label=POLICY_LABELS[g],
         )
 
-        # Annotate typical burst flow
         burst_row = df[df["flow"] == BURST_LABEL]
         if not burst_row.empty:
             ax.annotate(
@@ -635,13 +612,9 @@ def plot_pareto_tradeoff():
                 arrowprops=dict(arrowstyle="->", color=POLICY_COLORS[g], lw=1.2),
             )
 
-    # 1. Dynamically compute the maximum bandwidth to place the Ideal Point logically
     max_bw = max(dfs[g]["avg_bandwidth_mbps"].max() for g in groups)
-    ideal_bw = (
-        max_bw  # The theoretical peak capacity achieved by any path in this dataset
-    )
+    ideal_bw = max_bw
 
-    # 2. Draw the Ideal Point and dynamic annotation
     ax.plot(
         0.0,
         ideal_bw,
@@ -663,7 +636,7 @@ def plot_pareto_tradeoff():
 
     ax.set_xlabel("Average Loss Rate (%)", fontsize=12)
     ax.set_ylabel("Average Throughput (Mbps)", fontsize=12)
-    ax.set_ylim(-0.05, ideal_bw * 1.1)  # Ensure ideal point is beautifully visible
+    ax.set_ylim(-0.05, ideal_bw * 1.1)
     ax.set_title(
         "Multi-Objective Pareto Trade-off Scatter Plot\n"
         "(Throughput vs. Loss Rate across all 10 flows under three policies)",
@@ -696,7 +669,7 @@ def plot_flow_fairness_radar():
 
     n_flows = len(all_flows)
     angles = np.linspace(0, 2 * np.pi, n_flows, endpoint=False).tolist()
-    angles += angles[:1]  # Complete the loop
+    angles += angles[:1]
 
     fig, ax = plt.subplots(figsize=(9, 9), subplot_kw=dict(projection="polar"))
 
@@ -707,12 +680,11 @@ def plot_flow_fairness_radar():
             row = df[df["flow"] == f]
             raw_val = row["avg_bandwidth_mbps"].values[0] if not row.empty else 0
 
-            # Normalization: divided by max expected bandwidth (0.5 for background flows, 1.5 for burst flows)
             norm_factor = 1.5 if f == BURST_LABEL else 0.5
             norm_val = raw_val / norm_factor
             values.append(norm_val)
 
-        values += values[:1]  # Complete the loop
+        values += values[:1]
 
         ax.plot(
             angles, values, color=POLICY_COLORS[g], linewidth=2, label=POLICY_LABELS[g]
