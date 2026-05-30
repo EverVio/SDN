@@ -137,7 +137,6 @@ class ExperimentRunner:
                                 "Sub-flow" in decoded):
                                 with self._lock:
                                     if self.start_time is None:
-                                        import time
                                         self.start_time = time.time()
                                         self.socketio.emit("experiment_log", {
                                             "line": ">>> [SYSTEM] Network fully connected. Starting timer now."

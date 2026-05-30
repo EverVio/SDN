@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Flask + Flask-SocketIO backend for SDN Load Balancer Demo.
 Provides REST endpoints for experiment control and WebSocket for real-time data.
@@ -29,9 +28,6 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 runner = ExperimentRunner(socketio)
 polling_active = False
 polling_lock = threading.Lock()
-
-
-# ---------- REST endpoints ----------
 
 
 @app.route("/")
@@ -177,7 +173,6 @@ def _read_new_lines(filepath, offset):
     try:
         size = os.path.getsize(filepath)
         if size < offset:
-            # File was truncated (experiment restart), reset to beginning
             offset = 0
         if size <= offset:
             return [], offset
@@ -231,9 +226,6 @@ def _parse_weight_lines(lines):
         except (ValueError, IndexError):
             continue
     return latest if latest else None
-
-
-# ---------- Main ----------
 
 if __name__ == "__main__":
     print("SDN Load Balancer Demo")

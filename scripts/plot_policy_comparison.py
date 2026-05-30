@@ -86,7 +86,7 @@ def plot_grouped_bar():
                 linewidth=0.5,
                 alpha=0.9,
             )
-            # Value labels on bars with staggered offsets to prevent horizontal overlaps in jitter chart
+
             for bar, v in zip(bars, vals):
                 if v > 0:
                     if col == "avg_jitter_ms":
@@ -108,8 +108,12 @@ def plot_grouped_bar():
         ax.set_xticklabels(all_flows, fontsize=9)
         ax.set_ylabel(ylabel, fontsize=11)
         ax.set_title(title, fontsize=12, fontweight="bold")
-        ax.legend(fontsize=9, loc="upper left")
+        ax.legend(fontsize=9, loc="upper center", bbox_to_anchor=(0.5, 0.98), ncol=3)
         ax.grid(axis="y", alpha=0.3)
+
+    if col == "avg_jitter_ms":
+        y_max = ax.get_ylim()[1]
+        ax.set_ylim(top=y_max * 1.2)
 
     fig.suptitle(
         "Multi-Policy Load Balancing: Core Metrics Comparison\n"
@@ -120,13 +124,13 @@ def plot_grouped_bar():
     )
     fig.tight_layout()
     out = os.path.join(FIGURES_DIR, "policy_1_grouped_bar.png")
-    fig.savefig(out, dpi=180, bbox_inches="tight")
+    fig.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out}")
 
 
 # ─────────────────────────────────────────────────────
-# Chart 2: Box Plot for Robustness & Stability
+# Chart 2: Box Plot for Robustness & Stability (Optimized with Arrows)
 # ─────────────────────────────────────────────────────
 def plot_box():
     groups = ["base", "threshold", "predictive"]
@@ -158,19 +162,22 @@ def plot_box():
         fontweight="bold",
     )
     ax1.grid(axis="y", alpha=0.3)
-    ax1.tick_params(axis="x", labelsize=10)
+    ax1.set_axisbelow(True)
+    ax1.set_xlim(0.5, 4.2)  # 进一步增加右侧边界，为移远的标签留出空间
 
-    # Annotate median and IQR elegantly next to the box
+    # Annotate median and IQR with arrows
     for i, g in enumerate(groups):
         data = burst_dfs[g]["loss_pct"]
         if len(data) == 0:
             continue
         med = data.median()
         q1, q3 = data.quantile(0.25), data.quantile(0.75)
-        ax1.text(
-            i + 1.27,
-            med,
+
+        # xy 是中位数线条右侧边缘的坐标 (当前箱体中心为 i+1，宽度 0.5，右边缘即为 i+1.25)
+        ax1.annotate(
             f"Med={med:.1f}%\nIQR={q1:.1f}–{q3:.1f}%",
+            xy=(i + 1.25, med),
+            xytext=(i + 1.45, med + 5),  # 将文本向右移远至 1.45
             va="center",
             ha="left",
             fontsize=7.5,
@@ -178,6 +185,12 @@ def plot_box():
             fontweight="bold",
             bbox=dict(
                 boxstyle="round,pad=0.2", facecolor="white", edgecolor="#ddd", alpha=0.8
+            ),
+            arrowprops=dict(
+                arrowstyle="->",  # 细箭头样式
+                color="#666666",  # 灰色细线避免抢眼
+                linewidth=0.8,  # 线宽
+                connectionstyle="arc3",
             ),
         )
 
@@ -202,7 +215,8 @@ def plot_box():
         fontweight="bold",
     )
     ax2.grid(axis="y", alpha=0.3)
-    ax2.tick_params(axis="x", labelsize=10)
+    ax2.set_axisbelow(True)
+    ax2.set_xlim(0.5, 4.2)  # 同步增加右侧边界
 
     for i, g in enumerate(groups):
         data = burst_dfs[g]["bandwidth_mbps"]
@@ -210,10 +224,11 @@ def plot_box():
             continue
         med = data.median()
         q1, q3 = data.quantile(0.25), data.quantile(0.75)
-        ax2.text(
-            i + 1.27,
-            med,
-            f"Med={med:.2f}M\nIQR={q1:.2f}–{q3:.2f}",
+
+        ax2.annotate(
+            f"Med={med:.2f} Mbps\nIQR={q1:.2f}–{q3:.2f}",
+            xy=(i + 1.25, med),
+            xytext=(i + 1.45, med - 0.1),  # 将文本向右移远至 1.45
             va="center",
             ha="left",
             fontsize=7.5,
@@ -222,6 +237,9 @@ def plot_box():
             bbox=dict(
                 boxstyle="round,pad=0.2", facecolor="white", edgecolor="#ddd", alpha=0.8
             ),
+            arrowprops=dict(
+                arrowstyle="->", color="#666666", linewidth=0.8, connectionstyle="arc3"
+            ),
         )
 
     fig.suptitle(
@@ -229,11 +247,11 @@ def plot_box():
         "(Narrower boxes = more consistent control under hash collision uncertainty)",
         fontsize=14,
         fontweight="bold",
-        y=1.02,
+        y=0.93,
     )
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
     out = os.path.join(FIGURES_DIR, "policy_2_box_plot.png")
-    fig.savefig(out, dpi=180, bbox_inches="tight")
+    fig.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out}")
 
@@ -266,35 +284,36 @@ def plot_cdf():
             label=f"{POLICY_LABELS[g]} (n={len(sorted_loss)})",
         )
 
-    # Mark P95 and P99
+    # Mark P95 only (removed P99)
     for g in groups:
         loss = all_data[g]["loss_pct"].values
         if len(loss) == 0:
             continue
         p95 = np.percentile(loss, 95)
-        p99 = np.percentile(loss, 99)
         ax1.axvline(
-            x=p95, color=POLICY_COLORS[g], linestyle=":", alpha=0.5, linewidth=1
+            x=p95, color=POLICY_COLORS[g], linestyle="--", alpha=1.0, linewidth=2.5
         )
         ax1.text(
-            p95,
-            0.50,
+            p95 + 3,
+            0.5,
             f"P95={p95:.1f}%",
-            fontsize=7,
+            fontsize=11,
+            fontweight="bold",
             color=POLICY_COLORS[g],
             rotation=90,
             va="center",
+            ha="center",
         )
 
     ax1.set_xlabel("Loss Rate (%)", fontsize=12)
     ax1.set_ylabel("Cumulative Probability", fontsize=12)
     ax1.set_title("Loss Rate CDF", fontsize=12, fontweight="bold")
     ax1.legend(fontsize=9, loc="lower right")
-    ax1.grid(True, alpha=0.3)
+    # No grid
     ax1.set_xlim(left=-1)
     ax1.set_ylim(-0.02, 1.02)
 
-    # Subplot 2: Jitter CDF
+    # Subplot 2: Jitter CDF (unchanged, only P95)
     ax2 = axes[1]
     for g in groups:
         jitter = all_data[g]["jitter_ms"].values
@@ -316,23 +335,25 @@ def plot_cdf():
             continue
         p95 = np.percentile(jitter, 95)
         ax2.axvline(
-            x=p95, color=POLICY_COLORS[g], linestyle=":", alpha=0.5, linewidth=1
+            x=p95, color=POLICY_COLORS[g], linestyle="--", alpha=1.0, linewidth=2.5
         )
         ax2.text(
-            p95,
-            0.50,
-            f"P95={p95:.1f}ms",
-            fontsize=7,
+            p95 + 10,
+            0.5,
+            f"P95={p95:.1f}%",
+            fontsize=11,
+            fontweight="bold",
             color=POLICY_COLORS[g],
             rotation=90,
             va="center",
+            ha="center",
         )
 
     ax2.set_xlabel("Jitter (ms)", fontsize=12)
     ax2.set_ylabel("Cumulative Probability", fontsize=12)
     ax2.set_title("Jitter CDF", fontsize=12, fontweight="bold")
     ax2.legend(fontsize=9, loc="lower right")
-    ax2.grid(True, alpha=0.3)
+    # No grid
     ax2.set_xlim(left=-1)
     ax2.set_ylim(-0.02, 1.02)
 
@@ -345,21 +366,17 @@ def plot_cdf():
     )
     fig.tight_layout()
     out = os.path.join(FIGURES_DIR, "policy_4_cdf.png")
-    fig.savefig(out, dpi=180, bbox_inches="tight")
+    fig.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out}")
 
 
-# ─────────────────────────────────────────────────────
-# Chart 5: Dynamic Weight Evolution Stacked Area Chart (Weight Evolution)
-# ─────────────────────────────────────────────────────
 def plot_weight_evolution():
     weights_path = os.path.join(DATA_DIR, "group_weights.csv")
     if not os.path.exists(weights_path):
         print(f"Warning: {weights_path} not found. Skipping weight evolution chart.")
         return
     df = pd.read_csv(weights_path)
-    # Find active DPIDs in weights
     dpids = sorted(df["dpid"].unique())
     if not dpids:
         return
@@ -374,7 +391,7 @@ def plot_weight_evolution():
         sub_df = df[df["dpid"] == dpid].sort_values("timestamp")
         t_rel = sub_df["timestamp"] - min_ts
 
-        # Rolling average smoothing (w=5) for weights to eliminate high frequency visualization jitter
+        # Rolling average smoothing (w=5) for weights
         w_smooth = 5
         smoothed_w3 = (
             sub_df["port3_weight"].rolling(w_smooth, min_periods=1, center=True).mean()
@@ -399,11 +416,26 @@ def plot_weight_evolution():
         ax.set_ylabel(f"S{dpid} Weight (%)", fontsize=9)
         ax.set_ylim(0, 100)
         ax.grid(True, alpha=0.3)
-        # Avoid duplicated legends across rows, draw only on the first row
-        if i == 0:
-            ax.legend(loc="upper right", fontsize=8)
+        # 移除原有的图例（不再在每个子图中显示）
 
     axes[-1].set_xlabel("Time (seconds)", fontsize=11)
+
+    # 在标题下方添加横向排列的图例
+    from matplotlib.patches import Patch
+
+    legend_elements = [
+        Patch(facecolor="#3498db", alpha=0.85, label="Port 3"),
+        Patch(facecolor="#2ecc71", alpha=0.85, label="Port 4"),
+    ]
+    fig.legend(
+        handles=legend_elements,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.95),
+        ncol=2,
+        fontsize=9,
+        frameon=False,
+    )
+
     fig.suptitle(
         "Dynamic Weight Evolution Stacked Area Chart\n"
         "(Port 3 & Port 4 dynamic splitting weights per Aggregation switch)",
@@ -411,9 +443,10 @@ def plot_weight_evolution():
         fontweight="bold",
         y=0.99,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    # 调整布局，为标题和图例预留空间
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     out = os.path.join(FIGURES_DIR, "policy_5_weight_evolution.png")
-    fig.savefig(out, dpi=180, bbox_inches="tight")
+    fig.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out}")
 
@@ -543,7 +576,7 @@ def plot_dual_axis_coevolution():
     )
     fig.tight_layout()
     out = os.path.join(FIGURES_DIR, "policy_6_dual_axis_coevolution.png")
-    fig.savefig(out, dpi=180, bbox_inches="tight")
+    fig.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out}")
 
@@ -642,14 +675,11 @@ def plot_pareto_tradeoff():
 
     fig.tight_layout()
     out = os.path.join(FIGURES_DIR, "policy_7_pareto_tradeoff.png")
-    fig.savefig(out, dpi=180, bbox_inches="tight")
+    fig.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out}")
 
 
-# ─────────────────────────────────────────────────────
-# Chart 8: Flow Throughput Fairness Radar Chart
-# ─────────────────────────────────────────────────────
 def plot_flow_fairness_radar():
     groups = ["base", "threshold", "predictive"]
     dfs = {}
@@ -695,22 +725,28 @@ def plot_flow_fairness_radar():
     ax.set_xticks(angles[:-1])
     ax.set_xticklabels(all_flows, fontsize=10)
 
-    # Keep output nicely bound within [0.0, 1.05] for normalized throughput rate
     ax.set_ylim(0.0, 1.05)
     ax.set_rlabel_position(180)
+
     ax.set_title(
-        "Throughput Achievement Rate Fairness Radar Chart across 10 Flows\n"
-        "(Normalized by 0.5Mbps for regular flows & 1.5Mbps for burst flows;\n"
-        "Larger & more symmetric decagon = better throughput efficiency and resource fairness)",
-        fontsize=13,
+        "Throughput Fairness Radar Chart (Normalized by per‑flow capacity)",
+        fontsize=14,
         fontweight="bold",
-        y=1.08,
+        pad=20,
+        y=1.10,
     )
-    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.10),
+        ncol=3,
+        fontsize=10,
+        frameon=False,
+    )
 
     fig.tight_layout()
     out = os.path.join(FIGURES_DIR, "policy_8_flow_fairness_radar.png")
-    fig.savefig(out, dpi=180, bbox_inches="tight")
+    fig.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out}")
 

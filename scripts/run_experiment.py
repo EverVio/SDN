@@ -369,7 +369,7 @@ def print_summary(all_results):
 
 
 def main():
-    global TEST_DURATION, UDP_BANDWIDTH, BURST_DELAY
+    global TEST_DURATION, UDP_BANDWIDTH, BURST_DELAY, BURST_STAGGER
 
     import argparse
 
@@ -392,7 +392,14 @@ def main():
 
     TEST_DURATION = args.duration
     UDP_BANDWIDTH = args.bw
-    BURST_DELAY = args.burst_delay
+    
+    # 动态自适应突发流时间比例，防止短测试时长下突发流启动延迟超出总时间
+    if args.burst_delay == 20:  # 仅当用户未手动指定非默认参数时进行自适应
+        BURST_DELAY = max(5, int(TEST_DURATION / 3))
+    else:
+        BURST_DELAY = args.burst_delay
+
+    BURST_STAGGER = max(1, int(TEST_DURATION / 10))
     iters = args.iters
 
     data_dir = os.path.join(PROJECT_ROOT, "data")
